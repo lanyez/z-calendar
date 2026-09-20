@@ -80,7 +80,11 @@ fn main() {
 
     let config = config::Config::load();
     let holidays = ics::load_cache();
-    let weather = weather::load_cache();
+    let weather = if std::env::var("CAL_FAKE_WX").map(|v| v == "1").unwrap_or(false) {
+        Some(weather::fake())
+    } else {
+        weather::load_cache()
+    };
 
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
     let (weather_tx, weather_rx) = mpsc::channel::<()>();
@@ -107,6 +111,7 @@ fn main() {
 
     flyout::create_window(st.clone(), agenda, tray.clone());
     flyout::create_settings_window(st.clone(), tray);
+    flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);
 
     // 调试：启动即显示设置窗口
@@ -226,8 +231,8 @@ fn spawn_weather(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
             } else {
                 *st.weather.lock().unwrap() = None;
             }
-            // 失败 1 分钟后重试，成功 30 分钟后刷新
-            let wait = if ok { Duration::from_secs(30 * 60) } else { Duration::from_secs(60) };
+            // 失败 1 分钟后重试，成功 1 小时后刷新（每小时自动更新）
+            let wait = if ok { Duration::from_secs(60 * 60) } else { Duration::from_secs(60) };
             crate::trim_working_set();
             match rx.recv_timeout(wait) {
                 Ok(()) => {}

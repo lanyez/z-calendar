@@ -83,6 +83,8 @@ enum Action {
     MenuAuto,
     MenuRefresh,
     MenuQuit,
+    /// 头部左侧天气热区（悬停弹出近一周天气面板）
+    Weather,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -692,6 +694,8 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_ERASEBKGND => 1,
+        // 点击设置窗口不改变激活状态：主面板保持激活与显示
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_NCHITTEST => {
             // 标题栏返回 HTCAPTION：可原生拖动到全屏任意位置
             let x = ((lp as usize) & 0xFFFF) as u16 as i16 as i32;
@@ -778,6 +782,409 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
 }
 
 fn settings_hover_unused() {}
+
+// ================= 近一周天气面板（紧贴日历左侧，顶部对齐，悬停天气热区时弹出） =================
+pub const FC_W: f32 = 576.0;
+pub const FC_H: f32 = 212.0;
+
+static FORECAST_HWND: AtomicUsize = AtomicUsize::new(0);
+static FORECAST_UI: Mutex<Option<SendFc>> = Mutex::new(None);
+
+struct SendFc(Box<ForecastUi>);
+unsafe impl Send for SendFc {}
+
+struct ForecastUi {
+    hwnd: usize,
+    sf: f32,
+    w: f32,
+    h: f32,
+    mem_dc: usize,
+    bmp: gdi::Gp,
+    scan0: *mut u8,
+    g: gdi::Gp,
+    cache: Cache,
+    st: SharedState,
+    dumped: bool,
+    dump_path: String,
+    /// “更新”链接热区（面板坐标系，paint 时更新）
+    link_rect: gdi::RectF,
+    link_hover: bool,
+    /// 最近一次手动刷新时间（用于显示“更新中…”并防止连点）
+    refreshing: Option<std::time::Instant>,
+}
+
+pub fn forecast_visible() -> bool {
+    let h = FORECAST_HWND.load(Ordering::Relaxed);
+    h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 }
+}
+
+pub fn create_forecast_window(st: SharedState) {
+    unsafe {
+        let cls = crate::wide("z-calendar-forecast");
+        let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
+        let mut wc: WNDCLASSW = std::mem::zeroed();
+        wc.lpfnWndProc = Some(forecast_wndproc);
+        wc.hInstance = hinstance;
+        wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
+        wc.lpszClassName = cls.as_ptr();
+        RegisterClassW(&wc);
+
+        let w = FC_W as i32;
+        let h = FC_H as i32;
+        let title = crate::wide("Z日历天气");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            cls.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            32000,
+            32000,
+            w,
+            h,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null_mut(),
+        );
+        if hwnd.is_null() {
+            return;
+        }
+        FORECAST_HWND.store(hwnd as usize, Ordering::Relaxed);
+
+        let mut fui = Box::new(ForecastUi {
+            hwnd: hwnd as usize,
+            sf: 1.0,
+            w: w as f32,
+            h: h as f32,
+            mem_dc: 0,
+            bmp: std::ptr::null_mut(),
+            scan0: std::ptr::null_mut(),
+            g: std::ptr::null_mut(),
+            cache: Cache::new(),
+            st,
+            dumped: false,
+            dump_path: std::env::var("CAL_DUMP3").unwrap_or_default(),
+            link_rect: gdi::RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            link_hover: false,
+            refreshing: None,
+        });
+        let hdc = GetDC(std::ptr::null_mut());
+        fui.mem_dc = CreateCompatibleDC(hdc) as usize;
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = fui.w as i32;
+        bmi.bmiHeader.biHeight = -(fui.h as i32);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
+        SelectObject(fui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
+        ReleaseDC(std::ptr::null_mut(), hdc);
+        let mut bmp: gdi::Gp = std::ptr::null_mut();
+        GdipCreateBitmapFromScan0(
+            fui.w as i32,
+            fui.h as i32,
+            (fui.w * 4.0) as i32,
+            gdi::PIXEL_FORMAT_32BPP_PARGB,
+            bits as *mut u8,
+            &mut bmp,
+        );
+        fui.bmp = bmp;
+        fui.scan0 = bits as *mut u8;
+        GdipGetImageGraphicsContext(fui.bmp, &mut fui.g);
+
+        // 初始绘制（兼 CAL_DUMP3 首帧转储）
+        fui.redraw();
+        FORECAST_UI.lock().unwrap().replace(SendFc(fui));
+    }
+}
+
+/// 悬停天气热区：在主面板左侧弹出面板（放不下时改到右侧）
+pub fn forecast_open(main_hwnd: usize) {
+    unsafe {
+        let mut guard = FORECAST_UI.lock().unwrap();
+        let Some(f) = guard.as_mut() else { return };
+        let f = &mut f.0;
+        let w = f.st.weather.lock().unwrap().clone();
+        let Some(w) = w else { return };
+        if w.days.is_empty() {
+            return;
+        }
+        let fh = f.hwnd as HWND;
+        if IsWindowVisible(fh) != 0 {
+            return;
+        }
+        let mut mr: RECT = std::mem::zeroed();
+        GetWindowRect(main_hwnd as HWND, &mut mr);
+        let mut wa: RECT = std::mem::zeroed();
+        SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
+        // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐
+        let mut x = mr.left + 10 - FC_W as i32;
+        let mut y = mr.top + 10;
+        if y + FC_H as i32 > wa.bottom - 4 {
+            y = wa.bottom - 4 - FC_H as i32;
+        }
+        if y < wa.top + 4 {
+            y = wa.top + 4;
+        }
+        if x < wa.left + 4 {
+            x = mr.right - 10;
+        }
+        let xmax = wa.right - FC_W as i32 - 4;
+        if x > xmax {
+            x = xmax;
+        }
+        SetWindowPos(fh, HWND_TOPMOST, x, y, FC_W as i32, FC_H as i32, SWP_NOACTIVATE);
+        ShowWindow(fh, SW_SHOWNA);
+        f.redraw();
+    }
+}
+
+pub fn forecast_close() {
+    let h = FORECAST_HWND.load(Ordering::Relaxed);
+    if h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 } {
+        unsafe {
+            ShowWindow(h as HWND, SW_HIDE);
+        }
+        crate::trim_working_set();
+    }
+}
+
+/// 光标是否位于软件自身弹窗（天气侧栏/设置窗口）内
+fn cursor_on_own_popup() -> bool {
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        for h in [FORECAST_HWND.load(Ordering::Relaxed), SETTINGS_HWND.load(Ordering::Relaxed)] {
+            if h != 0 && IsWindowVisible(h as HWND) != 0 {
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(h as HWND, &mut r);
+                if pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+pub fn forecast_redraw() {
+    let mut guard = FORECAST_UI.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        f.0.redraw();
+    }
+}
+
+impl ForecastUi {
+    fn redraw(&mut self) {
+        if self.g.is_null() {
+            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
+        }
+        let cache_ptr: *const Cache = &self.cache;
+        let g = self.g;
+        unsafe {
+            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
+            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+        }
+        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
+        self.paint(&p);
+        self.ulw();
+
+        if !self.dumped && !self.dump_path.is_empty() {
+            self.dumped = true;
+            save_bmp(self.scan0, self.w as i32, self.h as i32, &self.dump_path);
+            if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
+                unsafe {
+                    PostMessageW(hwnd() as HWND, WM_CLOSE, 0, 0);
+                }
+            }
+        }
+    }
+
+    fn ulw(&self) {
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(self.hwnd as HWND, &mut r);
+            let mut ppt = POINT { x: r.left, y: r.top };
+            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut src = POINT { x: 0, y: 0 };
+            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
+                BlendOp: 0,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: 1,
+            };
+            UpdateLayeredWindow(
+                self.hwnd as HWND,
+                std::ptr::null_mut(),
+                &mut ppt,
+                &mut size,
+                self.mem_dc as winapi::shared::windef::HDC,
+                &mut src,
+                0,
+                &mut blend,
+                2,
+            );
+        }
+    }
+
+    fn paint(&mut self, p: &Painter) {
+        // 面板底（无边框、无阴影环，窗口即面板）
+        p.fill_round(0.0, 0.0, FC_W, FC_H, 12.0, POPUP_BG);
+
+        let w = self.st.weather.lock().unwrap().clone();
+        let Some(w) = w else { return };
+        if w.days.is_empty() {
+            return;
+        }
+        let today = Local::now().date_naive();
+
+        // 头部：定位城市 + 更新时间 + 手动刷新链接
+        p.text("\u{E81D}", 16.0, 12.0, 18.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, true, BLUE);
+        p.text(&w.city, 36.0, 12.0, 160.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
+        let refreshing = self
+            .refreshing
+            .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
+            .unwrap_or(false);
+        let time_str = chrono::DateTime::from_timestamp((w.ts / 1000) as i64, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_else(|| "--:--".into());
+        let head = format!("更新时间：{}", time_str);
+        let (tail, tail_col) = if refreshing {
+            ("更新中…", if self.link_hover { WHITE } else { BLUE })
+        } else {
+            ("更新", if self.link_hover { WHITE } else { BLUE })
+        };
+        let hw = p.measure(&head, 10.0, false, false).0;
+        let tw = p.measure(tail, 10.0, false, false).0;
+        let gap = 6.0;
+        let hx = FC_W - 16.0 - hw - gap - tw;
+        p.text(&head, hx, 14.0, hw + 2.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM);
+        p.text(tail, hx + hw + gap, 14.0, tw + 2.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, tail_col);
+        self.link_rect = gdi::RectF { x: hx + hw + gap, y: 14.0, w: tw, h: 18.0 };
+        p.fill_rect(16.0, 42.0, FC_W - 32.0, 1.0, DIVIDER);
+
+        // 每日列（不足 7 天时居中排布）
+        let n = w.days.len().min(7);
+        let col_w = (FC_W - 24.0) / 7.0;
+        let x0 = 12.0 + ((FC_W - 24.0) - col_w * n as f32) / 2.0;
+        for (i, d) in w.days.iter().take(n).enumerate() {
+            let cx = x0 + col_w * i as f32 + col_w / 2.0;
+            let weekday = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
+                [d.date.weekday().num_days_from_sunday() as usize];
+            p.text(weekday, cx - col_w / 2.0, 52.0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, true, false, if d.date == today { WHITE } else { DATE_COL });
+
+            // 日期 + 相对标签（今天/明天/后天）
+            let dstr = d.date.format("%m-%d").to_string();
+            let tag = match (d.date - today).num_days() {
+                0 => "今天",
+                1 => "明天",
+                2 => "后天",
+                _ => "",
+            };
+            let dw = p.measure(&dstr, 10.0, false, false).0;
+            let tw = if tag.is_empty() { 0.0 } else { p.measure(tag, 10.0, false, false).0 };
+            let gap = if tag.is_empty() { 0.0 } else { 5.0 };
+            let tx = cx - (dw + gap + tw) / 2.0;
+            p.text(&dstr, tx, 72.0, dw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB);
+            if !tag.is_empty() {
+                p.text(tag, tx + dw + gap, 72.0, tw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, BLUE);
+            }
+
+            draw_weather(p, cx, 110.0, d.code, 1.25);
+            p.text(crate::weather::wmo_text(d.code), cx - col_w / 2.0, 138.0, col_w, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, ROW_TXT);
+            p.text(&format!("{} ~ {}°C", d.tmin, d.tmax), cx - col_w / 2.0, 158.0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, DATE_COL);
+
+            // 空气质量（短等级带“空气”前缀，与参考样式一致）
+            match d.aqi {
+                Some(a) => {
+                    let (cat, (r, g2, b)) = crate::weather::aqi_level(a);
+                    let label = if cat.chars().count() <= 1 {
+                        format!("空气{} {}", cat, a)
+                    } else {
+                        format!("{} {}", cat, a)
+                    };
+                    p.text(&label, cx - col_w / 2.0, 180.0, col_w, 14.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, gdi::argb(255, r, g2, b));
+                }
+                None => {
+                    p.text("空气 --", cx - col_w / 2.0, 180.0, col_w, 14.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM);
+                }
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            ValidateRect(hwnd, std::ptr::null_mut());
+            0
+        }
+        WM_ERASEBKGND => 1,
+        // 点击面板不改变激活状态：主面板不会因失焦隐藏，点击消息正常送达本面板
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_MOUSEMOVE => {
+            let mut guard = FORECAST_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                let f = &mut f.0;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let r = f.link_rect;
+                let hit = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+                if hit != f.link_hover {
+                    f.link_hover = hit;
+                    f.redraw();
+                }
+                if hit {
+                    SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                    // 注册离开跟踪，移出链接后恢复箭头与颜色
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&mut tme);
+                }
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            let mut guard = FORECAST_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                let f = &mut f.0;
+                if f.link_hover {
+                    f.link_hover = false;
+                    f.redraw();
+                }
+            }
+            0
+        }
+        WM_LBUTTONDOWN => {
+            let mut guard = FORECAST_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                let f = &mut f.0;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let r = f.link_rect;
+                let refreshing = f
+                    .refreshing
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
+                    .unwrap_or(false);
+                if !refreshing && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                    // 点击“更新”：唤醒天气线程立即拉取（5 秒内防连点）
+                    f.refreshing = Some(std::time::Instant::now());
+                    let _ = f.st.weather_tx.send(());
+                    f.redraw();
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
 
 pub fn create_window(st: SharedState, agenda: Arc<Mutex<HashMap<String, Vec<String>>>>, tray: Arc<Mutex<Option<tray::Tray>>>) {
     unsafe {
@@ -997,6 +1404,7 @@ fn perform_hide(hwnd: HWND) {
         unsafe {
             ShowWindow(hwnd, SW_HIDE);
         }
+        forecast_close();
     }
     // 设置窗口保持打开，只由其"确定/✕"按钮关闭
     SHOWN_FLAG.store(0, Ordering::Relaxed);
@@ -1081,20 +1489,7 @@ impl Ui {
     }
 
     fn paint_frame(&self, p: &Painter) {
-        for i in 1..=8 {
-            let a = (3 + i * 2) as u8;
-            p.stroke_round(
-                10.0 - i as f32,
-                10.0 - i as f32,
-                WIN_W - 20.0 + i as f32 * 2.0,
-                WIN_H - 20.0 + i as f32 * 2.0,
-                12.0 + i as f32,
-                1.5,
-                gdi::argb(a / 2, 0, 0, 0),
-            );
-        }
         p.fill_round(10.0, 10.0, WIN_W - 20.0, WIN_H - 20.0, 12.0, BG);
-        p.stroke_round(10.0, 10.0, WIN_W - 20.0, WIN_H - 20.0, 12.0, 1.0, BORDER);
     }
 
     fn hit_add(regions: &mut Vec<(gdi::RectF, Action)>, x: f32, y: f32, w: f32, h: f32, a: Action) {
@@ -1139,11 +1534,18 @@ impl Ui {
         let date_w = p.measure(&date_str, 14.0, false, false).0;
         p.text(&lunar_txt, left + date_w + 8.0, 84.0, 140.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 14.0, false, false, SUB);
 
-        // 天气
+        // 天气（右上角，悬停弹出近一周天气面板）
         let wx = if cfg.show_weather { self.st.weather.lock().unwrap().clone() } else { None };
-        if let Some(w) = wx {
-            draw_weather(p, right - 22.0, 50.0, w.code);
+        if let Some(w) = &wx {
+            let can_hover = !w.days.is_empty();
+            if can_hover && self.hovered(&Action::Weather) {
+                p.fill_round(right - 78.0, 36.0, 76.0, 58.0, 8.0, HOVER_BG);
+            }
+            draw_weather(p, right - 22.0, 50.0, w.code, 1.0);
             p.text(&format!("{}°C", w.temp), right - 44.0, 73.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL);
+            if can_hover {
+                Self::hit_add(regions, right - 78.0, 32.0, 76.0, 64.0, Action::Weather);
+            }
         }
 
         // 分隔线
@@ -1468,50 +1870,50 @@ fn fest_color(k: FestKind) -> u32 {
     }
 }
 
-fn draw_weather(p: &Painter, cx: f32, cy: f32, code: u32) {
+fn draw_weather(p: &Painter, cx: f32, cy: f32, code: u32, sc: f32) {
     match code {
-        0 => draw_sun(p, cx, cy, 1.0),
+        0 => draw_sun(p, cx, cy, sc),
         1..=2 => {
-            draw_sun(p, cx - 6.0, cy - 7.0, 0.65);
-            draw_cloud(p, cx + 3.0, cy + 4.0, 1.0);
+            draw_sun(p, cx - 6.0 * sc, cy - 7.0 * sc, 0.65 * sc);
+            draw_cloud(p, cx + 3.0 * sc, cy + 4.0 * sc, sc);
         }
-        3 => draw_cloud(p, cx, cy, 1.2),
+        3 => draw_cloud(p, cx, cy, 1.2 * sc),
         45 | 48 => {
-            draw_cloud(p, cx, cy - 4.0, 1.0);
+            draw_cloud(p, cx, cy - 4.0 * sc, sc);
             for i in 0..2 {
-                p.line(cx - 9.0, cy + 4.0 + i as f32 * 5.0, cx + 9.0, cy + 4.0 + i as f32 * 5.0, 2.0, gdi::argb(180, 0xE8, 0xEC, 0xF2));
+                p.line(cx - 9.0 * sc, cy + (4.0 + i as f32 * 5.0) * sc, cx + 9.0 * sc, cy + (4.0 + i as f32 * 5.0) * sc, 2.0, gdi::argb(180, 0xE8, 0xEC, 0xF2));
             }
         }
         51..=67 | 80..=82 => {
-            draw_cloud(p, cx, cy - 5.0, 1.05);
+            draw_cloud(p, cx, cy - 5.0 * sc, 1.05 * sc);
             for i in -1..=1 {
-                p.line(cx + i as f32 * 7.0, cy + 6.0, cx + i as f32 * 7.0 - 2.0, cy + 12.0, 2.0, RAIN);
+                p.line(cx + i as f32 * 7.0 * sc, cy + 6.0 * sc, cx + i as f32 * 7.0 * sc - 2.0 * sc, cy + 12.0 * sc, 2.0, RAIN);
             }
         }
         71..=77 | 85 | 86 => {
-            draw_cloud(p, cx, cy - 5.0, 1.05);
+            draw_cloud(p, cx, cy - 5.0 * sc, 1.05 * sc);
             for i in -1..=1 {
-                p.fill_circle(cx + i as f32 * 7.0, cy + 9.0, 1.8, CLOUD);
+                p.fill_circle(cx + i as f32 * 7.0 * sc, cy + 9.0 * sc, 1.8 * sc, CLOUD);
             }
         }
         c if c >= 95 => {
-            draw_cloud(p, cx, cy - 5.0, 1.05);
+            draw_cloud(p, cx, cy - 5.0 * sc, 1.05 * sc);
             p.fill_polygon(
                 &[
-                    (cx + 1.0, cy + 4.0),
-                    (cx - 4.0, cy + 11.0),
-                    (cx + 0.0, cy + 11.0),
-                    (cx - 2.0, cy + 17.0),
-                    (cx + 4.0, cy + 9.0),
-                    (cx + 0.0, cy + 9.0),
-                    (cx + 3.0, cy + 4.0),
+                    (cx + 1.0 * sc, cy + 4.0 * sc),
+                    (cx - 4.0 * sc, cy + 11.0 * sc),
+                    (cx + 0.0 * sc, cy + 11.0 * sc),
+                    (cx - 2.0 * sc, cy + 17.0 * sc),
+                    (cx + 4.0 * sc, cy + 9.0 * sc),
+                    (cx + 0.0 * sc, cy + 9.0 * sc),
+                    (cx + 3.0 * sc, cy + 4.0 * sc),
                 ],
                 SUN,
             );
         }
         _ => {
-            draw_sun(p, cx - 6.0, cy - 7.0, 0.65);
-            draw_cloud(p, cx + 3.0, cy + 4.0, 1.0);
+            draw_sun(p, cx - 6.0 * sc, cy - 7.0 * sc, 0.65 * sc);
+            draw_cloud(p, cx + 3.0 * sc, cy + 4.0 * sc, sc);
         }
     }
 }
@@ -1664,7 +2066,7 @@ impl Ui {
                 }
                 self.redraw();
             }
-            Action::InputBox => {}
+            Action::InputBox | Action::Weather => {}
         }
     }
 
@@ -1742,6 +2144,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut quit = false;
             let mut idle_retune = false;
             let mut new_interval: u32 = 250;
+            let mut fc_repaint = false;
             {
                 let mut guard = UI.lock().unwrap();
                 if let Some(sui) = guard.as_mut() {
@@ -1788,6 +2191,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             ui.caret_on = !ui.caret_on;
                             ui.redraw();
                         }
+                        // 近一周天气面板：随秒重绘（每小时更新的数据及时反映）
+                        if forecast_visible() {
+                            fc_repaint = true;
+                        }
                     } else if !settings_visible() {
                         // 空闲防涨：回到空闲立即修剪，之后每 10 秒一次
                         if !ui.idle_timer {
@@ -1811,6 +2218,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             }
             if want_hide {
                 perform_hide(hwnd);
+            }
+            if fc_repaint {
+                forecast_redraw();
             }
             if quit {
                 DestroyWindow(hwnd);
@@ -1856,27 +2266,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     DestroyWindow(hwnd);
                 }
                 if open_settings {
-                    // 锁外执行窗口操作（防消息重入死锁）
+                    // 锁外执行窗口操作（防消息重入死锁）；打开设置侧窗时收起天气面板
+                    forecast_close();
                     show_settings();
                 }
             }
             0
         }
         WM_MOUSEMOVE => {
-            let mut guard = UI.lock().unwrap();
-            if let Some(sui) = guard.as_mut() {
-                let ui = &mut sui.0;
-                if ui.shown {
-                    let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
-                    let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
-                    let a = ui.action_at(x, y);
-                    if a != ui.hover {
-                        ui.hover = a;
-                        ui.redraw();
-                        let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaAdd) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MenuShow) | Some(Action::MenuAuto) | Some(Action::MenuRefresh) | Some(Action::MenuQuit));
-                        SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
+            let mut fc_open = false;
+            {
+                let mut guard = UI.lock().unwrap();
+                if let Some(sui) = guard.as_mut() {
+                    let ui = &mut sui.0;
+                    if ui.shown {
+                        let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
+                        let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
+                        let a = ui.action_at(x, y);
+                        if a != ui.hover {
+                            ui.hover = a;
+                            ui.redraw();
+                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaAdd) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MenuShow) | Some(Action::MenuAuto) | Some(Action::MenuRefresh) | Some(Action::MenuQuit));
+                            SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
+                        }
+                        fc_open = a == Some(Action::Weather);
                     }
                 }
+            }
+            // 窗口操作在 UI 锁之外执行（防消息重入死锁）；面板常驻，失焦不关闭
+            if fc_open {
+                forecast_open(hwnd as usize);
             }
             0
         }
@@ -1921,6 +2340,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             }
             if hide {
                 unsafe { ShowWindow(hwnd, SW_HIDE); }
+                forecast_close();
             }
             0
         }
@@ -1955,10 +2375,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             }
             0
         }
-        WM_ACTIVATE => {
+                WM_ACTIVATE => {
             let low = (wp & 0xFFFF) as u16;
-            // 设置窗口打开期间面板不随失焦隐藏（二者共存）
-            if low == 0 && !settings_visible() {
+            // 设置窗口打开期间面板不随失焦隐藏（二者共存）；
+            // 光标位于软件自身弹窗（天气侧栏/设置等）上时同样保持显示：
+            // 只有点击发生在软件相关窗口之外才关闭日历
+            if low == 0 && !settings_visible() && !cursor_on_own_popup() {
                 let hide = {
                     let mut guard = UI.lock().unwrap();
                     let mut hide = false;
@@ -1974,6 +2396,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 };
                 if hide {
                     ShowWindow(hwnd, SW_HIDE);
+                    forecast_close();
                     // 设置窗口保持打开：只由其"确定/✕"按钮关闭
                     SHOWN_FLAG.store(0, Ordering::Relaxed);
                     crate::trim_working_set();
