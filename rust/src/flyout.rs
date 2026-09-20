@@ -212,7 +212,7 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             cache: Cache::new(),
             st,
             tray,
-            tab: 0,
+            tab: std::env::var("CAL_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             regions: Vec::new(),
             hover: None,
             week_menu_open: false,
@@ -278,6 +278,18 @@ type c_void_ty2 = winapi::ctypes::c_void;
 #[link(name = "user32")]
 extern "system" {
     fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void_ty2, init: u32) -> i32;
+}
+
+/// 以指定页签打开设置窗口（日期侧边栏“卡片管理”入口）
+pub fn show_settings_tab(tab: usize) {
+    {
+        let mut guard = SETTINGS_UI.lock().unwrap();
+        if let Some(sui) = guard.as_mut() {
+            sui.0.tab = tab;
+            sui.0.week_menu_open = false;
+        }
+    }
+    show_settings();
 }
 
 pub fn show_settings() {
@@ -441,9 +453,10 @@ impl SettingsUi {
         p.text("✕", cx_btn, py + 12.0, 24.0, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if hov { RED } else { WEEK_NUM });
 
         // 左侧页签
-        let tabs: [(usize, &str, &str); 2] = [
+        let tabs: [(usize, &str, &str); 3] = [
             (0, "\u{E713}", "软件设置"),
             (1, "\u{E787}", "日历设置"),
+            (2, "\u{E81D}", "侧栏管理"),
         ];
         for (i, (tab_id, glyph, name)) in tabs.iter().enumerate() {
             let ty = py + 56.0 + 50.0 * i as f32;
@@ -519,7 +532,7 @@ impl SettingsUi {
                 p.text(line, cx, y, cw, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB_DIM);
                 y += 20.0;
             }
-        } else {
+        } else if self.tab == 1 {
             let rows: [(u8, &str, bool); 6] = [
                 (2, "显示农历/节日信息", cfg.show_lunar),
                 (3, "显示调休安排", cfg.show_adjust),
@@ -573,6 +586,32 @@ impl SettingsUi {
                     p.text(name, pill_x + 1.0, oy, pill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE } else { ROW_TXT });
                 }
             }
+        } else {
+            // 侧栏管理：卡片开关
+            p.fill_round(cx, py + 50.0, cw, 52.0, 8.0, POPUP_BG);
+            p.text("侧栏卡片", cx + 14.0, py + 56.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, true, false, TITLE_COL);
+            p.text("点击日历日期时在左侧展示，开关控制卡片显示", cx + 14.0, py + 76.0, cw - 28.0, 15.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
+            let rows: [(u8, &str, bool); 7] = [
+                (10, "日期信息", cfg.sidebar_date),
+                (11, "黄历信息", cfg.sidebar_almanac),
+                (12, "最近事件", cfg.sidebar_events),
+                (13, "今日日程", cfg.sidebar_agenda),
+                (14, "历史上的今天", cfg.sidebar_history),
+                (15, "时间格言", cfg.sidebar_motto),
+                (16, "待办清单", cfg.sidebar_todo),
+            ];
+            let mut y = py + 114.0;
+            for (idx, name, on) in rows {
+                Self::hit_add(regions, cx, y, cw, 38.0, SAction::Toggle(idx));
+                p.fill_round(cx, y, cw, 38.0, 8.0, gdi::argb(14, 255, 255, 255));
+                p.text(name, cx + 14.0, y, cw - 70.0, 38.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                let sw_x = cx + cw - 50.0;
+                p.fill_round(sw_x, y + 9.0, 36.0, 20.0, 10.0, if on { BLUE } else { gdi::argb(36, 255, 255, 255) });
+                let kx = if on { sw_x + 26.0 } else { sw_x + 10.0 };
+                p.fill_circle(kx, y + 19.0, 7.0, WHITE);
+                y += 42.0;
+            }
+            p.text("开关即时生效；日期侧边栏底部也可进入本页。", cx + 2.0, y + 6.0, cw, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
         }
 
         // 确定按钮（右下角）
@@ -629,10 +668,41 @@ impl SettingsUi {
                             cfg.show_tray = !cfg.show_tray;
                             cfg.show_tray
                         }
+                        10 => {
+                            cfg.sidebar_date = !cfg.sidebar_date;
+                            cfg.sidebar_date
+                        }
+                        11 => {
+                            cfg.sidebar_almanac = !cfg.sidebar_almanac;
+                            cfg.sidebar_almanac
+                        }
+                        12 => {
+                            cfg.sidebar_events = !cfg.sidebar_events;
+                            cfg.sidebar_events
+                        }
+                        13 => {
+                            cfg.sidebar_agenda = !cfg.sidebar_agenda;
+                            cfg.sidebar_agenda
+                        }
+                        14 => {
+                            cfg.sidebar_history = !cfg.sidebar_history;
+                            cfg.sidebar_history
+                        }
+                        15 => {
+                            cfg.sidebar_motto = !cfg.sidebar_motto;
+                            cfg.sidebar_motto
+                        }
+                        16 => {
+                            cfg.sidebar_todo = !cfg.sidebar_todo;
+                            cfg.sidebar_todo
+                        }
                         _ => cfg.show_weather,
                     }
                 };
                 self.st.config.lock().unwrap().save();
+                if (10..=16).contains(idx) {
+                    crate::sidebar::sidebar_repaint();
+                }
                 if *idx == 0 {
                     apply_autostart(on);
                     if let Some(t) = self.tray.lock().unwrap().as_ref() {
@@ -915,12 +985,19 @@ pub fn forecast_open(main_hwnd: usize) {
         if IsWindowVisible(fh) != 0 {
             return;
         }
+        // 与日期侧栏互斥：打开天气时自动收起日期侧栏（先收起，锚点即回到日历左缘）
+        crate::sidebar::sidebar_hide();
         let mut mr: RECT = std::mem::zeroed();
         GetWindowRect(main_hwnd as HWND, &mut mr);
         let mut wa: RECT = std::mem::zeroed();
         SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
-        // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐
-        let mut x = mr.left + 10 - FC_W as i32;
+        // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐；
+        // 日期侧栏打开时锚定到侧栏左缘（向左串联）
+        let anchor = match crate::sidebar::sidebar_left_x() {
+            Some(sx) => sx,
+            None => mr.left + 10,
+        };
+        let mut x = anchor - FC_W as i32;
         let mut y = mr.top + 10;
         if y + FC_H as i32 > wa.bottom - 4 {
             y = wa.bottom - 4 - FC_H as i32;
@@ -941,6 +1018,20 @@ pub fn forecast_open(main_hwnd: usize) {
     }
 }
 
+/// 天气面板已显示时按当前锚定（日期侧栏开/关）重新摆放
+pub fn forecast_reposition() {
+    if forecast_visible() {
+        let mh = hwnd();
+        if mh != 0 {
+            let h = FORECAST_HWND.load(Ordering::Relaxed);
+            unsafe {
+                ShowWindow(h as HWND, SW_HIDE);
+            }
+            forecast_open(mh);
+        }
+    }
+}
+
 pub fn forecast_close() {
     let h = FORECAST_HWND.load(Ordering::Relaxed);
     if h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 } {
@@ -956,7 +1047,7 @@ fn cursor_on_own_popup() -> bool {
     unsafe {
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
-        for h in [FORECAST_HWND.load(Ordering::Relaxed), SETTINGS_HWND.load(Ordering::Relaxed)] {
+        for h in [FORECAST_HWND.load(Ordering::Relaxed), SETTINGS_HWND.load(Ordering::Relaxed), crate::sidebar::sidebar_hwnd()] {
             if h != 0 && IsWindowVisible(h as HWND) != 0 {
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(h as HWND, &mut r);
@@ -1224,7 +1315,7 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<HashMap<String, Vec<Stri
             _ => Page::Calendar,
         };
         let settings_open = std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false);
-        let settings_tab = std::env::var("CAL_TAB")
+        let settings_tab: usize = std::env::var("CAL_TAB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -1384,6 +1475,10 @@ fn perform_show(hwnd: HWND) {
         ui.menu_open = false;
         SHOWN_FLAG.store(1, Ordering::Relaxed);
         ui.redraw();
+        // 调试：CAL_SIDEBAR=1 弹出日历时自动打开日期侧边栏
+        if std::env::var("CAL_SIDEBAR").map(|v| v == "1").unwrap_or(false) {
+            crate::sidebar::sidebar_show(ui.selected);
+        }
     }
 }
 
@@ -1405,6 +1500,7 @@ fn perform_hide(hwnd: HWND) {
             ShowWindow(hwnd, SW_HIDE);
         }
         forecast_close();
+        crate::sidebar::sidebar_hide();
     }
     // 设置窗口保持打开，只由其"确定/✕"按钮关闭
     SHOWN_FLAG.store(0, Ordering::Relaxed);
@@ -2010,6 +2106,12 @@ impl Ui {
             }
             Action::Cell(d) => {
                 self.selected = *d;
+                // 点击日期：打开/切换日期侧边栏；再次点击同一日期收起
+                if crate::sidebar::sidebar_visible() && crate::sidebar::sidebar_date() == Some(*d) {
+                    crate::sidebar::sidebar_hide();
+                } else {
+                    crate::sidebar::sidebar_show(*d);
+                }
                 self.redraw();
             }
             Action::BottomAgenda | Action::BottomPlus => {
@@ -2036,6 +2138,7 @@ impl Ui {
                 }
                 drop(a);
                 save_agenda(&self.agenda.lock().unwrap());
+                crate::sidebar::sidebar_repaint();
                 self.redraw();
             }
             Action::AgendaAdd => {
@@ -2078,6 +2181,7 @@ impl Ui {
         let key = crate::ics::key_of_date(self.selected);
         self.agenda.lock().unwrap().entry(key).or_default().push(text);
         save_agenda(&self.agenda.lock().unwrap());
+        crate::sidebar::sidebar_repaint();
         self.draft.clear();
         self.comp.clear();
         self.redraw();
@@ -2268,6 +2372,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 if open_settings {
                     // 锁外执行窗口操作（防消息重入死锁）；打开设置侧窗时收起天气面板
                     forecast_close();
+                    crate::sidebar::sidebar_hide();
                     show_settings();
                 }
             }
@@ -2341,6 +2446,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             if hide {
                 unsafe { ShowWindow(hwnd, SW_HIDE); }
                 forecast_close();
+                crate::sidebar::sidebar_hide();
             }
             0
         }
@@ -2397,6 +2503,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 if hide {
                     ShowWindow(hwnd, SW_HIDE);
                     forecast_close();
+                    crate::sidebar::sidebar_hide();
                     // 设置窗口保持打开：只由其"确定/✕"按钮关闭
                     SHOWN_FLAG.store(0, Ordering::Relaxed);
                     crate::trim_working_set();

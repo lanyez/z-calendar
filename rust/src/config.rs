@@ -42,6 +42,21 @@ pub struct Config {
     pub ics_url: String,
     #[serde(default)]
     pub last_ics_update: u64,
+    // 侧栏卡片（点击日期弹出的侧边栏）
+    #[serde(default = "def_true")]
+    pub sidebar_date: bool,      // 日期信息
+    #[serde(default = "def_true")]
+    pub sidebar_almanac: bool,   // 黄历信息
+    #[serde(default = "def_true")]
+    pub sidebar_events: bool,    // 最近事件
+    #[serde(default = "def_true")]
+    pub sidebar_agenda: bool,    // 今日日程
+    #[serde(default)]
+    pub sidebar_history: bool,   // 历史上的今天
+    #[serde(default)]
+    pub sidebar_motto: bool,     // 时间格言
+    #[serde(default = "def_true")]
+    pub sidebar_todo: bool,      // 待办清单
 }
 
 impl Default for Config {
@@ -59,6 +74,13 @@ impl Default for Config {
             week_start: 0,
             ics_url: DEFAULT_ICS_URL.to_string(),
             last_ics_update: 0,
+            sidebar_date: true,
+            sidebar_almanac: true,
+            sidebar_events: true,
+            sidebar_agenda: true,
+            sidebar_history: false,
+            sidebar_motto: false,
+            sidebar_todo: true,
         }
     }
 }

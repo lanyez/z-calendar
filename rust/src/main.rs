@@ -1,6 +1,7 @@
 // 让 exe 成为纯 GUI 程序：双击运行不再闪现控制台窗口
 #![windows_subsystem = "windows"]
 
+mod almanac;
 mod config;
 mod flyout;
 mod gdi;
@@ -8,6 +9,7 @@ mod ics;
 mod lunar;
 mod lunar_data;
 mod overlay;
+mod sidebar;
 mod tray;
 mod weather;
 
@@ -109,7 +111,8 @@ fn main() {
         }
     }
 
-    flyout::create_window(st.clone(), agenda, tray.clone());
+    flyout::create_window(st.clone(), agenda.clone(), tray.clone());
+    sidebar::create_window(st.clone(), agenda);
     flyout::create_settings_window(st.clone(), tray);
     flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);
