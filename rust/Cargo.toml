@@ -1,0 +1,33 @@
+[package]
+name = "calendar-flyout"
+version = "1.0.0"
+edition = "2021"
+description = "Z日历 - 替换 Windows 任务栏时钟点击弹出的日历（法定节假日/农历/节气）"
+
+[[bin]]
+name = "CalendarFlyout"
+path = "src/main.rs"
+
+[dependencies]
+winapi = { version = "0.3", features = [
+    "winuser", "windef", "minwindef", "ntdef", "libloaderapi", "synchapi",
+    "errhandlingapi", "winbase", "processthreadsapi", "handleapi", "winnt", "wingdi",
+] }
+tray-icon = "0.14"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winreg = "0.52"
+chrono = "0.4"
+raw-window-handle = "0.6"
+
+[build-dependencies]
+winresource = "0.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

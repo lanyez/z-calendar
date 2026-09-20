@@ -1,0 +1,9 @@
+node_modules/
+electron.log
+run.log
+shot*.png
+rust/target/
+rust/dbg*.log
+rust/*.log
+shots/*
+CalendarFlyout.exe
