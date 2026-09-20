@@ -117,22 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "calendar-flyout"
-version = "1.0.0"
-dependencies = [
- "chrono",
- "image",
- "raw-window-handle",
- "serde",
- "serde_json",
- "tray-icon",
- "ureq",
- "winapi",
- "winreg",
- "winresource",
-]
-
-[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1983,6 +1967,22 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
+]
+
+[[package]]
+name = "z-calendar"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "image",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "tray-icon",
+ "ureq",
+ "winapi",
+ "winreg",
+ "winresource",
 ]
 
 [[package]]

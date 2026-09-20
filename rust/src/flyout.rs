@@ -167,7 +167,7 @@ unsafe impl Send for SendSettings {}
 
 pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
     unsafe {
-        let cls = crate::wide("CalendarFlyoutSettings");
+        let cls = crate::wide("z-calendar-settings");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(settings_wndproc);
@@ -781,7 +781,7 @@ fn settings_hover_unused() {}
 
 pub fn create_window(st: SharedState, agenda: Arc<Mutex<HashMap<String, Vec<String>>>>, tray: Arc<Mutex<Option<tray::Tray>>>) {
     unsafe {
-        let cls = crate::wide("CalendarFlyoutMain");
+        let cls = crate::wide("z-calendar-main");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wndproc);

@@ -40,14 +40,14 @@ unsafe fn message_loop(clock: SharedClock) {
     let _ = CLOCK.set(clock);
 
     let hinstance = GetModuleHandleW(std::ptr::null());
-    let cls = wide("CalendarFlyoutOverlay");
+    let cls = wide("z-calendar-overlay");
     let mut wc: WNDCLASSW = std::mem::zeroed();
     wc.lpfnWndProc = Some(wndproc);
     wc.hInstance = hinstance;
     wc.lpszClassName = cls.as_ptr();
     RegisterClassW(&wc);
 
-    let title = wide("CalendarFlyoutOverlayWin");
+    let title = wide("z-calendar-overlay-win");
     let hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         cls.as_ptr(),

@@ -65,7 +65,7 @@ impl Default for Config {
 
 pub fn data_dir() -> PathBuf {
     let dir = std::env::var("APPDATA")
-        .map(|p| PathBuf::from(p).join("CalendarFlyout"))
+        .map(|p| PathBuf::from(p).join("z-calendar"))
         .unwrap_or_else(|_| PathBuf::from("."));
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -110,7 +110,6 @@ pub fn apply_autostart(enable: bool) {
             key.set_value("Z日历", &format!("\"{}\"", exe))?;
         } else {
             let _ = key.delete_value("Z日历");
-            let _ = key.delete_value("CalendarFlyout"); // 清理旧名称的注册项
         }
         Ok(())
     })();

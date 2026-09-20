@@ -1,11 +1,11 @@
 [package]
-name = "calendar-flyout"
+name = "z-calendar"
 version = "1.0.0"
 edition = "2021"
 description = "Z日历 - 替换 Windows 任务栏时钟点击弹出的日历（法定节假日/农历/节气）"
 
 [[bin]]
-name = "CalendarFlyout"
+name = "z-calendar"
 path = "src/main.rs"
 
 [dependencies]

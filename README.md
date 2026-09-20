@@ -16,7 +16,7 @@
 
 ## 使用
 
-- 启动：运行 `rust/target/release/CalendarFlyout.exe`（纯 GUI 程序无控制台），可自行复制改名（如 `Z日历.exe`）到任意位置。
+- 启动：运行 `rust/target/release/z-calendar.exe`（纯 GUI 程序无控制台），可自行复制改名（如 `Z日历.exe`）到任意位置。
 - 点击任务栏右下角时间 → 弹出日历；再点一次时钟 / Esc / 点击日历外任意位置 → 关闭。
 - 应用已在运行时再次启动 → 已运行实例的日历自动弹出（单实例，无重复进程）。
 - 开机自启：托盘菜单或设置中勾选（写注册表 `HKCU\...\Run`，项名「Z日历」，指向当前 exe 路径）。
@@ -30,7 +30,7 @@ build.cmd          REM 将 E:\tools\mingw64\bin 加入 PATH 后执行 cargo buil
 ```
 
 - 工具链：stable-x86_64-pc-windows-gnu（rustup 默认）+ [MinGW-w64](https://winlibs.com)（gcc，位于 `E:\tools\mingw64`，构建 `ring` 等需要）。
-- 产物：`rust/target/release/CalendarFlyout.exe`（约 1.9MB，静态链接 CRT/pthread，可直接拷贝运行）。
+- 产物：`rust/target/release/z-calendar.exe`（约 1.9MB，静态链接 CRT/pthread，可直接拷贝运行）。
 - **图标**：构建时以 `rust/icon.png` 为源自动生成多尺寸 `icon.ico`（16~256px）嵌入 exe，托盘图标与 exe 图标同源；换图标只需替换 `icon.png` 后重新构建。
 - `cargo test` 内置农历转换/节气/节日单元测试与天气联网测试。
 
@@ -57,7 +57,7 @@ tools/                开发辅助脚本（截图/内存/取色等）
 
 ## 数据与配置
 
-配置与缓存均在 `%APPDATA%\CalendarFlyout\`：
+配置与缓存均在 `%APPDATA%\z-calendar\`：
 
 - `config.json` — 配置项
 - `holidays.json` — 法定节假日缓存

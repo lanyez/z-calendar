@@ -30,7 +30,7 @@ pub fn create(config: &Config) -> Option<Tray> {
     let _ = menu.append(&sep2);
     let _ = menu.append(&quit);
 
-    let tray = TrayIconBuilder::new().with_id("cf-tray")
+    let tray = TrayIconBuilder::new().with_id("z-calendar-tray")
         .with_icon(icon_rgba())
         .with_tooltip("Z日历 · 点击任务栏时钟查看节假日")
         .with_menu(Box::new(menu))

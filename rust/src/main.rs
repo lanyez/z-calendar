@@ -64,7 +64,7 @@ fn main() {
     // 单实例：重复启动时通知已有实例弹出日历，然后退出
     let show_event: usize;
     unsafe {
-        let name: Vec<u16> = "CalendarFlyoutShowEvent\0".encode_utf16().collect();
+        let name: Vec<u16> = "z-calendar-show-event\0".encode_utf16().collect();
         use winapi::um::synchapi::{CreateEventW, OpenEventW, SetEvent};
         use winapi::um::winnt::EVENT_MODIFY_STATE;
         let existing = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());

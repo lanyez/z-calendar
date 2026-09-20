@@ -6,4 +6,4 @@ rust/target/
 rust/dbg*.log
 rust/*.log
 shots/*
-CalendarFlyout.exe
+z-calendar.exe
