@@ -42,8 +42,8 @@ const BORDER: u32 = gdi::argb(22, 255, 255, 255);
 const DIVIDER: u32 = gdi::argb(20, 255, 255, 255);
 const POPUP_BG: u32 = gdi::argb(255, 0x26, 0x30, 0x42);
 
-pub const WIN_W: f32 = 560.0;
-pub const WIN_H: f32 = 736.0;
+pub const WIN_W: f32 = 480.0;
+pub const WIN_H: f32 = 550.0;
 
 const WM_APP_TOGGLE: UINT = 0x8000 + 1;
 const WM_APP_SHOW: UINT = 0x8000 + 2;
@@ -79,10 +79,6 @@ enum Action {
     AgendaAdd,
     InputBox,
     OpenSettings,
-    MenuShow,
-    MenuAuto,
-    MenuRefresh,
-    MenuQuit,
     /// 头部左侧天气热区（悬停弹出近一周天气面板）
     Weather,
 }
@@ -113,7 +109,6 @@ struct Ui {
     selected: NaiveDate,
     regions: Vec<(gdi::RectF, Action)>,
     hover: Option<Action>,
-    menu_open: bool,
     draft: String,
     comp: String,
     caret_on: bool,
@@ -278,6 +273,19 @@ type c_void_ty2 = winapi::ctypes::c_void;
 #[link(name = "user32")]
 extern "system" {
     fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void_ty2, init: u32) -> i32;
+}
+
+/// 打开系统自带“日期与时间”设置
+pub fn open_date_time_settings() {
+    unsafe {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(hwnd: HWND, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+        }
+        let op = crate::wide("open");
+        let target = crate::wide("ms-settings:dateandtime");
+        ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), target.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 1);
+    }
 }
 
 /// 以指定页签打开设置窗口（日期侧边栏“卡片管理”入口）
@@ -1349,7 +1357,6 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<HashMap<String, Vec<Stri
             selected: today,
             regions: Vec::new(),
             hover: None,
-            menu_open: false,
             draft: String::new(),
             comp: String::new(),
             caret_on: true,
@@ -1445,10 +1452,8 @@ fn position_for(clock: Option<&crate::overlay::ClockInfo>, sf: f32, win_w: i32, 
 fn set_shown(ui: &mut Ui, show: bool) {
     if show {
         ui.shown = true;
-        ui.menu_open = false;
     } else {
         ui.shown = false;
-        ui.menu_open = false;
         SHOWN_FLAG.store(0, Ordering::Relaxed);
         crate::trim_working_set();
     }
@@ -1472,7 +1477,6 @@ fn perform_show(hwnd: HWND) {
     if let Some(sui) = guard.as_mut() {
         let ui = &mut sui.0;
         ui.shown = true;
-        ui.menu_open = false;
         SHOWN_FLAG.store(1, Ordering::Relaxed);
         ui.redraw();
         // 调试：CAL_SIDEBAR=1 弹出日历时自动打开日期侧边栏
@@ -1490,7 +1494,6 @@ fn perform_hide(hwnd: HWND) {
             Some(sui) => {
                 was_shown = sui.0.shown;
                 sui.0.shown = false;
-                sui.0.menu_open = false;
             }
             None => was_shown = false,
         }
@@ -1539,9 +1542,6 @@ impl Ui {
         match self.page {
             Page::Calendar => self.paint_calendar(&p, &mut regions),
             Page::Agenda => self.paint_agenda(&p, &mut regions),
-        }
-        if self.menu_open {
-            self.paint_context_menu(&p, &mut regions);
         }
         self.regions = regions;
         self.ulw();
@@ -1602,7 +1602,7 @@ impl Ui {
         let cfg = self.st.config.lock().unwrap().clone();
         let panel_x0 = 10.0;
         let panel_x1 = WIN_W - 10.0;
-        let pad = 18.0;
+        let pad = 14.0;
         let left = panel_x0 + pad;
         let right = panel_x1 - pad;
 
@@ -1619,44 +1619,44 @@ impl Ui {
         } else {
             format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
         };
-        p.text(&clock_str, left, 27.0, 380.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_NEAR, 40.0, true, false, TXT);
+        p.text(&clock_str, left, 22.0, 320.0, 52.0, gdi::HALIGN_NEAR, gdi::HALIGN_NEAR, 40.0, true, false, TXT);
         let l = now.date_naive();
         let lunar = lunar::solar_to_lunar(l);
         let lunar_txt = lunar
             .map(|l| format!("{}月{}", lunar::month_cn(l.month), lunar::day_cn(l.day)))
             .unwrap_or_default();
         let date_str = format!("{}年{}月{}日", l.year(), l.month(), l.day());
-        p.text(&date_str, left, 84.0, 200.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 14.0, false, false, DATE_COL);
-        let date_w = p.measure(&date_str, 14.0, false, false).0;
-        p.text(&lunar_txt, left + date_w + 8.0, 84.0, 140.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 14.0, false, false, SUB);
+        p.text(&date_str, left, 78.0, 200.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, false, false, DATE_COL);
+        let date_w = p.measure(&date_str, 13.5, false, false).0;
+        p.text(&lunar_txt, left + date_w + 8.0, 78.0, 140.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, false, false, SUB);
 
         // 天气（右上角，悬停弹出近一周天气面板）
         let wx = if cfg.show_weather { self.st.weather.lock().unwrap().clone() } else { None };
         if let Some(w) = &wx {
             let can_hover = !w.days.is_empty();
             if can_hover && self.hovered(&Action::Weather) {
-                p.fill_round(right - 78.0, 36.0, 76.0, 58.0, 8.0, HOVER_BG);
+                p.fill_round(right - 78.0, 32.0, 76.0, 58.0, 8.0, HOVER_BG);
             }
-            draw_weather(p, right - 22.0, 50.0, w.code, 1.0);
-            p.text(&format!("{}°C", w.temp), right - 44.0, 73.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL);
+            draw_weather(p, right - 22.0, 46.0, w.code, 1.0);
+            p.text(&format!("{}°C", w.temp), right - 44.0, 70.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL);
             if can_hover {
-                Self::hit_add(regions, right - 78.0, 32.0, 76.0, 64.0, Action::Weather);
+                Self::hit_add(regions, right - 78.0, 28.0, 76.0, 62.0, Action::Weather);
             }
         }
 
         // 分隔线
-        p.fill_rect(left, 113.0, right - left, 1.0, DIVIDER);
+        p.fill_rect(left, 102.0, right - left, 1.0, DIVIDER);
 
         // 月份栏
-        Self::hit_add(regions, left, 121.0, 200.0, 26.0, Action::Title);
-        p.text(&format!("{}年{}月", self.view_y, self.view_m), left, 121.0, 200.0, 26.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 17.0, true, false, TITLE_COL);
+        Self::hit_add(regions, left, 108.0, 160.0, 24.0, Action::Title);
+        p.text(&format!("{}年{}月", self.view_y, self.view_m), left, 108.0, 160.0, 24.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 16.0, true, false, TITLE_COL);
         let bw = 26.0;
         let gear_x = right - bw;
         let next_x = gear_x - bw - 4.0;
         let prev_x = next_x - bw - 4.0;
-        Self::hit_add(regions, prev_x, 121.0, bw, 26.0, Action::Prev);
-        Self::hit_add(regions, next_x, 121.0, bw, 26.0, Action::Next);
-        Self::hit_add(regions, gear_x, 121.0, bw, 26.0, Action::OpenSettings);
+        Self::hit_add(regions, prev_x, 108.0, bw, 24.0, Action::Prev);
+        Self::hit_add(regions, next_x, 108.0, bw, 24.0, Action::Next);
+        Self::hit_add(regions, gear_x, 108.0, bw, 24.0, Action::OpenSettings);
         for (bx, glyph, px, act) in [
             (prev_x, "‹", 20.0, Action::Prev),
             (next_x, "›", 20.0, Action::Next),
@@ -1664,9 +1664,9 @@ impl Ui {
         ] {
             let hov = self.hovered(&act);
             if hov {
-                p.fill_round(bx, 121.0, bw, 26.0, 6.0, HOVER_BG);
+                p.fill_round(bx, 108.0, bw, 24.0, 6.0, HOVER_BG);
             }
-            p.text(glyph, bx, 121.0, bw, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px, false, glyph == "\u{E713}", if hov { WHITE } else { ICON_COL });
+            p.text(glyph, bx, 108.0, bw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px, false, glyph == "\u{E713}", if hov { WHITE } else { ICON_COL });
         }
 
         // 星期表头（周起始日可配置）
@@ -1674,17 +1674,17 @@ impl Ui {
         let gutter_w = if show_gutter { 26.0 } else { 0.0 };
         let col_w = (WIN_W - 20.0 - pad * 2.0 - gutter_w) / 7.0;
         let week_names = ["一", "二", "三", "四", "五", "六", "日"];
-        let gy = 154.0;
+        let gy = 132.0;
         let ws = cfg.week_start as usize % 7;
         for c in 0..7usize {
             let wd = (ws + c) % 7;
             let cx = left + gutter_w + col_w * c as f32 + col_w / 2.0;
-            p.text(week_names[wd], cx - 30.0, gy, 60.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, WEEK_HEAD);
+            p.text(week_names[wd], cx - 30.0, gy, 60.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, WEEK_HEAD);
         }
 
         // 月网格
-        let grid_y = 176.0;
-        let row_h = ((WIN_H - 10.0 - 6.0 - 58.0 - grid_y) / 6.0).max(60.0);
+        let grid_y = 150.0;
+        let row_h = ((WIN_H - 10.0 - 6.0 - 48.0 - grid_y) / 6.0).max(52.0);
         let first = NaiveDate::from_ymd_opt(self.view_y, self.view_m, 1).unwrap_or(today);
         let first_wd = first.weekday().num_days_from_monday() as i64;
         let offset = (first_wd - ws as i64 + 7) % 7;
@@ -1733,8 +1733,8 @@ impl Ui {
     }
 
     fn paint_bottom_bar(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
-        let bar_y = WIN_H - 10.0 - 58.0;
-        let bar_h = 58.0;
+        let bar_y = WIN_H - 10.0 - 48.0;
+        let bar_h = 48.0;
         let w = WIN_W - 20.0;
         let slot = w / 5.0;
         p.fill_rect(10.0, bar_y, w, 1.0, DIVIDER);
@@ -1783,7 +1783,8 @@ impl Ui {
         let n = items.len();
         let row_h = 38.0;
         let gap = 6.0;
-        let max_visible = ((600.0f32 / (row_h + gap)).floor() as usize).max(1);
+        let input_y = WIN_H - 66.0;
+        let max_visible = (((input_y - 8.0) - 58.0) / (row_h + gap)).floor().max(1.0) as usize;
         let end_i = max_visible.min(n);
         for (i, text) in items[..end_i].iter().enumerate() {
             let y = 58.0 + (row_h + gap) * i as f32;
@@ -1799,11 +1800,11 @@ impl Ui {
         if n == 0 {
             p.text("这一天还没有日程", 10.0, 130.0, WIN_W - 20.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB_DIM);
         } else if n > max_visible {
-            p.text(&format!("共 {} 条，仅显示前 {} 条", n, max_visible), 20.0, 655.0, WIN_W - 40.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM);
+            p.text(&format!("共 {} 条，仅显示前 {} 条", n, max_visible), 20.0, input_y - 22.0, WIN_W - 40.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM);
         }
 
         // 底部输入
-        let input = gdi::RectF { x: 28.0, y: 686.0, w: WIN_W - 20.0 - 28.0 - 92.0, h: 30.0 };
+        let input = gdi::RectF { x: 28.0, y: WIN_H - 66.0, w: WIN_W - 20.0 - 28.0 - 92.0, h: 30.0 };
         Self::hit_add(regions, input.x, input.y, input.w, input.h, Action::InputBox);
         p.fill_round(input.x, input.y, input.w, input.h, 8.0, gdi::argb(18, 255, 255, 255));
         p.stroke_round(input.x, input.y, input.w, input.h, 8.0, 1.0, gdi::argb(24, 255, 255, 255));
@@ -1823,7 +1824,7 @@ impl Ui {
                 p.line(input.x + 10.0 + draft_w + 1.0, input.y + 6.0, input.x + 10.0 + draft_w + 1.0, input.y + input.h - 6.0, 1.0, ROW_TXT);
             }
         }
-        let btn = gdi::RectF { x: WIN_W - 20.0 - 84.0, y: 686.0, w: 84.0, h: 30.0 };
+        let btn = gdi::RectF { x: WIN_W - 20.0 - 84.0, y: WIN_H - 66.0, w: 84.0, h: 30.0 };
         Self::hit_add(regions, btn.x, btn.y, btn.w, btn.h, Action::AgendaAdd);
         let hov = self.hovered(&Action::AgendaAdd);
         p.fill_round(btn.x, btn.y, btn.w, btn.h, 8.0, if hov { gdi::argb(255, 0x53, 0x99, 0xFB) } else { BLUE });
@@ -1831,32 +1832,6 @@ impl Ui {
     }
 
 
-    fn paint_context_menu(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
-        let mx = WIN_W - 206.0;
-        let my = 16.0;
-        let mw = 186.0;
-        let row_h = 34.0;
-        let autostart = self.st.config.lock().unwrap().autostart;
-        let items: [(Action, String); 4] = [
-            (Action::MenuShow, "显示日历".into()),
-            (Action::MenuAuto, format!("开机自启{}", if autostart { " ✓" } else { "" })),
-            (Action::MenuRefresh, "立即更新节假日数据".into()),
-            (Action::MenuQuit, "退出".into()),
-        ];
-        Self::hit_add(regions, 10.0, 10.0, WIN_W - 20.0, WIN_H - 20.0, Action::None);
-        p.fill_round(mx, my, mw, row_h * 4.0 + 8.0, 10.0, gdi::argb(255, 0x2A, 0x33, 0x45));
-        p.stroke_round(mx, my, mw, row_h * 4.0 + 8.0, 10.0, 1.0, gdi::argb(26, 255, 255, 255));
-        for (i, (act, name)) in items.iter().enumerate() {
-            let y = my + 6.0 + row_h * i as f32;
-            Self::hit_add(regions, mx + 6.0, y, mw - 12.0, row_h - 2.0, *act);
-            let hov = self.hovered(act);
-            if hov {
-                p.fill_round(mx + 6.0, y, mw - 12.0, row_h - 2.0, 6.0, gdi::argb(16, 255, 255, 255));
-            }
-            let col = if *act == Action::MenuQuit { RED } else { ROW_TXT };
-            p.text(name, mx + 18.0, y, mw - 30.0, row_h - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, col);
-        }
-    }
 }
 
 fn paint_day_cell(
@@ -1872,9 +1847,9 @@ fn paint_day_cell(
     cfg: &Config,
 ) {
     let cx = rect.x + rect.w / 2.0;
-    let num_cy = rect.y + rect.h * 0.24;
-    let line1_cy = rect.y + rect.h * 0.52;
-    let line2_cy = rect.y + rect.h * 0.78;
+    let num_cy = rect.y + rect.h * 0.30;
+    let line1_cy = rect.y + rect.h * 0.64;
+    let line2_cy = rect.y + rect.h * 0.64 + 14.0;
     let hovered = ui.hover.map(|h| matches!(h, Action::Cell(d) if d == date)).unwrap_or(false);
     if in_month && hovered {
         p.fill_round(rect.x + 2.0, rect.y + 2.0, rect.w - 4.0, rect.h - 4.0, 8.0, gdi::argb(13, 255, 255, 255));
@@ -1930,13 +1905,13 @@ fn paint_day_cell(
         if !sub.is_empty() {
             let chars: Vec<char> = sub.chars().collect();
             if chars.len() <= 5 {
-                p.text(&sub, rect.x + 1.0, line1_cy - 9.0, rect.w - 2.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, col);
+                p.text(&sub, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, col);
             } else {
                 // 超过 5 字换行：第一行 5 字，其余第二行
                 let line1: String = chars[..5].iter().collect();
                 let line2: String = chars[5..].iter().collect();
-                p.text(&line1, rect.x + 1.0, line1_cy - 10.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, col);
-                p.text(&line2, rect.x + 1.0, line2_cy - 9.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, col);
+                p.text(&line1, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, col);
+                p.text(&line2, rect.x + 1.0, line2_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, col);
             }
         }
     }
@@ -1954,7 +1929,7 @@ fn paint_day_cell(
     }
 
     if has_agenda {
-        p.fill_circle(cx, rect.y + rect.h - 5.0, 2.0, BLUE);
+        p.fill_circle(rect.x + 7.0, rect.y + 7.0, 2.0, BLUE);
     }
 }
 
@@ -2118,7 +2093,7 @@ impl Ui {
                 self.page = Page::Agenda;
                 self.redraw();
             }
-            Action::BottomExit | Action::MenuQuit => {
+            Action::BottomExit => {
                 unsafe {
                     DestroyWindow(self.hwnd as HWND);
                 }
@@ -2149,26 +2124,7 @@ impl Ui {
                 // ShowWindow 激活设置窗口会同步触发本面板 WM_ACTIVATE 重入加锁 → 死锁
             }
             Action::None => {}
-            Action::MenuShow => {
-                self.menu_open = false;
-                self.redraw();
-            }
-            Action::MenuRefresh => {
-                let _ = self.st.refresh_tx.send(());
-            }
-            Action::MenuAuto => {
-                let on = self.st.config.lock().unwrap().autostart;
-                {
-                    let mut cfg = self.st.config.lock().unwrap();
-                    cfg.autostart = !on;
-                    cfg.save();
-                }
-                apply_autostart(!on);
-                if let Some(t) = self.tray.lock().unwrap().as_ref() {
-                    t.autostart_item.set_checked(!on);
-                }
-                self.redraw();
-            }
+            // 软件设置 / 日期与时间 在 WM_LBUTTONDOWN 锁外处理
             Action::InputBox | Action::Weather => {}
         }
     }
@@ -2233,6 +2189,14 @@ extern "system" {
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipDeleteGraphics(graphics: gdi::Gp) -> i32;
+}
+
+fn x_of(lp: LPARAM) -> i32 {
+    ((lp as usize) & 0xFFFF) as u16 as i16 as i32
+}
+
+fn y_of(lp: LPARAM) -> i32 {
+    (((lp as usize) >> 16) as u16 as i16) as i32
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -2334,6 +2298,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             }
             0
         }
+        WM_RBUTTONDOWN => {
+            // 右键日期格：打开“新增日程 / 新增待办”菜单
+            let hit = {
+                let mut guard = UI.lock().unwrap();
+                if let Some(sui) = guard.as_mut() {
+                    let ui = &mut sui.0;
+                    if ui.shown {
+                        let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
+                        let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
+                        ui.action_at(x, y)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(Action::Cell(d)) = hit {
+                // 菜单需要屏幕坐标：客户区坐标 + 窗口原点
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut r);
+                crate::ctxmenu::ctxmenu_date::date_menu_toggle(r.left + x_of(lp), r.top + y_of(lp), d);
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
             let mut hit: Option<Action> = None;
             {
@@ -2352,12 +2341,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let mut guard = UI.lock().unwrap();
                     if let Some(sui) = guard.as_mut() {
                         let ui = &mut sui.0;
-                        if matches!(a, Action::BottomExit | Action::MenuQuit) {
+                        if matches!(a, Action::BottomExit) {
                             exit = true;
                         } else if matches!(a, Action::OpenSettings | Action::BottomSettings) {
                             // 设置窗口为 NOACTIVATE：不抢焦点，面板保持打开
                             ui.page = Page::Calendar;
-                            ui.menu_open = false;
                             ui.hover = None;
                             ui.redraw();
                             open_settings = true;
@@ -2391,7 +2379,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if a != ui.hover {
                             ui.hover = a;
                             ui.redraw();
-                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaAdd) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MenuShow) | Some(Action::MenuAuto) | Some(Action::MenuRefresh) | Some(Action::MenuQuit));
+                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaAdd) | Some(Action::OpenSettings) | Some(Action::Back));
                             SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
                         }
                         fc_open = a == Some(Action::Weather);
@@ -2412,10 +2400,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let ui = &mut sui.0;
                     match wp as i32 {
                         0x1B => {
-                            if ui.menu_open {
-                                ui.menu_open = false;
-                                ui.redraw();
-                            } else if ui.page != Page::Calendar {
+                            if ui.page != Page::Calendar {
                                 ui.page = Page::Calendar;
                                 ui.redraw();
                             } else {
@@ -2494,7 +2479,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         let ui = &mut sui.0;
                         if ui.shown {
                             ui.shown = false;
-                            ui.menu_open = false;
                             hide = true;
                         }
                     }
@@ -2516,14 +2500,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let guard = UI.lock().unwrap();
                 guard.as_ref().map(|s| s.0.shown).unwrap_or(false)
             };
-            if wp == 2 {
-                perform_show(hwnd);
-                let mut guard = UI.lock().unwrap();
-                if let Some(sui) = guard.as_mut() {
-                    sui.0.menu_open = true;
-                    sui.0.redraw();
-                }
-            } else if shown {
+            if shown {
                 perform_hide(hwnd);
             } else {
                 perform_show(hwnd);

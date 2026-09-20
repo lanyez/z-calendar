@@ -1,4 +1,7 @@
-//! 任务栏时钟接管：透明可点击覆盖层（Win32 原生窗口，独立线程）
+//! 任务栏时钟点击接管：低级鼠标钩子（WH_MOUSE_LL）
+//! 不建窗口、不遮挡、不修改原生时钟；点击落在时钟矩形内时吞掉该次点击
+//! 并打开本日历（系统日历因此不会再弹出），其余鼠标事件原样放行。
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
@@ -15,14 +18,18 @@ pub struct ClockInfo {
 
 pub type SharedClock = Arc<Mutex<Option<ClockInfo>>>;
 
-#[derive(Clone, Copy)]
-pub enum OverlayEvent {
-    LeftClick,
-    RightClick,
-}
-
 static CLOCK: std::sync::OnceLock<SharedClock> = std::sync::OnceLock::new();
-static OVERLAY_HWND: Mutex<usize> = Mutex::new(0);
+
+// 时钟矩形缓存（供钩子回调无锁读取）
+static CLK_VALID: AtomicBool = AtomicBool::new(false);
+static CLK_L: AtomicI32 = AtomicI32::new(0);
+static CLK_T: AtomicI32 = AtomicI32::new(0);
+static CLK_R: AtomicI32 = AtomicI32::new(0);
+static CLK_B: AtomicI32 = AtomicI32::new(0);
+// 全屏应用时放行点击（任务栏不可见）
+static SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+const WH_MOUSE_LL: i32 = 14;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -39,76 +46,78 @@ pub fn spawn(clock: SharedClock) {
 unsafe fn message_loop(clock: SharedClock) {
     let _ = CLOCK.set(clock);
 
-    let hinstance = GetModuleHandleW(std::ptr::null());
-    let cls = wide("z-calendar-overlay");
-    let mut wc: WNDCLASSW = std::mem::zeroed();
-    wc.lpfnWndProc = Some(wndproc);
-    wc.hInstance = hinstance;
-    wc.lpszClassName = cls.as_ptr();
-    RegisterClassW(&wc);
-
-    let title = wide("z-calendar-overlay-win");
-    let hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        cls.as_ptr(),
-        title.as_ptr(),
-        WS_POPUP,
-        0,
-        0,
-        77,
-        44,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        hinstance,
-        std::ptr::null_mut(),
-    );
-    if hwnd.is_null() {
-        return;
-    }
-    *OVERLAY_HWND.lock().unwrap() = hwnd as usize;
-
-    // 全窗 alpha=1/255：肉眼不可见但可接收鼠标点击
-    SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA);
-    SetTimer(hwnd, 1, 1000, None);
+    let hinstance = GetModuleHandleW(std::ptr::null_mut());
+    let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), hinstance, 0);
+    // NULL 窗口定时器：WM_TIMER 直接投递到线程消息队列
+    SetTimer(std::ptr::null_mut(), 1, 1000, None);
     update_overlay();
 
     let mut msg: MSG = std::mem::zeroed();
     while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+        if msg.message == WM_TIMER && msg.hwnd.is_null() {
+            update_overlay();
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if !hook.is_null() {
+        UnhookWindowsHookEx(hook);
+    }
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
-        WM_TIMER => {
-            update_overlay();
-            0
-        }
-        WM_LBUTTONDOWN => {
-            crate::flyout::overlay_click(0);
-            0
-        }
-        WM_RBUTTONDOWN => {
-            crate::flyout::overlay_click(2);
-            0
-        }
-        WM_SETCURSOR => {
-            // 显式设置箭头：类光标机制在某些环境下仍会显示忙碌
-            if (lp as i32 & 0xFFFF) == 1 {
-                // HTCLIENT
-                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW));
-                1
-            } else {
-                DefWindowProcW(hwnd, msg, wp, lp)
+/// 低级鼠标钩子：点击原生时钟 → 吞掉并打开本日历
+unsafe extern "system" fn hook_proc(n_code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if n_code >= 0 {
+        let msg = wp as u32;
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN) {
+            // 右键菜单打开时：菜单内点击放行给菜单窗口；菜单外点击收起菜单并吞掉
+            if let Some((ml, mt, mr, mb)) = crate::ctxmenu::rect() {
+                let info = &*(lp as *const MSLLHOOKSTRUCT);
+                let (x, y) = (info.pt.x, info.pt.y);
+                if x >= ml && x < mr && y >= mt && y < mb {
+                    return CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp);
+                }
+                crate::ctxmenu::close();
+                return 1;
             }
         }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
+        // 日期右键菜单打开时：菜单内左键放行给菜单窗口；菜单外左键收起菜单并吞掉
+        // （右键不拦截，右键其它日期格仍由主面板的 WM_RBUTTONDOWN 切换菜单）
+        if msg == WM_LBUTTONDOWN {
+            if let Some((ml, mt, mr, mb)) = crate::ctxmenu::ctxmenu_date::date_menu_rect() {
+                let info = &*(lp as *const MSLLHOOKSTRUCT);
+                let (x, y) = (info.pt.x, info.pt.y);
+                if x >= ml && x < mr && y >= mt && y < mb {
+                    return CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp);
+                }
+                crate::ctxmenu::ctxmenu_date::date_menu_close();
+                return 1;
+            }
         }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
+        if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP)
+            && CLK_VALID.load(Ordering::Relaxed)
+            && !SUSPENDED.load(Ordering::Relaxed)
+        {
+            let info = &*(lp as *const MSLLHOOKSTRUCT);
+            let (x, y) = (info.pt.x, info.pt.y);
+            let (l, t, r, b) = (
+                CLK_L.load(Ordering::Relaxed),
+                CLK_T.load(Ordering::Relaxed),
+                CLK_R.load(Ordering::Relaxed),
+                CLK_B.load(Ordering::Relaxed),
+            );
+            if x >= l && x <= r && y >= t && y <= b {
+                match msg {
+                    WM_LBUTTONDOWN => crate::flyout::overlay_click(0),
+                    WM_RBUTTONDOWN => crate::ctxmenu::toggle(x, y),
+                    _ => {}
+                }
+                // 吞掉该次点击（含配对的抬起），原生时钟与系统日历均不响应
+                return 1;
+            }
+        }
     }
+    CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp)
 }
 
 unsafe fn find_clock() -> Option<ClockInfo> {
@@ -169,13 +178,9 @@ unsafe fn is_foreground_fullscreen(mon: (i32, i32, i32, i32)) -> bool {
 }
 
 unsafe fn update_overlay() {
-    let hwnd = *OVERLAY_HWND.lock().unwrap();
-    if hwnd == 0 {
-        return;
-    }
-    let hwnd = hwnd as HWND;
+    let clock = CLOCK.get().unwrap();
     let info = find_clock();
-    let mut shown = false;
+    let mut suspended = true;
     if let Some(ref ci) = info {
         if !is_foreground_fullscreen(ci.mon) {
             let r = &ci.rect;
@@ -183,21 +188,24 @@ unsafe fn update_overlay() {
             let vis_w = ci.mon.2.min(r.right) - ci.mon.0.max(r.left);
             let (w, h) = (r.right - r.left, r.bottom - r.top);
             if vis_h >= 20.min(h) && vis_w >= 20 {
-                shown = true;
+                suspended = false;
             }
         }
     }
 
-    let clock = CLOCK.get().unwrap();
-    match (shown, info) {
-        (true, Some(ci)) => {
-            let (x, y, w, h) = (ci.rect.left - 2, ci.rect.top - 2, ci.rect.right - ci.rect.left + 4, ci.rect.bottom - ci.rect.top + 4);
-            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    SUSPENDED.store(suspended, Ordering::Relaxed);
+    match (suspended, info) {
+        (false, Some(ci)) => {
+            let r = &ci.rect;
+            CLK_L.store(r.left, Ordering::Relaxed);
+            CLK_T.store(r.top, Ordering::Relaxed);
+            CLK_R.store(r.right, Ordering::Relaxed);
+            CLK_B.store(r.bottom, Ordering::Relaxed);
+            CLK_VALID.store(true, Ordering::Relaxed);
             *clock.lock().unwrap() = Some(ci);
         }
         _ => {
-            ShowWindow(hwnd, SW_HIDE);
+            CLK_VALID.store(false, Ordering::Relaxed);
             *clock.lock().unwrap() = None;
         }
     }

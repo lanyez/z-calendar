@@ -3,7 +3,9 @@
 
 mod almanac;
 mod config;
+mod ctxmenu;
 mod flyout;
+mod inputbox;
 mod gdi;
 mod ics;
 mod lunar;
@@ -112,7 +114,10 @@ fn main() {
     }
 
     flyout::create_window(st.clone(), agenda.clone(), tray.clone());
-    sidebar::create_window(st.clone(), agenda);
+    sidebar::create_window(st.clone(), agenda.clone());
+    ctxmenu::create_window(st.clone(), tray.clone());
+    ctxmenu::ctxmenu_date::create_date_menu_window();
+    inputbox::create_window(agenda.clone());
     flyout::create_settings_window(st.clone(), tray);
     flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);

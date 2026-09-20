@@ -27,6 +27,8 @@ unsafe impl Send for SendSb {}
 enum SbAction {
     CardManage,
     TodoToggle(usize),
+    TodoDelete(usize),
+    AgendaDelete(usize),
 }
 
 struct SidebarUi {
@@ -53,6 +55,9 @@ struct Todo {
     text: String,
     #[serde(default)]
     done: bool,
+    /// 归属日期（Y-M-D，与日程 key 同格式）
+    #[serde(default)]
+    date: Option<String>,
 }
 
 static TODOS: Mutex<Option<Vec<Todo>>> = Mutex::new(None);
@@ -75,6 +80,65 @@ fn save_todos(list: &[Todo]) {
     if let Ok(text) = serde_json::to_string_pretty(list) {
         let _ = std::fs::write(path, text);
     }
+}
+
+/// 新增某日待办（日期右键菜单）
+pub fn add_todo(key: String, text: String) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(Vec::new);
+    list.push(Todo { text, done: false, date: Some(key) });
+    save_todos(list);
+}
+
+/// 某日的待办（下标对应全局列表中的顺序）
+fn todos_for(key: &str) -> Vec<(usize, Todo)> {
+    todos()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, t)| t.date.as_deref() == Some(key))
+        .collect()
+}
+
+/// 删除某日第 idx 条待办
+pub fn remove_todo_for(key: &str, idx: usize) {
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(Vec::new);
+    let mut seen = 0usize;
+    let mut remove_at = None;
+    for (gi, td) in list.iter().enumerate() {
+        if td.date.as_deref() == Some(key) {
+            if seen == idx {
+                remove_at = Some(gi);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    if let Some(gi) = remove_at {
+        list.remove(gi);
+        save_todos(list);
+    }
+}
+
+/// 切换某日第 idx 条待办的完成状态
+pub fn toggle_todo_for(key: &str, idx: usize) {
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(Vec::new);
+    let mut seen = 0usize;
+    for td in list.iter_mut() {
+        if td.date.as_deref() == Some(key) {
+            if seen == idx {
+                td.done = !td.done;
+                break;
+            }
+            seen += 1;
+        }
+    }
+    save_todos(list);
 }
 
 /// 历史上的今天：内置精选事件（月, 日, 年, 事件）
@@ -426,26 +490,26 @@ impl SidebarUi {
     fn almanac_height(&self, p: &Painter, date: NaiveDate) -> f32 {
         let zhi = almanac::jianzhi(date);
         let (yi, ji) = almanac::jianzhi_yiji(zhi);
-        let max_w = SB_W - 32.0 - 28.0 - 32.0 - 36.0;
+        let max_w = SB_W - 32.0 - 28.0 - 30.0 - 32.0;
         let l1 = wrap_terms(p, yi, max_w).len() as f32;
         let l2 = wrap_terms(p, ji, max_w).len() as f32;
-        12.0 + (l1 * 17.0).max(24.0) + 6.0 + (l2 * 17.0).max(24.0) + 12.0
+        8.0 + (l1 * 16.0).max(22.0) + 5.0 + (l2 * 16.0).max(22.0) + 8.0
     }
 
     fn agenda_height(&self, date: NaiveDate) -> f32 {
         let key = key_of_date(date);
         let n = self.agenda.lock().unwrap().get(&key).map(|v| v.len()).unwrap_or(0);
         if n == 0 {
-            52.0
+            44.0
         } else {
-            12.0 + (1 + n.min(4)) as f32 * 21.0 + 10.0
+            8.0 + (1 + n.min(4)) as f32 * 20.0 + 8.0
         }
     }
 
     fn motto_height(&self, p: &Painter, date: NaiveDate) -> f32 {
         let (quote, author) = motto_of(date);
         let lines = wrap_chars(p, quote, SB_W - 32.0 - 28.0).len() as f32;
-        12.0 + lines * 19.0 + 8.0 + 18.0 + 12.0
+        8.0 + lines * 18.0 + 5.0 + 16.0 + 8.0
     }
 
     fn paint(&mut self, p: &Painter) {
@@ -461,103 +525,109 @@ impl SidebarUi {
         // 页面底
         p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE);
 
-        let mut y = 14.0;
+        let mut y = 8.0;
         let cx = 16.0;
         let cw = SB_W - 32.0;
         for c in &cards {
             match *c {
                 "date" => {
                     self.paint_date_card(p, cx, y, cw, date, today);
-                    y += 96.0 + 12.0;
+                    y += 84.0 + 8.0;
                 }
                 "almanac" => {
                     let h = self.almanac_height(p, date);
                     self.paint_almanac_card(p, cx, y, cw, h, date);
-                    y += h + 12.0;
+                    y += h + 8.0;
                 }
                 "events" => {
-                    p.fill_round(cx, y, cw, 52.0, 10.0, POPUP_BG);
+                    p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG);
                     let text = self.next_event_text(date, today);
-                    p.text(&text, cx, y, cw, 52.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
-                    y += 52.0 + 12.0;
+                    p.text(&text, cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                    y += 44.0 + 8.0;
                 }
                 "agenda" => {
                     let h = self.agenda_height(date);
                     self.paint_agenda_card(p, cx, y, cw, h, date);
-                    y += h + 12.0;
+                    y += h + 8.0;
                 }
                 "history" => {
                     let items = history_of(date.month(), date.day());
                     if items.is_empty() {
-                        p.fill_round(cx, y, cw, 52.0, 10.0, POPUP_BG);
-                        p.text("暂无记录", cx, y, cw, 52.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
-                        y += 52.0 + 12.0;
+                        p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG);
+                        p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                        y += 44.0 + 8.0;
                     } else {
-                        let h = 12.0 + 20.0 + (items.len().min(4) as f32) * 19.0 + 10.0;
+                        let h = 8.0 + 18.0 + (items.len().min(4) as f32) * 18.0 + 8.0;
                         p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-                        p.text("历史上的今天", cx + 14.0, y + 10.0, cw - 28.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, true, false, TITLE_COL);
+                        p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
                         for (i, (y2, t)) in items.iter().take(4).enumerate() {
                             let line = format!("{}年：{}", y2, t);
-                            p.text(&line, cx + 14.0, y + 34.0 + i as f32 * 19.0, cw - 28.0, 19.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
+                            p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT);
                         }
-                        y += h + 12.0;
+                        y += h + 8.0;
                     }
                 }
                 "motto" => {
                     let h = self.motto_height(p, date);
                     self.paint_motto_card(p, cx, y, cw, h, date);
-                    y += h + 12.0;
+                    y += h + 8.0;
                 }
                 "todo" => {
-                    let todos = todos();
+                    let key = crate::ics::key_of_date(date);
+                    let todos = todos_for(&key);
                     let rows = todos.len().min(5);
-                    let h = 12.0 + 20.0 + 6.0 + if todos.is_empty() { 20.0 } else { rows as f32 * 22.0 } + 10.0;
+                    let h = 8.0 + 18.0 + 4.0 + if todos.is_empty() { 18.0 } else { rows as f32 * 20.0 } + 8.0;
                     p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-                    p.text("待办清单", cx + 14.0, y + 10.0, cw - 28.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, true, false, TITLE_COL);
+                    p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
                     if todos.is_empty() {
-                        p.text("暂无待办", cx, y + 36.0, cw, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
+                        p.text("暂无待办", cx, y + 28.0, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
                     } else {
-                        for (i, td) in todos.iter().take(5).enumerate() {
-                            let ry = y + 36.0 + i as f32 * 22.0;
+                        for (i, (_, td)) in todos.iter().take(5).enumerate() {
+                            let ry = y + 28.0 + i as f32 * 20.0;
                             let col = if td.done { SUB_DIM } else { ROW_TXT };
-                            p.stroke_circle(cx + 21.0, ry + 10.0, 5.5, 1.2, if td.done { BLUE } else { SUB });
+                            // 勾选圈（点击切换完成）
+                            p.stroke_circle(cx + 21.0, ry + 10.0, 5.0, 1.2, if td.done { BLUE } else { SUB });
                             if td.done {
-                                p.fill_circle(cx + 21.0, ry + 10.0, 3.5, BLUE);
+                                p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE);
                             }
-                            p.text(&td.text, cx + 36.0, ry, cw - 60.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, col);
+                            p.text(&td.text, cx + 36.0, ry, cw - 78.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
                             if td.done {
-                                let w = p.measure(&td.text, 12.5, false, false).0;
-                                p.line(cx + 36.0, ry + 10.0, cx + 36.0 + w, ry + 10.0, 1.0, SUB_DIM);
+                                let w = p.measure(&td.text, 12.0, false, false).0;
+                                p.line(cx + 36.0, ry + 9.0, cx + 36.0 + w, ry + 9.0, 1.0, SUB_DIM);
                             }
-                            self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: cw - 24.0, h: 22.0 }, SbAction::TodoToggle(i)));
+                            // 删除
+                            let del_hover = self.hover == Some(SbAction::TodoDelete(i));
+                            p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+                            self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoToggle(i)));
+                            self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoDelete(i)));
                         }
                     }
-                    y += h + 12.0;
+                    y += h + 8.0;
                 }
                 _ => {}
             }
         }
 
         // 卡片管理
-        p.text("卡片管理", cx, y, cw, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE);
-        self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 28.0 }, SbAction::CardManage));
+        p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE);
+        self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 24.0 }, SbAction::CardManage));
     }
 
     fn paint_date_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, date: NaiveDate, today: NaiveDate) {
-        p.fill_round(cx, y, cw, 96.0, 10.0, POPUP_BG);
+        p.fill_round(cx, y, cw, 84.0, 10.0, POPUP_BG);
         let ix = cx + 14.0;
-        let iy = y + 16.0;
-        p.fill_round(ix, iy, 56.0, 56.0, 8.0, WHITE);
-        p.fill_round(ix, iy, 56.0, 15.0, 7.0, RED);
-        p.fill_round(ix, iy + 11.0, 56.0, 45.0, 7.0, WHITE);
-        p.fill_circle(ix + 15.0, iy + 1.0, 2.5, RED);
-        p.fill_circle(ix + 41.0, iy + 1.0, 2.5, RED);
-        p.text(&format!("{}", date.day()), ix, iy + 13.0, 56.0, 42.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 26.0, true, false, BLUE);
+        let iy = y + 13.0;
+        p.fill_round(ix, iy, 48.0, 48.0, 7.0, WHITE);
+        p.fill_round(ix, iy, 48.0, 13.0, 6.0, RED);
+        p.fill_round(ix, iy + 9.0, 48.0, 39.0, 6.0, WHITE);
+        p.fill_circle(ix + 13.0, iy + 1.0, 2.2, RED);
+        p.fill_circle(ix + 35.0, iy + 1.0, 2.2, RED);
+        p.text(&format!("{}", date.day()), ix, iy + 11.0, 48.0, 36.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 23.0, true, false, BLUE);
 
-        let tx = ix + 66.0;
+        let tx = ix + 58.0;
         let tw = cx + cw - 14.0 - tx - 48.0;
         let wd = ["日", "一", "二", "三", "四", "五", "六"][date.weekday().num_days_from_sunday() as usize];
-        p.text(&format!("{}年{}月{}日 星期{}", date.year(), date.month(), date.day(), wd), tx, y + 14.0, tw + 40.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.5, true, false, TITLE_COL);
+        p.text(&format!("{}年{}月{}日 星期{}", date.year(), date.month(), date.day(), wd), tx, y + 12.0, tw + 40.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL);
 
         // 相对今天徽标
         let rel = (date - today).num_days();
@@ -568,15 +638,15 @@ impl SidebarUi {
             n if n < 0 => format!("{}天前", -n),
             n => format!("{}天后", n),
         };
-        let bw = p.measure(&tag, 10.0, false, false).0 + 16.0;
+        let bw = p.measure(&tag, 10.0, false, false).0 + 14.0;
         let bx = cx + cw - 14.0 - bw;
-        p.fill_round(bx, y + 13.0, bw, 20.0, 10.0, BLUE);
-        p.text(&tag, bx, y + 13.0, bw, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, WHITE);
+        p.fill_round(bx, y + 11.0, bw, 18.0, 9.0, BLUE);
+        p.text(&tag, bx, y + 11.0, bw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, WHITE);
 
         let l = crate::lunar::solar_to_lunar(date);
-        p.text(&almanac::day_week_line(date), tx, y + 42.0, cw - 28.0 - 70.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
+        p.text(&almanac::day_week_line(date), tx, y + 35.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
         if let Some(l) = l {
-            p.text(&almanac::lunar_ganzhi_line(&l, date), tx, y + 62.0, cw - 28.0 - 70.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
+            p.text(&almanac::lunar_ganzhi_line(&l, date), tx, y + 52.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
         }
     }
 
@@ -589,43 +659,47 @@ impl SidebarUi {
         let mut ry = y + 12.0;
         for (terms, label, bg, fg) in rows {
             let lines = wrap_terms(p, terms, max_w);
-            let row_h = (lines.len() as f32 * 17.0).max(24.0);
-            p.fill_round(cx + 14.0, ry + (row_h - 24.0) / 2.0, 24.0, 24.0, 5.0, bg);
-            p.text(label, cx + 14.0, ry + (row_h - 24.0) / 2.0, 24.0, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, true, false, fg);
+            let row_h = (lines.len() as f32 * 16.0).max(22.0);
+            p.fill_round(cx + 14.0, ry + (row_h - 22.0) / 2.0, 22.0, 22.0, 5.0, bg);
+            p.text(label, cx + 14.0, ry + (row_h - 22.0) / 2.0, 22.0, 22.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, true, false, fg);
             for (i, line) in lines.iter().enumerate() {
-                p.text(line, cx + 14.0 + 32.0, ry + (row_h - lines.len() as f32 * 17.0) / 2.0 + i as f32 * 17.0, max_w, 17.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                p.text(line, cx + 14.0 + 30.0, ry + (row_h - lines.len() as f32 * 16.0) / 2.0 + i as f32 * 16.0, max_w, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
             }
-            ry += row_h + 6.0;
+            ry += row_h + 5.0;
         }
         // 右侧竖排徽标：十二值日
         let name = format!("{}日", almanac::JIANZHI_NAMES[zhi]);
-        let bx = cx + cw - 14.0 - 28.0;
-        let by = y + 12.0;
-        let bh = h - 24.0;
-        p.fill_round(bx, by, 28.0, bh, 6.0, gdi::argb(30, 62, 135, 250));
-        p.stroke_round(bx, by, 28.0, bh, 6.0, 1.0, gdi::argb(110, 62, 135, 250));
+        let bx = cx + cw - 14.0 - 26.0;
+        let by = y + 10.0;
+        let bh = h - 20.0;
+        p.fill_round(bx, by, 26.0, bh, 6.0, gdi::argb(30, 62, 135, 250));
+        p.stroke_round(bx, by, 26.0, bh, 6.0, 1.0, gdi::argb(110, 62, 135, 250));
         let chars: Vec<char> = name.chars().collect();
-        let total = chars.len() as f32 * 18.0;
+        let total = chars.len() as f32 * 17.0;
         let start = by + (bh - total) / 2.0;
         for (i, ch) in chars.iter().enumerate() {
-            p.text(&ch.to_string(), bx, start + i as f32 * 18.0, 28.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, false, false, BLUE);
+            p.text(&ch.to_string(), bx, start + i as f32 * 17.0, 26.0, 17.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE);
         }
     }
 
-    fn paint_agenda_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
+    fn paint_agenda_card(&mut self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
         p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
         let key = key_of_date(date);
         let items = self.agenda.lock().unwrap().get(&key).cloned().unwrap_or_default();
         let wd = ["日", "一", "二", "三", "四", "五", "六"][date.weekday().num_days_from_sunday() as usize];
         if items.is_empty() {
-            p.text(&format!("{}年{}月{}日 星期{} 还没有日程", date.year(), date.month(), date.day(), wd), cx, y, cw, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
+            p.text(&format!("{}年{}月{}日 星期{} 还没有日程", date.year(), date.month(), date.day(), wd), cx, y, cw, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
         } else {
-            p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 10.0, cw - 28.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
+            p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
             for (i, item) in items.iter().take(4).enumerate() {
-                p.text(item, cx + 14.0, y + 34.0 + i as f32 * 21.0, cw - 28.0, 19.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                let ry = y + 28.0 + i as f32 * 20.0;
+                p.text(item, cx + 14.0, ry, cw - 56.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                let del_hover = self.hover == Some(SbAction::AgendaDelete(i));
+                p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+                self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::AgendaDelete(i)));
             }
             if items.len() > 4 {
-                p.text(&format!("… 共 {} 条", items.len()), cx + 14.0, y + 34.0 + 4.0 * 21.0, cw - 28.0, 19.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB_DIM);
+                p.text(&format!("… 共 {} 条", items.len()), cx + 14.0, y + 28.0 + 4.0 * 20.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
             }
         }
     }
@@ -635,9 +709,9 @@ impl SidebarUi {
         let (quote, author) = motto_of(date);
         let lines = wrap_chars(p, quote, cw - 28.0);
         for (i, line) in lines.iter().enumerate() {
-            p.text(line, cx + 14.0, y + 12.0 + i as f32 * 19.0, cw - 28.0, 19.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text(line, cx + 14.0, y + 10.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
         }
-        p.text(&format!("—— {}", author), cx + 14.0, y + h - 26.0, cw - 28.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 11.5, false, false, SUB);
+        p.text(&format!("—— {}", author), cx + 14.0, y + h - 22.0, cw - 28.0, 16.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB);
     }
 
     fn next_event_text(&self, date: NaiveDate, today: NaiveDate) -> String {
@@ -668,7 +742,7 @@ fn wrap_terms(p: &Painter, terms: &[&str], max_w: f32) -> Vec<String> {
     let mut cur = String::new();
     let mut w = 0.0f32;
     for t in terms {
-        let tw = p.measure(t, 12.5, false, false).0;
+        let tw = p.measure(t, 12.0, false, false).0;
         let add = if cur.is_empty() { tw } else { tw + 10.0 };
         if !cur.is_empty() && w + add > max_w {
             lines.push(std::mem::take(&mut cur));
@@ -693,7 +767,7 @@ fn wrap_chars(p: &Painter, s: &str, max_w: f32) -> Vec<String> {
     let mut cur = String::new();
     let mut w = 0.0f32;
     for ch in s.chars() {
-        let cw = p.measure(&ch.to_string(), 12.5, false, false).0;
+        let cw = p.measure(&ch.to_string(), 12.0, false, false).0;
         if w + cw > max_w && !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
             w = 0.0;
@@ -765,15 +839,40 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                         crate::flyout::show_settings_tab(2);
                     }
                     Some(SbAction::TodoToggle(i)) => {
-                        let mut list = todos();
-                        if let Some(td) = list.get_mut(i) {
-                            td.done = !td.done;
+                        if let Some(d) = f.date {
+                            let key = crate::ics::key_of_date(d);
+                            crate::sidebar::toggle_todo_for(&key, i);
+                            f.redraw();
                         }
-                        save_todos(&list);
-                        drop(guard);
-                        let mut g2 = SIDEBAR_UI.lock().unwrap();
-                        if let Some(f) = g2.as_mut() {
-                            f.0.redraw();
+                    }
+                    Some(SbAction::TodoDelete(i)) => {
+                        if let Some(d) = f.date {
+                            let key = crate::ics::key_of_date(d);
+                            crate::sidebar::remove_todo_for(&key, i);
+                            f.redraw();
+                        }
+                    }
+                    Some(SbAction::AgendaDelete(i)) => {
+                        if let Some(d) = f.date {
+                            let key = crate::ics::key_of_date(d);
+                            let mut map = f.agenda.lock().unwrap();
+                            let mut removed = false;
+                            if let Some(v) = map.get_mut(&key) {
+                                if i < v.len() {
+                                    v.remove(i);
+                                    if v.is_empty() {
+                                        map.remove(&key);
+                                    }
+                                    if let Ok(json) = serde_json::to_string(&*map) {
+                                        let _ = std::fs::write(crate::config::data_dir().join("agenda.json"), json);
+                                    }
+                                    removed = true;
+                                }
+                            }
+                            drop(map);
+                            if removed {
+                                f.redraw();
+                            }
                         }
                     }
                     _ => {}
