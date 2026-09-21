@@ -12,6 +12,9 @@ fn def_week_start() -> u32 {
 fn def_ics() -> String {
     DEFAULT_ICS_URL.to_string()
 }
+fn def_motto_type() -> String {
+    "d".to_string() // 名人名言
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -55,6 +58,9 @@ pub struct Config {
     pub sidebar_history: bool,   // 历史上的今天
     #[serde(default)]
     pub sidebar_motto: bool,     // 时间格言
+    /// 时间格言分类：d=名人名言 a=文学 i=互联网 k=科普
+    #[serde(default = "def_motto_type")]
+    pub motto_type: String,
     #[serde(default = "def_true")]
     pub sidebar_todo: bool,      // 待办清单
 }
@@ -80,6 +86,7 @@ impl Default for Config {
             sidebar_agenda: true,
             sidebar_history: false,
             sidebar_motto: false,
+            motto_type: "d".to_string(),
             sidebar_todo: true,
         }
     }
@@ -107,6 +114,9 @@ impl Config {
         }
         if cfg.ics_url.is_empty() {
             cfg.ics_url = DEFAULT_ICS_URL.to_string();
+        }
+        if !matches!(cfg.motto_type.as_str(), "d" | "a" | "i" | "k") {
+            cfg.motto_type = "d".to_string();
         }
         cfg
     }

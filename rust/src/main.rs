@@ -4,12 +4,15 @@
 mod almanac;
 mod config;
 mod ctxmenu;
+mod events;
 mod flyout;
 mod inputbox;
 mod gdi;
+mod history;
 mod ics;
 mod lunar;
 mod lunar_data;
+mod motto;
 mod overlay;
 mod sidebar;
 mod tray;
@@ -84,6 +87,10 @@ fn main() {
 
     let config = config::Config::load();
     let holidays = ics::load_cache();
+    // 历史上的今天：删除不是当天的缓存数据
+    history::purge_stale();
+    // 时间格言：删除旧版本遗留的缓存（现改为每次点击日期都重新获取）
+    motto::purge_stale();
     let weather = if std::env::var("CAL_FAKE_WX").map(|v| v == "1").unwrap_or(false) {
         Some(weather::fake())
     } else {

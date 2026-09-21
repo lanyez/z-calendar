@@ -1,6 +1,5 @@
 //! 日期侧边栏：点击日历日期时在日历左侧弹出，按设置显示卡片
 //! （日期信息 / 黄历信息 / 最近事件 / 今日日程 / 历史上的今天 / 时间格言 / 待办清单）
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,11 +10,15 @@ use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleD
 use winapi::um::winuser::*;
 
 use crate::almanac;
+use crate::events::AgendaMap;
 use crate::flyout::SharedState;
 use crate::gdi::{self, Cache, Painter};
 use crate::ics::{key_of_date, DayType};
 
 pub const SB_W: f32 = 400.0;
+
+/// 历史上的今天后台拉取完成：请求侧栏重绘（线程安全）
+const WM_APP_HISTORY: UINT = 0x8000 + 1;
 
 static SIDEBAR_HWND: AtomicUsize = AtomicUsize::new(0);
 static SIDEBAR_UI: Mutex<Option<SendSb>> = Mutex::new(None);
@@ -42,7 +45,7 @@ struct SidebarUi {
     g: gdi::Gp,
     cache: Cache,
     st: SharedState,
-    agenda: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    agenda: Arc<Mutex<AgendaMap>>,
     date: Option<NaiveDate>,
     regions: Vec<(gdi::RectF, SbAction)>,
     hover: Option<SbAction>,
@@ -51,18 +54,36 @@ struct SidebarUi {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Todo {
-    text: String,
+pub struct Todo {
+    pub text: String,
     #[serde(default)]
-    done: bool,
+    pub done: bool,
     /// 归属日期（Y-M-D，与日程 key 同格式）
     #[serde(default)]
-    date: Option<String>,
+    pub date: Option<String>,
+    /// 优先级：0=收集箱 1=重要且紧急 2=重要但不紧急 3=紧急但不重要 4=不重要不紧急
+    #[serde(default)]
+    pub priority: u8,
+    /// 是否带有时间（无时间待办只显示内容）
+    #[serde(default)]
+    pub has_time: bool,
+    /// "%Y-%m-%d %H:%M"
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end: Option<String>,
+    /// 提前提醒分钟数（None=不提醒，0=准时）
+    #[serde(default)]
+    pub remind: Option<i64>,
+    /// 重复间隔分钟（None=单次）
+    #[serde(default)]
+    pub repeat: Option<i64>,
 }
 
 static TODOS: Mutex<Option<Vec<Todo>>> = Mutex::new(None);
 
-fn todos() -> Vec<Todo> {
+/// 缓存未加载时先读盘，避免写操作覆盖已有数据
+fn cached_list() -> Vec<Todo> {
     let mut g = TODOS.lock().unwrap();
     if g.is_none() {
         let path = crate::config::data_dir().join("todo.json");
@@ -75,6 +96,10 @@ fn todos() -> Vec<Todo> {
     g.clone().unwrap()
 }
 
+fn todos() -> Vec<Todo> {
+    cached_list()
+}
+
 fn save_todos(list: &[Todo]) {
     let path = crate::config::data_dir().join("todo.json");
     if let Ok(text) = serde_json::to_string_pretty(list) {
@@ -82,15 +107,15 @@ fn save_todos(list: &[Todo]) {
     }
 }
 
-/// 新增某日待办（日期右键菜单）
-pub fn add_todo(key: String, text: String) {
-    let text = text.trim().to_string();
-    if text.is_empty() {
+/// 新增待办（日期右键“新增待办”弹窗）
+pub fn add_todo_full(todo: Todo) {
+    if todo.text.trim().is_empty() {
         return;
     }
+    let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
-    let list = g.get_or_insert_with(Vec::new);
-    list.push(Todo { text, done: false, date: Some(key) });
+    let list = g.get_or_insert_with(|| cached);
+    list.push(todo);
     save_todos(list);
 }
 
@@ -105,8 +130,9 @@ fn todos_for(key: &str) -> Vec<(usize, Todo)> {
 
 /// 删除某日第 idx 条待办
 pub fn remove_todo_for(key: &str, idx: usize) {
+    let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
-    let list = g.get_or_insert_with(Vec::new);
+    let list = g.get_or_insert_with(|| cached);
     let mut seen = 0usize;
     let mut remove_at = None;
     for (gi, td) in list.iter().enumerate() {
@@ -126,8 +152,9 @@ pub fn remove_todo_for(key: &str, idx: usize) {
 
 /// 切换某日第 idx 条待办的完成状态
 pub fn toggle_todo_for(key: &str, idx: usize) {
+    let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
-    let list = g.get_or_insert_with(Vec::new);
+    let list = g.get_or_insert_with(|| cached);
     let mut seen = 0usize;
     for td in list.iter_mut() {
         if td.date.as_deref() == Some(key) {
@@ -231,7 +258,7 @@ fn history_of(m: u32, d: u32) -> Vec<(i32, &'static str)> {
         .collect()
 }
 
-/// 时间格言（按日期轮换）
+/// 时间格言兜底（一言 API 拉取中/失败时按日期轮换显示）
 const MOTTOS: &[(&str, &str)] = &[
     ("一寸光阴一寸金，寸金难买寸光阴。", "《增广贤文》"),
     ("逝者如斯夫，不舍昼夜。", "《论语》"),
@@ -302,8 +329,20 @@ pub fn sidebar_repaint() {
     }
 }
 
+/// 供后台线程投递重绘请求（绘制始终在侧栏窗口线程执行）
+pub fn post_repaint() {
+    let h = SIDEBAR_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            PostMessageW(h as HWND, WM_APP_HISTORY, 0, 0);
+        }
+    }
+}
+
 pub fn sidebar_show(date: NaiveDate) {
     unsafe {
+        // 时间格言：互联网分类每次打开都要换一条
+        crate::motto::on_sidebar_show();
         // 与天气面板互斥：打开日期侧栏时自动收起天气
         crate::flyout::forecast_close();
         let mut guard = SIDEBAR_UI.lock().unwrap();
@@ -327,7 +366,7 @@ pub fn sidebar_show(date: NaiveDate) {
     }
 }
 
-pub fn create_window(st: SharedState, agenda: Arc<Mutex<HashMap<String, Vec<String>>>>) {
+pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
     unsafe {
         let cls = crate::wide("z-calendar-sidebar");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null());
@@ -507,9 +546,19 @@ impl SidebarUi {
     }
 
     fn motto_height(&self, p: &Painter, date: NaiveDate) -> f32 {
-        let (quote, author) = motto_of(date);
-        let lines = wrap_chars(p, quote, SB_W - 32.0 - 28.0).len() as f32;
+        let (quote, _) = self.motto_content(date);
+        let lines = wrap_chars(p, &quote, SB_W - 32.0 - 28.0).len() as f32;
         8.0 + lines * 18.0 + 5.0 + 16.0 + 8.0
+    }
+
+    /// 时间格言：一言 API 结果，拉取中/失败回退到内置格言
+    fn motto_content(&self, date: NaiveDate) -> (String, String) {
+        let ty = self.st.config.lock().unwrap().motto_type.clone();
+        if let Some(m) = crate::motto::current(&ty) {
+            return (m.text, m.from);
+        }
+        let (q, a) = motto_of(date);
+        (q.to_string(), a.to_string())
     }
 
     fn paint(&mut self, p: &Painter) {
@@ -551,17 +600,37 @@ impl SidebarUi {
                     y += h + 8.0;
                 }
                 "history" => {
-                    let items = history_of(date.month(), date.day());
+                    // 任意日期：月缓存命中直接显示；未命中触发后台拉取，
+                    // 期间/失败时用内置精选事件兜底
+                    let cached = crate::history::load_for(date);
+                    if cached.is_none() {
+                        crate::history::ensure_fetched(date);
+                    }
+                    let mut items: Vec<(i32, String)> = match cached {
+                        Some(v) =>
+                            // 缓存数据已按重要性排好序，直接使用
+                            v.into_iter().map(|it| (it.year, it.title)).collect(),
+                        None => {
+                            let mut v: Vec<(i32, String)> = history_of(date.month(), date.day())
+                                .into_iter()
+                                .map(|(y, t)| (y, t.to_string()))
+                                .collect();
+                            v.sort_by(|a, b| b.0.cmp(&a.0));
+                            v
+                        }
+                    };
                     if items.is_empty() {
                         p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG);
                         p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
                         y += 44.0 + 8.0;
                     } else {
-                        let h = 8.0 + 18.0 + (items.len().min(4) as f32) * 18.0 + 8.0;
+                        let n = items.len().min(3);
+                        let h = 8.0 + 18.0 + n as f32 * 18.0 + 8.0;
                         p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
                         p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
-                        for (i, (y2, t)) in items.iter().take(4).enumerate() {
-                            let line = format!("{}年：{}", y2, t);
+                        for (i, (y2, t)) in items.iter().take(3).enumerate() {
+                            let ytxt = if *y2 < 0 { format!("公元前{}年", -y2) } else { format!("{}年", y2) };
+                            let line = format!("{}：{}", ytxt, t);
                             p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT);
                         }
                         y += h + 8.0;
@@ -590,10 +659,16 @@ impl SidebarUi {
                             if td.done {
                                 p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE);
                             }
-                            p.text(&td.text, cx + 36.0, ry, cw - 78.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
+                            // 优先级色点
+                            let mut tx = cx + 36.0;
+                            if let Some(pc) = priority_color(td.priority) {
+                                p.fill_circle(cx + 35.0, ry + 9.0, 3.0, pc);
+                                tx = cx + 44.0;
+                            }
+                            p.text(&td.text, tx, ry, cx + cw - 30.0 - tx, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
                             if td.done {
                                 let w = p.measure(&td.text, 12.0, false, false).0;
-                                p.line(cx + 36.0, ry + 9.0, cx + 36.0 + w, ry + 9.0, 1.0, SUB_DIM);
+                                p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM);
                             }
                             // 删除
                             let del_hover = self.hover == Some(SbAction::TodoDelete(i));
@@ -693,7 +768,8 @@ impl SidebarUi {
             p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
             for (i, item) in items.iter().take(4).enumerate() {
                 let ry = y + 28.0 + i as f32 * 20.0;
-                p.text(item, cx + 14.0, ry, cw - 56.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                let text = crate::events::display(item);
+                p.text(&text, cx + 14.0, ry, cw - 56.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
                 let del_hover = self.hover == Some(SbAction::AgendaDelete(i));
                 p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
                 self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::AgendaDelete(i)));
@@ -706,8 +782,8 @@ impl SidebarUi {
 
     fn paint_motto_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
         p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-        let (quote, author) = motto_of(date);
-        let lines = wrap_chars(p, quote, cw - 28.0);
+        let (quote, author) = self.motto_content(date);
+        let lines = wrap_chars(p, &quote, cw - 28.0);
         for (i, line) in lines.iter().enumerate() {
             p.text(line, cx + 14.0, y + 10.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
         }
@@ -785,6 +861,14 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
     match msg {
         WM_PAINT => {
             ValidateRect(hwnd, std::ptr::null_mut());
+            0
+        }
+        // 历史上的今天后台拉取完成：重绘
+        WM_APP_HISTORY => {
+            let mut guard = SIDEBAR_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                f.0.redraw();
+            }
             0
         }
         WM_ERASEBKGND => 1,
@@ -894,6 +978,17 @@ const SUB_DIM: u32 = gdi::argb(255, 0x5C, 0x66, 0x73);
 const BLUE: u32 = gdi::argb(255, 0x3E, 0x87, 0xFA);
 const RED: u32 = gdi::argb(255, 0xE5, 0x4B, 0x4B);
 const WHITE: u32 = gdi::argb(255, 255, 255, 255);
+
+/// 优先级色点颜色（与新建待办弹窗一致）
+fn priority_color(p: u8) -> Option<u32> {
+    match p {
+        1 => Some(gdi::argb(255, 0xE5, 0x48, 0x4D)),
+        2 => Some(gdi::argb(255, 0xE8, 0x96, 0x3C)),
+        3 => Some(gdi::argb(255, 0x3E, 0x87, 0xFA)),
+        4 => Some(gdi::argb(255, 0x8A, 0x93, 0xA0)),
+        _ => None,
+    }
+}
 
 #[link(name = "gdiplus")]
 extern "system" {
