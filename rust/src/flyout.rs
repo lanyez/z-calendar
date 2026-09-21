@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
+use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, CreateRectRgn, SelectObject};
 use winapi::um::winuser::*;
 
 use crate::config::{apply_autostart, Config};
@@ -27,6 +27,8 @@ const SUB_DIM: u32 = gdi::argb(255, 0x5C, 0x66, 0x73);
 const LEGAL: u32 = gdi::argb(255, 0xE4, 0xE7, 0xEB);
 /// 节日/节假日名称统一使用的鲜艳蓝色
 const FEST_BLUE: u32 = gdi::argb(255, 0x4D, 0xA3, 0xFF);
+/// 日历格悬停圆圈的半透明高亮
+const CELL_HOVER: u32 = gdi::argb(28, 255, 255, 255);
 const WEEK_HEAD: u32 = gdi::argb(255, 0xA6, 0xAD, 0xB6);
 const WEEK_NUM: u32 = gdi::argb(255, 0x6E, 0x76, 0x81);
 const ICON_COL: u32 = gdi::argb(255, 0x8A, 0x91, 0x9C);
@@ -45,6 +47,20 @@ const POPUP_BG: u32 = gdi::argb(255, 0x26, 0x30, 0x42);
 
 pub const WIN_W: f32 = 510.0;
 pub const WIN_H: f32 = 640.0;
+
+/// 可见面板在窗口内的内缩量：paint_frame 与各页布局都以窗口左上 (10,10) 为面板原点，
+/// 窗口因此比可见面板大出一圈。贴屏幕右缘/任务栏摆放时这一圈被裁到屏幕外。
+const PANEL_INSET: f32 = 10.0;
+
+/// 面板圆角半径；贴住屏幕/任务栏的一侧不画圆角（否则边缘会留下月牙形空隙）
+const PANEL_RADIUS: f32 = 12.0;
+
+/// 可见面板下缘与任务栏上缘的间距：贴死会把任务栏顶边压住（圆角补平后更是连成一片），
+/// 留一点缝把日历整体抬起来。嫌高/嫌低改这一个数即可。
+const EDGE_GAP: f32 = 2.0;
+
+/// 任务栏不在屏幕底部时，面板下缘与时钟上缘的间距
+const CLOCK_GAP: f32 = 6.0;
 
 const WM_APP_TOGGLE: UINT = 0x8000 + 1;
 const WM_APP_SHOW: UINT = 0x8000 + 2;
@@ -105,6 +121,9 @@ struct Ui {
     agenda: Arc<Mutex<crate::events::AgendaMap>>,
     shown: bool,
     page: Page,
+    /// 面板贴住工作区右缘/下缘：该侧圆角改画直角
+    flush_right: bool,
+    flush_bottom: bool,
     view_y: i32,
     view_m: u32,
     selected: NaiveDate,
@@ -1095,13 +1114,10 @@ pub fn forecast_open(main_hwnd: usize) {
         if y < wa.top + 4 {
             y = wa.top + 4;
         }
-        if x < wa.left + 4 {
-            x = mr.right - 10;
-        }
+        // 左侧放不下（屏幕过窄）：贴着工作区左缘，宁可压住日历也不越出屏幕
+        // （窗口为贴屏幕右缘摆放，右缘已伸出屏幕外，不能再用窗口右缘做退路）
         let xmax = wa.right - FC_W as i32 - 4;
-        if x > xmax {
-            x = xmax;
-        }
+        x = x.max(wa.left + 4).min(xmax);
         SetWindowPos(fh, HWND_TOPMOST, x, y, FC_W as i32, FC_H as i32, SWP_NOACTIVATE);
         ShowWindow(fh, SW_SHOWNA);
         f.redraw();
@@ -1428,6 +1444,15 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             return;
         }
         FLYOUT_HWND.store(hwnd as usize, Ordering::Relaxed);
+        // 命中区域只取可见面板：窗口为贴屏幕右缘与任务栏摆放，四周那一圈透明内缩会超出
+        // 屏幕/压在任务栏上，不设区域就会吞掉任务栏上的点击
+        let rgn = CreateRectRgn(
+            PANEL_INSET as i32,
+            PANEL_INSET as i32,
+            w - PANEL_INSET as i32,
+            h - PANEL_INSET as i32,
+        );
+        SetWindowRgn(hwnd, rgn, 0);
 
         let page = match std::env::var("CAL_PAGE").as_deref() {
             Ok("agenda") => Page::Agenda,
@@ -1463,6 +1488,8 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             agenda,
             shown: false,
             page,
+            flush_right: false,
+            flush_bottom: false,
             view_y,
             view_m,
             selected: today,
@@ -1530,34 +1557,57 @@ static UI: Mutex<Option<SendUi>> = Mutex::new(None);
 struct SendUi(Box<Ui>);
 unsafe impl Send for SendUi {}
 
-/// 弹窗位置：时钟上方右侧对齐
-fn position_for(clock: Option<&crate::overlay::ClockInfo>, sf: f32, win_w: i32, win_h: i32) -> (i32, i32) {
-    let (mut x, mut y);
-    match clock {
-        Some(ci) => {
-            let clk_right = ci.rect.right as f32 / sf;
-            let clk_top = ci.rect.top as f32 / sf;
-            let clk_bottom = ci.rect.bottom as f32 / sf;
-            x = clk_right - win_w as f32 + 12.0;
-            y = clk_top - win_h as f32 - 6.0;
-            let wa = (
-                ci.work.0 as f32 / sf,
-                ci.work.1 as f32 / sf,
-                ci.work.2 as f32 / sf,
-                ci.work.3 as f32 / sf,
-            );
-            if y < wa.1 {
-                y = (clk_bottom + 6.0).min(wa.3 - win_h as f32);
-            }
-            x = wa.0.max(x.min(wa.2 - win_w as f32 - 4.0));
-            y = wa.1.max(y.min(wa.3 - win_h as f32));
-        }
-        None => {
-            x = 32000.0;
-            y = 32000.0;
-        }
+/// 弹窗摆放结果：窗口左上角坐标 + 面板是否贴住右缘/下缘（贴边侧画直角）
+struct Placement {
+    x: i32,
+    y: i32,
+    flush_right: bool,
+    flush_bottom: bool,
+}
+
+/// 弹窗位置：任务栏停在屏幕底部时，可见面板右缘贴工作区右缘、下缘距任务栏上缘 EDGE_GAP
+/// （抬起来，不压住任务栏）；其余任务栏位置（上/左/右）仍贴在时钟上方，上方放不下则改到时钟下方
+fn position_for(clock: Option<&crate::overlay::ClockInfo>, sf: f32, win_w: i32, win_h: i32) -> Placement {
+    let Some(ci) = clock else {
+        return Placement { x: 32000, y: 32000, flush_right: false, flush_bottom: false };
+    };
+    let clk_right = ci.rect.right as f32 / sf;
+    let clk_top = ci.rect.top as f32 / sf;
+    let clk_bottom = ci.rect.bottom as f32 / sf;
+    let mon_bottom = ci.mon.3 as f32 / sf;
+    let wa = (
+        ci.work.0 as f32 / sf,
+        ci.work.1 as f32 / sf,
+        ci.work.2 as f32 / sf,
+        ci.work.3 as f32 / sf,
+    );
+    let (ww, wh) = (win_w as f32, win_h as f32);
+    // 可见面板在窗口内四周各内缩 PANEL_INSET，故面板边缘 = 窗口原点 + PANEL_INSET。
+    // 下面各式把"面板要贴的屏幕位置"换算成窗口原点：
+    //   win = 目标面板右/下缘 - 窗口尺寸 + PANEL_INSET
+    let x_flush = wa.2 - ww + PANEL_INSET;
+    let y_flush = wa.3 - EDGE_GAP - wh + PANEL_INSET;
+    let x_clock = clk_right - ww + PANEL_INSET;
+    let y_clock = clk_top - CLOCK_GAP - wh + PANEL_INSET;
+    // 任务栏停在屏幕底部 ⇒ 工作区只在下方被占：右缘贴工作区右缘、下缘贴任务栏
+    // （原生时钟居中于任务栏、够不到屏幕下缘，故用工作区与显示器下缘之差判定，而非时钟自身）
+    let docked = wa.3 < mon_bottom;
+    let (mut x, mut y) = if docked { (x_flush, y_flush) } else { (x_clock, y_clock) };
+    // 非贴边时上方放不下 → 改到时钟下方
+    if !docked && y + PANEL_INSET < wa.1 {
+        y = clk_bottom - PANEL_INSET;
     }
-    (x.round() as i32, y.round() as i32)
+    // 收进工作区：面板左缘 ≥ 工作区左缘、右缘 ≤ 工作区右缘、下缘 ≤ 工作区下缘
+    x = (wa.0 - PANEL_INSET).max(x.min(x_flush));
+    y = (wa.1 - PANEL_INSET).max(y.min(y_flush));
+    // 最终落在工作区右/下缘 ⇒ 该侧贴边，画直角消除圆角与屏幕边缘之间的月牙缝
+    let (xi, yi) = (x.round() as i32, y.round() as i32);
+    Placement {
+        x: xi,
+        y: yi,
+        flush_right: (xi as f32 + ww - PANEL_INSET - wa.2).abs() < 0.5,
+        flush_bottom: (yi as f32 + wh - PANEL_INSET - wa.3).abs() < 0.5,
+    }
 }
 
 fn set_shown(ui: &mut Ui, show: bool) {
@@ -1572,7 +1622,7 @@ fn set_shown(ui: &mut Ui, show: bool) {
 
 /// 显示弹窗：窗口操作在 UI 锁之外执行（避免消息重入死锁）
 fn perform_show(hwnd: HWND) {
-    let (x, y) = {
+    let p = {
         let guard = UI.lock().unwrap();
         let ui = &guard.as_ref().unwrap().0;
         let clock = ui.st.clock.lock().unwrap().clone();
@@ -1580,13 +1630,15 @@ fn perform_show(hwnd: HWND) {
     };
     let (w, h) = (WIN_W as i32, WIN_H as i32);
     unsafe {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        SetWindowPos(hwnd, HWND_TOPMOST, p.x, p.y, w, h, SWP_NOACTIVATE);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
     let mut guard = UI.lock().unwrap();
     if let Some(sui) = guard.as_mut() {
         let ui = &mut sui.0;
+        ui.flush_right = p.flush_right;
+        ui.flush_bottom = p.flush_bottom;
         ui.shown = true;
         SHOWN_FLAG.store(1, Ordering::Relaxed);
         ui.redraw();
@@ -1696,7 +1748,18 @@ impl Ui {
     }
 
     fn paint_frame(&self, p: &Painter) {
-        p.fill_round(10.0, 10.0, WIN_W - 20.0, WIN_H - 20.0, 12.0, BG);
+        let (x, y) = (PANEL_INSET, PANEL_INSET);
+        let (w, h) = (WIN_W - PANEL_INSET * 2.0, WIN_H - PANEL_INSET * 2.0);
+        p.fill_round(x, y, w, h, PANEL_RADIUS, BG);
+        // 贴边的角补成直角：圆角会在屏幕/任务栏边缘留下一块透明月牙
+        if self.flush_right {
+            p.fill_rect(x + w - PANEL_RADIUS, y, PANEL_RADIUS, PANEL_RADIUS, BG);
+            p.fill_rect(x + w - PANEL_RADIUS, y + h - PANEL_RADIUS, PANEL_RADIUS, PANEL_RADIUS, BG);
+        }
+        if self.flush_bottom {
+            p.fill_rect(x, y + h - PANEL_RADIUS, PANEL_RADIUS, PANEL_RADIUS, BG);
+            p.fill_rect(x + w - PANEL_RADIUS, y + h - PANEL_RADIUS, PANEL_RADIUS, PANEL_RADIUS, BG);
+        }
     }
 
     fn hit_add(regions: &mut Vec<(gdi::RectF, Action)>, x: f32, y: f32, w: f32, h: f32, a: Action) {
@@ -1957,6 +2020,33 @@ impl Ui {
 
 }
 
+/// 圆圈几何：包住数字与次行农历/节日文本（宽度按次行扩展，最大不超格子）。
+/// 今天/选中/悬停三种圆圈共用，保证形状一致。
+fn circle_geo(p: &Painter, rect: &gdi::RectF, sub: &str) -> (f32, f32) {
+    let num_cy = rect.y + rect.h * 0.30;
+    let line1_cy = rect.y + rect.h * 0.64;
+    let line2_cy = line1_cy + 14.0;
+    let (mut top, mut bottom, mut w_half): (f32, f32, f32) = (num_cy - 18.0, num_cy + 18.0, 18.0);
+    let chars: Vec<char> = sub.chars().collect();
+    if !chars.is_empty() {
+        bottom = line1_cy + 9.0;
+        let l1: String = if chars.len() <= 5 {
+            sub.to_string()
+        } else {
+            chars[..5].iter().collect()
+        };
+        if chars.len() > 5 {
+            let l2: String = chars[5..].iter().collect();
+            bottom = line2_cy + 9.0;
+            w_half = w_half.max(p.measure(&l2, 11.0, false, false).0 / 2.0 + 9.0);
+        }
+        w_half = w_half.max(p.measure(&l1, 11.0, false, false).0 / 2.0 + 9.0);
+    }
+    let cy = (top + bottom) / 2.0;
+    let r = ((bottom - top) / 2.0 + 4.0).max(w_half).min(rect.w / 2.0 - 1.0);
+    (cy, r)
+}
+
 fn paint_day_cell(
     p: &Painter,
     ui: &Ui,
@@ -1974,9 +2064,6 @@ fn paint_day_cell(
     let line1_cy = rect.y + rect.h * 0.64;
     let line2_cy = rect.y + rect.h * 0.64 + 14.0;
     let hovered = ui.hover.map(|h| matches!(h, Action::Cell(d) if d == date)).unwrap_or(false);
-    if in_month && hovered {
-        p.fill_round(rect.x + 2.0, rect.y + 2.0, rect.w - 4.0, rect.h - 4.0, 8.0, gdi::argb(13, 255, 255, 255));
-    }
 
     let is_today = date == today;
     let is_selected = date == selected;
@@ -2022,29 +2109,18 @@ fn paint_day_cell(
         sub_col = c;
     }
 
-    // 今天：圆圈包住数字与农历/节日行（宽度按次行文本扩展，最大不超格子）
+    // 悬停：半透明圆圈垫底（选中/今天的格子悬停时同样有效）；
+    // 今天：大蓝圈包住数字与次行；选中：同形状的空心蓝环
+    if hovered && in_month {
+        let (cy, r) = circle_geo(p, rect, &sub);
+        p.fill_circle(cx, cy, r, CELL_HOVER);
+    }
     if is_today {
-        let (mut top, mut bottom, mut w_half): (f32, f32, f32) = (num_cy - 18.0, num_cy + 18.0, 18.0);
-        let chars: Vec<char> = sub.chars().collect();
-        if !chars.is_empty() {
-            bottom = line1_cy + 9.0;
-            let l1: String = if chars.len() <= 5 {
-                sub.clone()
-            } else {
-                chars[..5].iter().collect()
-            };
-            if chars.len() > 5 {
-                let l2: String = chars[5..].iter().collect();
-                bottom = line2_cy + 9.0;
-                w_half = w_half.max(p.measure(&l2, 11.0, false, false).0 / 2.0 + 9.0);
-            }
-            w_half = w_half.max(p.measure(&l1, 11.0, false, false).0 / 2.0 + 9.0);
-        }
-        let cy = (top + bottom) / 2.0;
-        let r = ((bottom - top) / 2.0 + 4.0).max(w_half).min(rect.w / 2.0 - 1.0);
+        let (cy, r) = circle_geo(p, rect, &sub);
         p.fill_circle(cx, cy, r, BLUE);
     } else if is_selected {
-        p.stroke_circle(cx, num_cy, 14.5, 1.5, BLUE);
+        let (cy, r) = circle_geo(p, rect, &sub);
+        p.stroke_circle(cx, cy, r - 2.25, 4.5, BLUE);
     }
     p.text(&num, cx - 22.0, num_cy - 16.0, 44.0, 32.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 18.0, true, false, if is_today { WHITE } else { num_col });
 
