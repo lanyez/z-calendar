@@ -32,6 +32,8 @@ const CM_W: f32 = 186.0;
 const CM_ROW: f32 = 34.0;
 const CM_H: f32 = CM_ROW * 4.0 + 8.0;
 
+const CM_WM_APP_TOGGLE: UINT = 0x8000 + 1;
+
 static CM_HWND: AtomicUsize = AtomicUsize::new(0);
 static CM_UI: Mutex<Option<SendCm>> = Mutex::new(None);
 static CM_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
@@ -87,6 +89,19 @@ pub fn close() {
             ShowWindow(h as HWND, SW_HIDE);
         }
         crate::trim_working_set();
+    }
+}
+
+/// 在鼠标位置打开/收起菜单（菜单窗口线程执行）
+pub fn request_toggle(x: i32, y: i32) {
+    // 钩子回调里只 PostMessage：SetWindowPos/重绘等耗时操作全部落到菜单窗口线程，
+    // 回调超时会让系统放行点击（弹出系统日历），反复超时甚至会摘除低级钩子
+    let h = CM_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        let lp = ((((y as i16 as u16) as usize) << 16) | (x as i16 as u16) as usize) as LPARAM;
+        unsafe {
+            PostMessageW(h as HWND, CM_WM_APP_TOGGLE, 0, lp);
+        }
     }
 }
 
@@ -350,6 +365,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     _ => {}
                 }
             }
+            0
+        }
+        CM_WM_APP_TOGGLE => {
+            let x = ((lp as usize & 0xFFFF) as u16 as i16) as i32;
+            let y = (((lp as usize) >> 16) as u16 as i16) as i32;
+            toggle(x, y);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
