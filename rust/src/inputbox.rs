@@ -16,7 +16,7 @@ use crate::events::{self, AgendaEntry, AgendaMap, RichEvent};
 use crate::gdi::{self, Cache, Painter};
 
 const DL_W: f32 = 400.0;
-const H_MAX: f32 = 512.0; // 位图按最大高度分配（待办开时间时最高）
+const H_MAX: f32 = 620.0; // 位图按最大高度分配（待办开时间 + 修改范围/重复至两行附加卡时最高）
 
 // 布局
 const TITLE_H: f32 = 44.0;
@@ -95,7 +95,9 @@ enum DlAction {
     Save,
     ToggleTime,
     ToggleAllDay,
-    PickRow(usize),  // 0=开始 1=结束 → 日期选择
+    ToggleUntil,         // 重复截止日开关
+    ScopeSeries(bool),   // 修改范围：true=整个系列 false=仅这一天
+    PickRow(usize),  // 0=开始 1=结束 2=重复至 → 日期选择
     DropRow(usize),  // 0=提醒 1=重复 2=优先级 → 下拉
     PickMonthPrev,
     PickMonthNext,
@@ -146,11 +148,24 @@ struct DialogUi {
     a_end: NaiveDateTime,
     remind: Option<i64>,
     repeat: Option<i64>,
+    /// 按天重复：d=每天 w=每周 m=每月 y=每年 l=农历每年
+    recur: Option<String>,
+    /// 重复截止日开关 + 日期（recur 生效时可编辑）
+    until_on: bool,
+    until_dt: NaiveDateTime,
+    /// 修改范围（编辑重复条目时显示）：true=整个系列 false=仅这一天
+    scope_series: bool,
+    /// 出现日期（编辑重复条目时 Some，用于“仅这一天”定位；非重复为 None）
+    scope_date: Option<NaiveDate>,
     comp: String,
     caret_on: bool,
     drop: Option<Drop>,
     regions: Vec<(gdi::RectF, DlAction)>,
     hover: Option<DlAction>,
+    /// 编辑模式：Some((日期key, 下标, 原id, 原仅此次例外))——保存时原位替换（日期改动则移动）
+    edit_agenda: Option<(String, usize, String, Vec<String>)>,
+    /// 编辑模式：Some((全局下标, 原完成状态, 原id, 原按天完成记录, 原仅此次例外))
+    edit_todo: Option<(usize, bool, String, Vec<String>, Vec<String>)>,
 }
 
 #[link(name = "gdiplus")]
@@ -194,8 +209,8 @@ pub fn visible() -> bool {
     h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 }
 }
 
-/// 弹窗总高度（与 paint 的布局累加保持一致）
-fn dialog_h(kind: Kind, time_on: bool) -> f32 {
+/// 弹窗总高度（与 paint 的布局累加保持一致）；recur_rows = 重复附加卡（修改范围/重复至）行数
+fn dialog_h(kind: Kind, time_on: bool, recur_rows: usize) -> f32 {
     let mut y = TOP_Y;
     match kind {
         Kind::Todo => {
@@ -208,6 +223,9 @@ fn dialog_h(kind: Kind, time_on: bool) -> f32 {
             y += 54.0 + GAP; // 全天
             y += 164.0 + GAP; // 时间卡片
         }
+    }
+    if recur_rows > 0 {
+        y += 12.0 + ROW_H * recur_rows as f32 + GAP; // 重复附加卡
     }
     y + SAVE_H + 8.0
 }
@@ -265,11 +283,18 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             a_end: date_at(now.date(), 10, 0),
             remind: None,
             repeat: None,
+            recur: None,
+            until_on: false,
+            until_dt: date_at(now.date(), 0, 0),
+            scope_series: true,
+            scope_date: None,
             comp: String::new(),
             caret_on: true,
             drop: None,
             regions: Vec::new(),
             hover: None,
+            edit_agenda: None,
+            edit_todo: None,
         });
         let hdc = GetDC(std::ptr::null_mut());
         ui.mem_dc = CreateCompatibleDC(hdc) as usize;
@@ -297,8 +322,105 @@ fn date_at(d: NaiveDate, h: u32, m: u32) -> NaiveDateTime {
     d.and_hms_opt(h, m, 0).unwrap_or_else(|| d.and_hms_opt(0, 0, 0).unwrap())
 }
 
-/// 在指定位置附近打开弹窗
+/// 在指定位置附近打开弹窗（新增）
 pub fn open(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind) {
+    open_with(at_x, at_y, date, kind, Prefill::New);
+}
+
+/// 编辑已有日程（key + 下标定位；日期改动则移动到新日期）。
+/// occ：重复条目的出现日期（侧栏/日程页当前查看的日子），用于“仅这一天”修改；
+/// 传入时表单日期预定位到该次出现（保留时刻）。
+pub fn open_agenda_edit(at_x: i32, at_y: i32, key: &str, idx: usize, ev: &RichEvent, occ: Option<NaiveDate>) {
+    let Some(dt) = events::parse_start(&ev.start) else { return };
+    let end = events::parse_start(&ev.end).unwrap_or(dt + chrono::Duration::hours(1));
+    // 重复条目：表单预定位到本次出现的日期（保留时刻）
+    let view_date = if ev.recur.is_some() { occ.unwrap_or(dt.date()) } else { dt.date() };
+    let shifted = |d: NaiveDateTime| {
+        if view_date != dt.date() {
+            date_at(view_date, d.hour(), d.minute())
+        } else {
+            d
+        }
+    };
+    let (s, e) = if ev.all_day {
+        (date_at(view_date, 0, 0), date_at(end.date().max(view_date), 0, 0))
+    } else {
+        (shifted(dt), shifted(end))
+    };
+    open_with(
+        at_x,
+        at_y,
+        view_date,
+        Kind::Agenda,
+        Prefill::Agenda {
+            key: key.to_string(),
+            idx,
+            id: ev.id.clone(),
+            name: ev.name.clone(),
+            all_day: ev.all_day,
+            start: s,
+            end: e,
+            remind: ev.remind,
+            repeat: ev.repeat,
+            recur: ev.recur.clone(),
+            until: ev.recur_until.clone(),
+            skips: ev.skip_dates.clone(),
+            occ: if ev.recur.is_some() { Some(view_date) } else { None },
+        },
+    );
+}
+
+/// 编辑已有待办（全局下标定位；完成状态保持不变）。occ 语义同 open_agenda_edit。
+pub fn open_todo_edit(at_x: i32, at_y: i32, gi: usize, td: &crate::sidebar::Todo, occ: Option<NaiveDate>) {
+    let anchor = td
+        .date
+        .as_deref()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+    let date = if td.recur.is_some() {
+        occ.or(anchor).unwrap_or_else(|| chrono::Local::now().date_naive())
+    } else {
+        anchor.unwrap_or_else(|| chrono::Local::now().date_naive())
+    };
+    let moved = td.recur.is_some() && anchor.map(|a| a != date).unwrap_or(false);
+    let st0 = td.start.as_deref().and_then(events::parse_start).unwrap_or_else(|| date_at(date, 9, 0));
+    let en0 = td.end.as_deref().and_then(events::parse_start).unwrap_or_else(|| date_at(date, 10, 0));
+    let (st, en) = if moved {
+        (date_at(date, st0.hour(), st0.minute()), date_at(date, en0.hour(), en0.minute()))
+    } else {
+        (st0, en0)
+    };
+    open_with(
+        at_x,
+        at_y,
+        date,
+        Kind::Todo,
+        Prefill::Todo {
+            gi,
+            done: td.done,
+            id: td.id.clone(),
+            text: td.text.clone(),
+            priority: td.priority,
+            time_on: td.has_time,
+            start: st,
+            end: en,
+            remind: td.remind,
+            repeat: td.repeat,
+            recur: td.recur.clone(),
+            until: td.recur_until.clone(),
+            skips: td.skip_dates.clone(),
+            done_dates: td.done_dates.clone(),
+            occ: if td.recur.is_some() { Some(date) } else { None },
+        },
+    );
+}
+
+enum Prefill {
+    New,
+    Agenda { key: String, idx: usize, id: String, name: String, all_day: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, occ: Option<NaiveDate> },
+    Todo { gi: usize, done: bool, id: String, text: String, priority: u8, time_on: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, done_dates: Vec<String>, occ: Option<NaiveDate> },
+}
+
+fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
     unsafe {
         let h = IB_HWND.load(Ordering::Relaxed);
         if h == 0 {
@@ -321,10 +443,53 @@ pub fn open(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind) {
                 f.a_end = date_at(date, 10, 0);
                 f.remind = None;
                 f.repeat = None;
+                f.recur = None;
+                f.until_on = false;
+                f.until_dt = date_at(date, 0, 0);
+                f.scope_series = true;
+                f.scope_date = None;
                 f.caret_on = true;
                 f.drop = None;
                 f.hover = None;
-                f.h = dialog_h(kind, false);
+                f.edit_agenda = None;
+                f.edit_todo = None;
+                match pre {
+                    Prefill::New => {}
+                    Prefill::Agenda { key, idx, id, name, all_day, start, end, remind, repeat, recur, until, skips, occ } => {
+                        f.edit_agenda = Some((key, idx, id, skips));
+                        f.agenda_name = name;
+                        f.all_day = all_day;
+                        f.a_start = start;
+                        f.a_end = end;
+                        f.remind = remind;
+                        f.repeat = repeat;
+                        f.recur = recur;
+                        f.until_on = until.is_some();
+                        f.until_dt = until
+                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+                            .and_then(|d| d.and_hms_opt(0, 0, 0))
+                            .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
+                        f.scope_date = occ;
+                    }
+                    Prefill::Todo { gi, done, id, text, priority, time_on, start, end, remind, repeat, recur, until, skips, done_dates, occ } => {
+                        f.edit_todo = Some((gi, done, id, done_dates, skips));
+                        f.todo_text = text;
+                        f.priority = priority;
+                        f.time_on = time_on;
+                        f.a_start = start;
+                        f.a_end = end;
+                        f.remind = remind;
+                        f.repeat = repeat;
+                        f.recur = recur;
+                        f.until_on = until.is_some();
+                        f.until_dt = until
+                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+                            .and_then(|d| d.and_hms_opt(0, 0, 0))
+                            .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
+                        f.scope_date = occ;
+                    }
+                }
+                f.h = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
             }
         }
         // 工作区钳制（鼠标所在显示器）
@@ -362,6 +527,28 @@ fn redraw() {
     if let Some(f) = guard.as_mut() {
         f.0.redraw();
     }
+}
+
+/// 弹窗高度变化后重设尺寸并保持垂直居中（钳制在所在显示器工作区内）。
+/// old_h/new_h 由调用方给出：redraw 的 ULW 已把窗口改成新高度，不能再从窗口实测。
+unsafe fn resize_keep_center(hwnd: HWND, old_h: f32, new_h: f32) {
+    let mut r: RECT = std::mem::zeroed();
+    GetWindowRect(hwnd, &mut r);
+    let mut ny = r.top - ((new_h - old_h) / 2.0) as i32;
+    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if !mon.is_null() {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi) != 0 {
+            if ny + new_h as i32 > mi.rcWork.bottom {
+                ny = mi.rcWork.bottom - new_h as i32;
+            }
+            if ny < mi.rcWork.top {
+                ny = mi.rcWork.top;
+            }
+        }
+    }
+    SetWindowPos(hwnd, std::ptr::null_mut(), r.left, ny, DL_W as i32, new_h as i32, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 impl DialogUi {
@@ -418,25 +605,37 @@ impl DialogUi {
         }
     }
 
+    /// 重复附加卡行数：修改范围（编辑重复条目时）+ 重复至（选了按天重复时）
+    fn recur_extra_rows(&self) -> usize {
+        if self.recur.is_none() {
+            return 0;
+        }
+        1 + self.scope_date.is_some() as usize
+    }
+
     fn row_dt(&self, row: usize) -> NaiveDateTime {
-        if row == 0 {
-            self.a_start
-        } else {
-            self.a_end
+        match row {
+            0 => self.a_start,
+            1 => self.a_end,
+            _ => self.until_dt,
         }
     }
 
     fn set_row_dt(&mut self, row: usize, dt: NaiveDateTime) {
-        if row == 0 {
-            self.a_start = dt;
-            if self.a_end < dt {
+        match row {
+            0 => {
+                self.a_start = dt;
+                if self.a_end < dt {
+                    self.a_end = dt;
+                }
+            }
+            1 => {
                 self.a_end = dt;
+                if self.a_end < self.a_start {
+                    self.a_start = self.a_end;
+                }
             }
-        } else {
-            self.a_end = dt;
-            if self.a_end < self.a_start {
-                self.a_start = self.a_end;
-            }
+            _ => self.until_dt = dt,
         }
     }
 
@@ -453,7 +652,7 @@ impl DialogUi {
             Drop::List { list, .. } => {
                 let n = match list {
                     0 => events::REMIND_VALUES.len(),
-                    1 => events::REPEAT_VALUES.len(),
+                    1 => events::REPEAT_MENU_LEN,
                     _ => 1 + PRIORITIES.len(),
                 };
                 let ph = n as f32 * LIST_ROW + 8.0;
@@ -469,9 +668,22 @@ impl DialogUi {
         self.regions.clear();
 
         // 标题栏
+        let editing = self.edit_agenda.is_some() || self.edit_todo.is_some();
         let title = match self.kind {
-            Kind::Agenda => "新增日程",
-            Kind::Todo => "新增待办",
+            Kind::Agenda => {
+                if editing {
+                    "编辑日程"
+                } else {
+                    "新增日程"
+                }
+            }
+            Kind::Todo => {
+                if editing {
+                    "编辑待办"
+                } else {
+                    "新增待办"
+                }
+            }
         };
         p.text(title, 16.0, 0.0, 160.0, TITLE_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL);
         let close_hov = self.hover == Some(DlAction::Close);
@@ -501,6 +713,11 @@ impl DialogUi {
                 self.paint_time_card(p, y, false);
                 y += 164.0 + GAP;
             }
+        }
+        // 重复附加卡：修改范围（编辑重复条目）/ 重复至（选了按天重复）
+        let rows = self.recur_extra_rows();
+        if rows > 0 {
+            y = self.paint_recur_extra(p, y);
         }
 
         // 保存
@@ -639,7 +856,7 @@ impl DialogUi {
                     p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB);
                 }
                 _ => {
-                    p.text(&events::repeat_label(self.repeat), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                    p.text(&self.repeat_pill_label(), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
                     p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB);
                 }
             }
@@ -648,12 +865,59 @@ impl DialogUi {
         }
     }
 
+    /// 重复附加卡：修改范围（整个系列 / 仅这一天）+ 重复至（截止日开关 + 日期）
+    fn paint_recur_extra(&mut self, p: &Painter, y: f32) -> f32 {
+        let rows = self.recur_extra_rows();
+        let ch = 12.0 + ROW_H * rows as f32;
+        p.fill_round(14.0, y, 372.0, ch, 8.0, CARD_BG);
+        let mut ry = y + 6.0;
+        if self.scope_date.is_some() {
+            p.text("修改范围", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            let pills = [("整个系列", true), ("仅这一天", false)];
+            let mut px = DL_W - 20.0 - 76.0 * 2.0 - 8.0;
+            for (label, on) in pills {
+                let sel = self.scope_series == on;
+                let action = DlAction::ScopeSeries(on);
+                let hov = self.hover == Some(action);
+                if sel || hov {
+                    p.fill_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, if sel { SEL_BG } else { HOVER_BG });
+                } else {
+                    p.stroke_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, 1.0, BORDER_SUB);
+                }
+                p.text(label, px, ry, 76.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { WHITE } else { ROW_TXT });
+                Self::hit_add(&mut self.regions, px, ry, 76.0, ROW_H, action);
+                px += 84.0;
+            }
+            p.line(20.0, ry + ROW_H, DL_W - 20.0, ry + ROW_H, 1.0, gdi::argb(10, 255, 255, 255));
+            ry += ROW_H;
+        }
+        p.text("重复至", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+        self.paint_switch(p, DL_W - 52.0, ry + 10.0, self.until_on);
+        Self::hit_add(&mut self.regions, DL_W - 60.0, ry, 56.0, ROW_H, DlAction::ToggleUntil);
+        let pick = DlAction::PickRow(2);
+        let hov = self.hover == Some(pick);
+        if hov {
+            p.fill_round(16.0, ry, 320.0, ROW_H, 6.0, HOVER_BG);
+        }
+        let label = if self.until_on {
+            events::fmt_date_cn(self.until_dt.date())
+        } else {
+            "无限重复".to_string()
+        };
+        p.text(&label, 70.0, ry, 230.0, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, if self.until_on { ROW_TXT } else { SUB });
+        if self.until_on {
+            Self::hit_add(&mut self.regions, 70.0, ry, 230.0, ROW_H, pick);
+        }
+        y + ch + GAP
+    }
+
     /// 日期选择面板（月历 + 底部“下一步/完成”）
     fn paint_date_panel(&mut self, p: &Painter) {
         let Some(Drop::Date { row, y: by, m: bm, .. }) = &self.drop else { return };
         let (row, by, bm) = (*row, *by, *bm);
         let (px, py, pw, ph) = self.drop_rect();
-        let timed = self.kind == Kind::Todo || !self.all_day;
+        // 重复至只选日期（无时间步）
+        let timed = row != 2 && (self.kind == Kind::Todo || !self.all_day);
         p.fill_round(px, py, pw, ph, 10.0, DROP_BG);
         p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
 
@@ -758,6 +1022,15 @@ impl DialogUi {
         Self::hit_add(&mut self.regions, x, y, w, h, action);
     }
 
+    /// 重复行的展示文本（按天重复优先于分钟级重复）
+    fn repeat_pill_label(&self) -> String {
+        if let Some(rc) = &self.recur {
+            events::recur_label(rc)
+        } else {
+            events::repeat_label(self.repeat)
+        }
+    }
+
     /// 提醒 / 重复 / 优先级 下拉
     fn paint_dropdown(&mut self, p: &Painter) {
         let Some(Drop::List { list, .. }) = &self.drop else { return };
@@ -767,7 +1040,7 @@ impl DialogUi {
         p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
         let n = match list {
             0 => events::REMIND_VALUES.len(),
-            1 => events::REPEAT_VALUES.len(),
+            1 => events::REPEAT_MENU_LEN,
             _ => 1 + PRIORITIES.len(),
         };
         for i in 0..n {
@@ -775,7 +1048,13 @@ impl DialogUi {
             let action = DlAction::ListItem(i);
             let sel = match list {
                 0 => events::REMIND_VALUES.get(i) == Some(&self.remind),
-                1 => events::REPEAT_VALUES.get(i) == Some(&self.repeat),
+                1 => {
+                    if i < events::REPEAT_MENU_MIN {
+                        self.recur.is_none() && events::REPEAT_VALUES.get(i) == Some(&self.repeat)
+                    } else {
+                        events::RECUR_VALUES.get(i - events::REPEAT_MENU_MIN).copied() == self.recur.as_deref()
+                    }
+                }
                 _ => {
                     let v = if i == 0 { 0 } else { PRIORITIES[i - 1].0 };
                     v == self.priority
@@ -793,6 +1072,10 @@ impl DialogUi {
                     self.paint_badge(p, px + 12.0, iy + 6.0, 16.0, numeral, *color);
                     p.text(*label, px + 34.0, iy, pw - 44.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
                 }
+            } else if list == 1 && i >= events::REPEAT_MENU_MIN {
+                // 按天重复项（跟在分钟级重复之后）
+                let label = events::recur_label(events::RECUR_VALUES[i - events::REPEAT_MENU_MIN]);
+                p.text(&label, px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
             } else {
                 let v = if list == 0 { events::REMIND_VALUES.get(i).copied().flatten() } else { events::REPEAT_VALUES.get(i).copied().flatten() };
                 let label = if list == 0 { events::remind_label(v) } else { events::repeat_label(v) };
@@ -835,6 +1118,12 @@ fn confirm() {
     let mut guard = IB_UI.lock().unwrap();
     let Some(f) = guard.as_mut() else { return };
     let f = &mut f.0;
+    // 重复截止日（仅按天重复时存储）
+    let until_store = if f.recur.is_some() && f.until_on {
+        Some(events::fmt_d_store(f.until_dt.date()))
+    } else {
+        None
+    };
     match f.kind {
         Kind::Todo => {
             let text = f.todo_text.trim().to_string();
@@ -843,9 +1132,13 @@ fn confirm() {
             }
             let key = crate::ics::key_of_date(f.date);
             let timed = f.time_on;
+            let edit = f.edit_todo.take();
+            let scope_only = f.recur.is_some() && !f.scope_series && edit.is_some();
+            let scope_date = f.scope_date.unwrap_or(f.date);
             let todo = crate::sidebar::Todo {
+                id: edit.as_ref().map(|(_, _, id, _, _)| id.clone()).unwrap_or_default(),
                 text,
-                done: false,
+                done: edit.as_ref().map(|(_, done, _, _, _)| *done).unwrap_or(false),
                 date: Some(key),
                 priority: f.priority,
                 has_time: timed,
@@ -853,9 +1146,30 @@ fn confirm() {
                 end: if timed { Some(events::fmt_dt_store(f.a_end)) } else { None },
                 remind: if timed { f.remind } else { None },
                 repeat: if timed { f.repeat } else { None },
+                recur: f.recur.clone(),
+                recur_until: until_store.clone(),
+                skip_dates: edit.as_ref().map(|(_, _, _, _, sk)| sk.clone()).unwrap_or_default(),
+                done_dates: edit.as_ref().map(|(_, _, _, dd, _)| dd.clone()).unwrap_or_default(),
             };
             drop(guard);
-            crate::sidebar::add_todo_full(todo);
+            if scope_only {
+                // 仅这一天：系列条目追加例外（可顺带更新截止日），编辑结果另存为独立待办
+                if let Some((gi, ..)) = edit {
+                    crate::sidebar::todo_patch_recur(gi, until_store, Some(scope_date));
+                }
+                let mut single = todo;
+                single.recur = None;
+                single.recur_until = None;
+                single.skip_dates = Vec::new();
+                single.done = false;
+                single.done_dates = Vec::new();
+                single.id = String::new();
+                crate::sidebar::add_todo_full(single);
+            } else if let Some((gi, ..)) = edit {
+                crate::sidebar::update_todo_at(gi, todo);
+            } else {
+                crate::sidebar::add_todo_full(todo);
+            }
         }
         Kind::Agenda => {
             let name = f.agenda_name.trim().to_string();
@@ -863,18 +1177,69 @@ fn confirm() {
                 return;
             }
             let key = crate::ics::key_of_date(f.date);
-            let entry = AgendaEntry::Rich(RichEvent {
+            let edit = f.edit_agenda.take();
+            let scope_only = f.recur.is_some() && !f.scope_series && edit.is_some();
+            let mut entry = AgendaEntry::Rich(RichEvent {
+                id: edit.as_ref().map(|(_, _, id, _)| id.clone()).unwrap_or_else(events::gen_id),
                 name,
                 all_day: f.all_day,
                 start: if f.all_day { events::fmt_d_store(f.a_start.date()) } else { events::fmt_dt_store(f.a_start) },
                 end: if f.all_day { events::fmt_d_store(f.a_end.date()) } else { events::fmt_dt_store(f.a_end) },
                 remind: f.remind,
                 repeat: f.repeat,
+                recur: f.recur.clone(),
+                recur_until: until_store.clone(),
+                skip_dates: edit.as_ref().map(|(_, _, _, sk)| sk.clone()).unwrap_or_default(),
             });
             if let Some(agenda) = IB_AGENDA.lock().unwrap().as_ref() {
                 let mut map = agenda.lock().unwrap();
-                map.entry(key).or_default().push(entry);
-                events::save(&map);
+                match edit {
+                    Some((old_key, idx, ..)) => {
+                        if scope_only {
+                            // 仅这一天：系列条目追加例外（可顺带更新截止日），编辑结果另存为独立日程
+                            let scope = f.scope_date.unwrap_or(f.date);
+                            if let Some(v) = map.get_mut(&old_key) {
+                                if let Some(AgendaEntry::Rich(sr)) = v.get_mut(idx) {
+                                    if !events::recur_skipped(&sr.skip_dates, scope) {
+                                        sr.skip_dates.push(crate::ics::key_of_date(scope));
+                                    }
+                                    sr.recur_until = until_store;
+                                }
+                            }
+                            if let AgendaEntry::Rich(sr) = &mut entry {
+                                sr.recur = None;
+                                sr.recur_until = None;
+                                sr.skip_dates = Vec::new();
+                                sr.id = events::gen_id();
+                            }
+                            map.entry(key).or_default().push(entry);
+                        } else {
+                            // 编辑保存：同日期原位替换；改了日期则移动到新日期
+                            if old_key == key {
+                                if let Some(v) = map.get_mut(&key) {
+                                    if idx < v.len() {
+                                        v[idx] = entry;
+                                    }
+                                }
+                            } else {
+                                if let Some(v) = map.get_mut(&old_key) {
+                                    if idx < v.len() {
+                                        v.remove(idx);
+                                    }
+                                    if v.is_empty() {
+                                        map.remove(&old_key);
+                                    }
+                                }
+                                map.entry(key).or_default().push(entry);
+                            }
+                        }
+                        events::save(&map);
+                    }
+                    None => {
+                        map.entry(key).or_default().push(entry);
+                        events::save(&map);
+                    }
+                }
             }
             drop(guard);
         }
@@ -1071,13 +1436,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 Some(DlAction::ToggleTime) => {
                     f.time_on = !f.time_on;
                     f.drop = None;
-                    f.h = dialog_h(f.kind, f.time_on);
+                    let old_h = f.h;
+                    f.h = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
                     let hh = f.h;
                     drop(guard);
                     unsafe {
-                        SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, DL_W as i32, hh as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        resize_keep_center(hwnd, old_h, hh);
                     }
                     redraw();
+                }
+                Some(DlAction::ToggleUntil) => {
+                    f.until_on = !f.until_on;
+                    if f.until_on && f.until_dt.date() < f.a_start.date() {
+                        // 打开时默认给出一个截止日：开始日 + 30 天
+                        f.until_dt = date_at(f.a_start.date() + chrono::Duration::days(30), 0, 0);
+                    }
+                    f.redraw();
+                }
+                Some(DlAction::ScopeSeries(on)) => {
+                    f.scope_series = on;
+                    f.redraw();
                 }
                 Some(DlAction::ToggleAllDay) => {
                     f.all_day = !f.all_day;
@@ -1171,25 +1549,50 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         Some(Drop::List { list, .. }) => *list,
                         _ => 0,
                     };
-                    match list {
-                        0 => {
-                            if let Some(v) = events::REMIND_VALUES.get(i) {
-                                f.remind = *v;
-                            }
+            match list {
+                0 => {
+                    if let Some(v) = events::REMIND_VALUES.get(i) {
+                        f.remind = *v;
+                    }
+                }
+                1 => {
+                    if i < events::REPEAT_MENU_MIN {
+                        // 分钟级重复（与按天重复互斥；重复附加卡随之消失）
+                        if let Some(v) = events::REPEAT_VALUES.get(i) {
+                            f.repeat = *v;
+                            f.recur = None;
                         }
-                        1 => {
-                            if let Some(v) = events::REPEAT_VALUES.get(i) {
-                                f.repeat = *v;
-                            }
-                        }
-                        _ => {
-                            if i == 0 {
-                                f.priority = 0;
-                            } else if let Some((v, _, _, _)) = PRIORITIES.get(i - 1) {
-                                f.priority = *v;
-                            }
+                    } else if let Some(rc) = events::RECUR_VALUES.get(i - events::REPEAT_MENU_MIN) {
+                        // 按天重复（每天/每周/每月/每年/农历每年），重复附加卡随之出现
+                        f.repeat = None;
+                        f.recur = Some(rc.to_string());
+                        if f.until_dt.date() < f.a_start.date() {
+                            f.until_dt = date_at(f.a_start.date() + chrono::Duration::days(30), 0, 0);
                         }
                     }
+                    // 重复附加卡出现/消失：重算弹窗高度（保持垂直居中）
+                    let old_h = f.h;
+                    let nh = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
+                    if (nh - old_h).abs() > 0.5 {
+                        f.h = nh;
+                        f.drop = None;
+                        f.redraw();
+                        drop(guard);
+                        unsafe {
+                            resize_keep_center(hwnd, old_h, nh);
+                        }
+                        redraw();
+                        return 0;
+                    }
+                }
+                _ => {
+                    if i == 0 {
+                        f.priority = 0;
+                    } else if let Some((v, _, _, _)) = PRIORITIES.get(i - 1) {
+                        f.priority = *v;
+                    }
+                }
+            }
                     f.drop = None;
                     f.redraw();
                 }

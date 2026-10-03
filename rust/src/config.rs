@@ -45,6 +45,9 @@ pub struct Config {
     pub ics_url: String,
     #[serde(default)]
     pub last_ics_update: u64,
+    /// 提醒弹窗伴随提示音
+    #[serde(default = "def_true")]
+    pub remind_sound: bool,
     // 侧栏卡片（点击日期弹出的侧边栏）
     #[serde(default = "def_true")]
     pub sidebar_date: bool,      // 日期信息
@@ -63,6 +66,59 @@ pub struct Config {
     pub motto_type: String,
     #[serde(default = "def_true")]
     pub sidebar_todo: bool,      // 待办清单
+    /// 侧栏卡片顺序（card id 列表；缺失的按默认顺序补齐）
+    #[serde(default)]
+    pub sidebar_order: Vec<String>,
+}
+
+/// 侧栏卡片定义：(card id, 名称, 设置开关 idx)
+pub const SIDEBAR_CARDS: [(&str, &str, u8); 7] = [
+    ("date", "日期信息", 10),
+    ("almanac", "黄历信息", 11),
+    ("events", "最近事件", 12),
+    ("agenda", "今日日程", 13),
+    ("history", "历史上的今天", 14),
+    ("motto", "时间格言", 15),
+    ("todo", "待办清单", 16),
+];
+
+impl Config {
+    /// 侧栏卡片开关状态
+    pub fn sidebar_enabled(&self, id: &str) -> bool {
+        match id {
+            "date" => self.sidebar_date,
+            "almanac" => self.sidebar_almanac,
+            "events" => self.sidebar_events,
+            "agenda" => self.sidebar_agenda,
+            "history" => self.sidebar_history,
+            "motto" => self.sidebar_motto,
+            "todo" => self.sidebar_todo,
+            _ => false,
+        }
+    }
+
+    /// 完整卡片顺序：sidebar_order 优先，缺失的按默认顺序补齐，未知 id 忽略
+    pub fn sidebar_card_order(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for id in &self.sidebar_order {
+            if let Some((cid, _, _)) = SIDEBAR_CARDS.iter().find(|(c, _, _)| id == c) {
+                if !out.contains(cid) {
+                    out.push(cid);
+                }
+            }
+        }
+        for (cid, _, _) in SIDEBAR_CARDS.iter() {
+            if !out.contains(cid) {
+                out.push(cid);
+            }
+        }
+        out
+    }
+
+    /// 拖动排序后写回（传入重排后的完整顺序）
+    pub fn set_sidebar_order(&mut self, order: &[&str]) {
+        self.sidebar_order = order.iter().map(|s| s.to_string()).collect();
+    }
 }
 
 impl Default for Config {
@@ -80,6 +136,7 @@ impl Default for Config {
             week_start: 0,
             ics_url: DEFAULT_ICS_URL.to_string(),
             last_ics_update: 0,
+            remind_sound: true,
             sidebar_date: true,
             sidebar_almanac: true,
             sidebar_events: true,
@@ -88,6 +145,7 @@ impl Default for Config {
             sidebar_motto: false,
             motto_type: "d".to_string(),
             sidebar_todo: true,
+            sidebar_order: Vec::new(),
         }
     }
 }
@@ -98,6 +156,58 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."));
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+/// 写入前把现有文件复制为 .bak（数据文件损坏时可手工恢复）
+pub fn backup_file(path: &PathBuf) {
+    let bak = path.with_extension("bak");
+    let _ = std::fs::copy(path, bak);
+}
+
+/// 读 JSON，主文件损坏时自动从 .bak 恢复。
+/// 返回 (数据, 是否发生了恢复)。损坏文件留档为 .corrupt（即使没有可用备份，
+/// 也先把坏文件改名，避免下次保存把坏内容复制进 .bak）。
+pub fn load_json_or_bak<T: serde::de::DeserializeOwned>(path: &PathBuf) -> (Option<T>, bool) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return (None, false), // 文件不存在=首次使用
+    };
+    if let Ok(v) = serde_json::from_str::<T>(&text) {
+        return (Some(v), false);
+    }
+    let _ = std::fs::rename(path, path.with_extension("corrupt"));
+    let bak = path.with_extension("bak");
+    if let Ok(bt) = std::fs::read_to_string(&bak) {
+        if let Ok(v) = serde_json::from_str::<T>(&bt) {
+            let _ = std::fs::copy(&bak, path);
+            return (Some(v), true);
+        }
+    }
+    (None, false)
+}
+
+// ---- 高频读取的设置位（绘制线程每次重绘都会用到，避免反复加锁/读盘） ----
+
+static HOUR12: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REMIND_SOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn hour12_on() -> bool {
+    HOUR12.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_hour12(v: bool) {
+    HOUR12.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn remind_sound_on() -> bool {
+    REMIND_SOUND.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_remind_sound(v: bool) {
+    REMIND_SOUND.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 启动时从配置同步原子缓存
+pub fn init_flags(cfg: &Config) {
+    set_hour12(cfg.hour12);
+    set_remind_sound(cfg.remind_sound);
 }
 
 fn config_path() -> PathBuf {

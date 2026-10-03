@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
 use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
@@ -17,6 +17,11 @@ use crate::ics::{key_of_date, DayType};
 
 pub const SB_W: f32 = 400.0;
 
+/// 日程卡片一屏可见行数（更多靠滚轮）
+const AGENDA_VISIBLE: usize = 5;
+/// 待办卡片一屏可见行数（更多靠滚轮）
+const TODO_VISIBLE: usize = 5;
+
 /// 历史上的今天后台拉取完成：请求侧栏重绘（线程安全）
 const WM_APP_HISTORY: UINT = 0x8000 + 1;
 
@@ -29,8 +34,16 @@ unsafe impl Send for SendSb {}
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SbAction {
     CardManage,
+    /// 全部使用全局列表下标（todos_for/todos() 的 enumerate 序号）
     TodoToggle(usize),
+    TodoEdit(usize),
     TodoDelete(usize),
+    /// 逾期待办顺延到今天（全局下标）
+    TodoPostpone(usize),
+    /// 清除所有已完成待办
+    TodoClearDone,
+    /// 日程行：agenda_rows 的下标（含按天重复展开的行），行体点击/✎ 都打开编辑
+    AgendaEdit(usize),
     AgendaDelete(usize),
 }
 
@@ -51,10 +64,24 @@ struct SidebarUi {
     hover: Option<SbAction>,
     dumped: bool,
     dump_path: String,
+    // ---- 卡片滚动（滚轮作用于光标所在卡片） ----
+    /// 日程卡片：滚动偏移 / 条目总数 / 列表区 y 范围
+    agenda_scroll: usize,
+    agenda_count: usize,
+    agenda_band: (f32, f32),
+    /// 待办卡片：滚动偏移 / 当日条目总数 / 列表区 y 范围
+    todo_scroll: usize,
+    todo_count: usize,
+    todo_band: (f32, f32),
+    /// 本次绘制解析出的日程行（含按天重复展开）：(原key, 原下标, 条目)
+    agenda_rows: Vec<(String, usize, crate::events::AgendaEntry)>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Todo {
+    /// 稳定 id（提醒去重用；旧条目为空）
+    #[serde(default)]
+    pub id: String,
     pub text: String,
     #[serde(default)]
     pub done: bool,
@@ -78,20 +105,32 @@ pub struct Todo {
     /// 重复间隔分钟（None=单次）
     #[serde(default)]
     pub repeat: Option<i64>,
+    /// 按天重复：d=每天 w=每周（同星期几） m=每月（同几号） y=每年 l=农历每年；None=不按天重复
+    #[serde(default)]
+    pub recur: Option<String>,
+    /// 重复截止日期（"%Y-%m-%d"，含当天）；None=无限重复
+    #[serde(default)]
+    pub recur_until: Option<String>,
+    /// “仅此次”删除/修改产生的例外日期
+    #[serde(default)]
+    pub skip_dates: Vec<String>,
+    /// 按天重复待办的完成记录（已完成日子的 Y-M-D key；主条目 done 恒为 false）
+    #[serde(default)]
+    pub done_dates: Vec<String>,
 }
 
 static TODOS: Mutex<Option<Vec<Todo>>> = Mutex::new(None);
 
-/// 缓存未加载时先读盘，避免写操作覆盖已有数据
+/// 缓存未加载时先读盘，避免写操作覆盖已有数据（损坏时自动从 .bak 恢复）
 fn cached_list() -> Vec<Todo> {
     let mut g = TODOS.lock().unwrap();
     if g.is_none() {
         let path = crate::config::data_dir().join("todo.json");
-        let list = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Vec<Todo>>(t.as_str()).ok())
-            .unwrap_or_default();
-        *g = Some(list);
+        let (list, healed) = crate::config::load_json_or_bak::<Vec<Todo>>(&path);
+        if healed {
+            crate::toast::notify("待办数据已恢复", "todo.json 损坏，已自动从备份恢复");
+        }
+        *g = Some(list.unwrap_or_default());
     }
     g.clone().unwrap()
 }
@@ -103,6 +142,7 @@ fn todos() -> Vec<Todo> {
 fn save_todos(list: &[Todo]) {
     let path = crate::config::data_dir().join("todo.json");
     if let Ok(text) = serde_json::to_string_pretty(list) {
+        crate::config::backup_file(&path);
         let _ = std::fs::write(path, text);
     }
 }
@@ -112,60 +152,327 @@ pub fn add_todo_full(todo: Todo) {
     if todo.text.trim().is_empty() {
         return;
     }
+    let mut todo = todo;
+    if todo.id.is_empty() {
+        todo.id = crate::events::gen_id();
+    }
     let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
     let list = g.get_or_insert_with(|| cached);
     list.push(todo);
     save_todos(list);
+    drop(g);
+    crate::flyout::flyout_repaint();
 }
 
-/// 某日的待办（下标对应全局列表中的顺序）
+/// 全局下标取待办（编辑弹窗预填用）
+pub fn todo_at(gi: usize) -> Option<Todo> {
+    todos().into_iter().nth(gi)
+}
+
+/// 某日实际生效的待办（下标对应全局列表中的顺序）。
+/// 重复待办在命中日子展开一条（尊重截止日与“仅此次”例外），done 反映当天的完成记录；
+/// 列表按 时间→优先级 排序。
 fn todos_for(key: &str) -> Vec<(usize, Todo)> {
-    todos()
+    let date = chrono::NaiveDate::parse_from_str(key, "%Y-%m-%d").ok();
+    let mut out: Vec<(usize, Todo)> = todos()
         .into_iter()
         .enumerate()
-        .filter(|(_, t)| t.date.as_deref() == Some(key))
-        .collect()
+        .filter_map(|(i, mut t)| {
+            if t.date.as_deref() == Some(key) {
+                if let Some(rc) = &t.recur {
+                    // 锚点日：同样尊重截止日/“仅此次”例外
+                    let Some(anchor) = t
+                        .date
+                        .as_deref()
+                        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    else {
+                        return None;
+                    };
+                    let Some(d) = date else { return None };
+                    if !crate::events::recur_occurs(t.recur_until.as_deref(), &t.skip_dates, rc, anchor, d) {
+                        return None;
+                    }
+                    // 锚点日本身也按当天完成记录显示
+                    t.done = t.done_dates.iter().any(|k| k == key);
+                }
+                return Some((i, t));
+            }
+            if let (Some(rc), Some(anchor), Some(d)) = (&t.recur, t.date.as_deref().and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()), date) {
+                if crate::events::recur_occurs(t.recur_until.as_deref(), &t.skip_dates, rc, anchor, d) {
+                    t.done = t.done_dates.iter().any(|k| k == key);
+                    return Some((i, t));
+                }
+            }
+            None
+        })
+        .collect();
+    out.sort_by(|a, b| todo_sort_key(&a.1).cmp(&todo_sort_key(&b.1)));
+    out
 }
 
-/// 删除某日第 idx 条待办
-pub fn remove_todo_for(key: &str, idx: usize) {
-    let cached = cached_list();
-    let mut g = TODOS.lock().unwrap();
-    let list = g.get_or_insert_with(|| cached);
-    let mut seen = 0usize;
-    let mut remove_at = None;
-    for (gi, td) in list.iter().enumerate() {
-        if td.date.as_deref() == Some(key) {
-            if seen == idx {
-                remove_at = Some(gi);
-                break;
+/// 待办排序键：未完成在前 → 带时间的按时间升序在前 → 无时间的（随时做）在后 → 优先级（收集箱垫底）
+/// （sort_by 为稳定排序，同键保持录入顺序）
+fn todo_sort_key(t: &Todo) -> (u8, u8, u32, u8) {
+    let done = t.done as u8;
+    let untimed = (!t.has_time) as u8;
+    let mins = t
+        .start
+        .as_deref()
+        .filter(|_| t.has_time)
+        .and_then(crate::events::parse_start)
+        .map(|d| d.hour() as u32 * 60 + d.minute() as u32)
+        .unwrap_or(0);
+    let prio = match t.priority {
+        0 => 5, // 收集箱（未分类）垫底
+        p => p,
+    };
+    (done, untimed, mins, prio)
+}
+
+/// 是否存在某日的未完成待办（日历格角标）
+pub fn has_todo(key: &str) -> bool {
+    todos().iter().any(|t| t.date.as_deref() == Some(key) && !t.done)
+}
+
+/// 含未完成待办的日期集合（日历格角标），范围 [a, b]；
+/// 重复待办按规则展开（尊重截止日/“仅此次”例外，当天已完成的除外）。
+pub fn todo_keys_between(a: NaiveDate, b: NaiveDate) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    for t in todos() {
+        if t.done && t.recur.is_none() {
+            continue;
+        }
+        let anchor = t
+            .date
+            .as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+        if let (Some(anchor), Some(rc)) = (anchor, &t.recur) {
+            // 重复：展开到范围内（含锚点日，尊重截止日/例外）
+            let from = anchor.max(a);
+            let mut d = from;
+            while d <= b {
+                if crate::events::recur_occurs(t.recur_until.as_deref(), &t.skip_dates, rc, anchor, d) {
+                    let k = crate::ics::key_of_date(d);
+                    if !t.done_dates.iter().any(|x| *x == k) {
+                        set.insert(k);
+                    }
+                }
+                d += chrono::Duration::days(1);
             }
-            seen += 1;
+        } else if let Some(d) = anchor {
+            if !t.done && d >= a && d <= b {
+                set.insert(crate::ics::key_of_date(d));
+            }
         }
     }
-    if let Some(gi) = remove_at {
-        list.remove(gi);
-        save_todos(list);
-    }
+    set
 }
 
-/// 切换某日第 idx 条待办的完成状态
-pub fn toggle_todo_for(key: &str, idx: usize) {
+/// 逾期未完成的待办（归属日期早于今天），按日期升序。
+/// 注意：date 存储为不补零的 "Y-M-D"（key_of 格式），不能直接字符串比较，须解析成日期。
+/// 按天重复的待办不会逾期（永远落在当天之后的日子上）。
+pub fn overdue_todos() -> Vec<(usize, Todo)> {
+    let today = chrono::Local::now().date_naive();
+    let mut out: Vec<(usize, Todo)> = todos()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.recur.is_none()
+                && !t.done
+                && t.date
+                    .as_deref()
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .map(|d| d < today)
+                    .unwrap_or(false)
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let ka = a
+            .1
+            .date
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        let kb = b
+            .1
+            .date
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        ka.cmp(&kb).then_with(|| todo_sort_key(&a.1).cmp(&todo_sort_key(&b.1)))
+    });
+    out
+}
+
+/// 切换待办完成状态（全局下标）。
+/// 按天重复的待办按“日子”记录完成（done_dates），普通待办直接翻 done 位。
+pub fn toggle_todo_on(gi: usize, date_key: &str) {
     let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
     let list = g.get_or_insert_with(|| cached);
-    let mut seen = 0usize;
-    for td in list.iter_mut() {
-        if td.date.as_deref() == Some(key) {
-            if seen == idx {
-                td.done = !td.done;
-                break;
+    if let Some(td) = list.get_mut(gi) {
+        if td.recur.is_some() {
+            if let Some(pos) = td.done_dates.iter().position(|k| k == date_key) {
+                td.done_dates.remove(pos);
+            } else {
+                td.done_dates.push(date_key.to_string());
             }
-            seen += 1;
+        } else {
+            td.done = !td.done;
         }
     }
     save_todos(list);
+    drop(g);
+    crate::flyout::flyout_repaint();
+}
+
+/// 删除待办（全局下标）
+pub fn remove_todo_at(gi: usize) {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    if gi < list.len() {
+        list.remove(gi);
+        save_todos(list);
+    }
+    drop(g);
+    crate::flyout::flyout_repaint();
+}
+
+/// 编辑替换待办（全局下标；done/id 沿用原条目）
+pub fn update_todo_at(gi: usize, mut td: Todo) {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    if let Some(old) = list.get(gi) {
+        td.done = old.done;
+        if td.id.is_empty() {
+            td.id = old.id.clone();
+        }
+        list[gi] = td;
+        save_todos(list);
+    }
+    drop(g);
+    crate::flyout::flyout_repaint();
+}
+
+/// 逾期待办顺延到今天（全局下标；按天重复的待办没有逾期概念，忽略）
+pub fn postpone_todo_to_today(gi: usize) {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    if let Some(td) = list.get_mut(gi) {
+        if td.recur.is_none() {
+            td.date = Some(crate::ics::key_of_date(chrono::Local::now().date_naive()));
+            save_todos(list);
+        }
+    }
+    drop(g);
+    crate::flyout::flyout_repaint();
+}
+
+/// 一键清除所有已完成待办（按天重复的完成记录不受影响）
+pub fn clear_done_todos() {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let before = list.len();
+    list.retain(|t| !(t.done && t.recur.is_none()));
+    let changed = list.len() != before;
+    if changed {
+        save_todos(list);
+    }
+    drop(g);
+    if changed {
+        crate::flyout::flyout_repaint();
+    }
+}
+
+/// 是否存在已完成的待办（“清除已完成”按钮显隐）
+pub fn has_done_todos() -> bool {
+    todos().iter().any(|t| t.done && t.recur.is_none())
+}
+
+/// 提醒卡片「完成」按钮：按 id 定位待办标记完成（重复待办按日子记录完成）
+pub fn complete_todo_by_id(id: &str, date_key: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let mut changed = false;
+    for td in list.iter_mut() {
+        if td.id == id {
+            if td.recur.is_some() {
+                if !td.done_dates.iter().any(|k| k == date_key) {
+                    td.done_dates.push(date_key.to_string());
+                    changed = true;
+                }
+            } else if !td.done {
+                td.done = true;
+                changed = true;
+            }
+            break;
+        }
+    }
+    if changed {
+        save_todos(list);
+    }
+    drop(g);
+    if changed {
+        crate::flyout::flyout_repaint();
+    }
+}
+
+/// 「仅删除这一天」：给重复待办追加例外日期（该天不再出现）
+pub fn todo_skip_day(gi: usize, date: chrono::NaiveDate) -> bool {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let mut changed = false;
+    if let Some(td) = list.get_mut(gi) {
+        if td.recur.is_some() && !crate::events::recur_skipped(&td.skip_dates, date) {
+            td.skip_dates.push(crate::ics::key_of_date(date));
+            changed = true;
+        }
+    }
+    if changed {
+        save_todos(list);
+    }
+    drop(g);
+    if changed {
+        crate::flyout::flyout_repaint();
+    }
+    changed
+}
+
+/// 「仅修改这一天」（编辑保存）：给重复待办追加例外日期并可顺带更新截止日
+pub fn todo_patch_recur(gi: usize, until: Option<String>, skip: Option<chrono::NaiveDate>) {
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let mut changed = false;
+    if let Some(td) = list.get_mut(gi) {
+        if td.recur.is_some() {
+            if td.recur_until != until {
+                td.recur_until = until;
+                changed = true;
+            }
+            if let Some(d) = skip {
+                if !crate::events::recur_skipped(&td.skip_dates, d) {
+                    td.skip_dates.push(crate::ics::key_of_date(d));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if changed {
+        save_todos(list);
+    }
+    drop(g);
+    if changed {
+        crate::flyout::flyout_repaint();
+    }
 }
 
 /// 历史上的今天：内置精选事件（月, 日, 年, 事件）
@@ -416,6 +723,13 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
             hover: None,
             dumped: false,
             dump_path: std::env::var("CAL_DUMP4").unwrap_or_default(),
+            agenda_scroll: 0,
+            agenda_count: 0,
+            agenda_band: (0.0, 0.0),
+            todo_scroll: 0,
+            todo_count: 0,
+            todo_band: (0.0, 0.0),
+            agenda_rows: Vec::new(),
         });
         let hdc = GetDC(std::ptr::null_mut());
         sui.mem_dc = CreateCompatibleDC(hdc) as usize;
@@ -500,30 +814,12 @@ impl SidebarUi {
     }
 
     fn enabled_cards(&self) -> Vec<&'static str> {
+        // 按设置中的卡片顺序（侧栏管理可拖动调整），过滤出开启的卡片
         let cfg = self.st.config.lock().unwrap();
-        let mut v = Vec::new();
-        if cfg.sidebar_date {
-            v.push("date");
-        }
-        if cfg.sidebar_almanac {
-            v.push("almanac");
-        }
-        if cfg.sidebar_events {
-            v.push("events");
-        }
-        if cfg.sidebar_agenda {
-            v.push("agenda");
-        }
-        if cfg.sidebar_history {
-            v.push("history");
-        }
-        if cfg.sidebar_motto {
-            v.push("motto");
-        }
-        if cfg.sidebar_todo {
-            v.push("todo");
-        }
-        v
+        cfg.sidebar_card_order()
+            .into_iter()
+            .filter(|id| cfg.sidebar_enabled(id))
+            .collect()
     }
 
     fn almanac_height(&self, p: &Painter, date: NaiveDate) -> f32 {
@@ -536,12 +832,13 @@ impl SidebarUi {
     }
 
     fn agenda_height(&self, date: NaiveDate) -> f32 {
-        let key = key_of_date(date);
-        let n = self.agenda.lock().unwrap().get(&key).map(|v| v.len()).unwrap_or(0);
+        let n = crate::events::agenda_on(&self.agenda.lock().unwrap(), date).len();
         if n == 0 {
             44.0
         } else {
-            8.0 + (1 + n.min(4)) as f32 * 20.0 + 8.0
+            8.0 + (1 + n.min(AGENDA_VISIBLE)) as f32 * 20.0
+                + if n > AGENDA_VISIBLE { 16.0 } else { 0.0 }
+                + 8.0
         }
     }
 
@@ -570,6 +867,7 @@ impl SidebarUi {
         let today = Local::now().date_naive();
         let cards = self.enabled_cards();
         self.regions.clear();
+        self.agenda_rows.clear();
 
         // 页面底
         p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE);
@@ -643,39 +941,56 @@ impl SidebarUi {
                 }
                 "todo" => {
                     let key = crate::ics::key_of_date(date);
+                    let is_today = date == today;
                     let todos = todos_for(&key);
-                    let rows = todos.len().min(5);
-                    let h = 8.0 + 18.0 + 4.0 + if todos.is_empty() { 18.0 } else { rows as f32 * 20.0 } + 8.0;
+                    // 逾期未完成（仅在查看今天时列出，可顺延到今天）
+                    let overdue = if is_today { overdue_todos() } else { Vec::new() };
+                    let over_rows = overdue.len().min(3);
+                    let n = todos.len();
+                    self.todo_count = n;
+                    let more = n > TODO_VISIBLE;
+                    let past = date < today; // 查看过去的日期：未完成待办标红
+                    let list_h = if todos.is_empty() { 18.0 } else { TODO_VISIBLE as f32 * 20.0 };
+                    let over_h = if over_rows > 0 { over_rows as f32 * 20.0 + 4.0 } else { 0.0 };
+                    let more_h = if more { 16.0 } else { 0.0 };
+                    let h = 8.0 + 18.0 + 4.0 + over_h + list_h + more_h + 8.0;
                     p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
                     p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
-                    if todos.is_empty() {
-                        p.text("暂无待办", cx, y + 28.0, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
-                    } else {
-                        for (i, (_, td)) in todos.iter().take(5).enumerate() {
-                            let ry = y + 28.0 + i as f32 * 20.0;
-                            let col = if td.done { SUB_DIM } else { ROW_TXT };
-                            // 勾选圈（点击切换完成）
-                            p.stroke_circle(cx + 21.0, ry + 10.0, 5.0, 1.2, if td.done { BLUE } else { SUB });
-                            if td.done {
-                                p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE);
-                            }
-                            // 优先级色点
-                            let mut tx = cx + 36.0;
-                            if let Some(pc) = priority_color(td.priority) {
-                                p.fill_circle(cx + 35.0, ry + 9.0, 3.0, pc);
-                                tx = cx + 44.0;
-                            }
-                            p.text(&td.text, tx, ry, cx + cw - 30.0 - tx, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
-                            if td.done {
-                                let w = p.measure(&td.text, 12.0, false, false).0;
-                                p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM);
-                            }
-                            // 删除
-                            let del_hover = self.hover == Some(SbAction::TodoDelete(i));
-                            p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
-                            self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoToggle(i)));
-                            self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoDelete(i)));
-                        }
+                    // 清除已完成（存在已完成条目时显示）
+                    if has_done_todos() {
+                        let bhov = self.hover == Some(SbAction::TodoClearDone);
+                        p.text("清除已完成", cx + cw - 84.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE } else { SUB_DIM });
+                        self.regions.push((gdi::RectF { x: cx + cw - 90.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoClearDone));
+                    }
+                    let mut ry = y + 28.0;
+                    if todos.is_empty() && over_rows == 0 {
+                        p.text("暂无待办", cx, ry, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                        ry += 18.0;
+                    }
+                    // 逾期区（红字，带原日期前缀；“→”顺延到今天）
+                    for (gi, td) in overdue.iter().take(3) {
+                        let (oy, od) = td
+                            .date
+                            .as_deref()
+                            .map(|d| (d.get(5..7).unwrap_or("").trim_start_matches('0'), d.get(8..10).unwrap_or("").trim_start_matches('0')))
+                            .unwrap_or(("", ""));
+                        let label = format!("{}-{} {}", oy, od, td.text);
+                        self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, true, true);
+                        ry += 20.0;
+                    }
+                    if over_rows > 0 {
+                        ry += 4.0;
+                    }
+                    // 当日待办（可滚动）
+                    self.todo_band = (ry, ry + list_h);
+                    let off = self.todo_scroll.min(n.saturating_sub(TODO_VISIBLE));
+                    for (vi, (gi, td)) in todos.iter().enumerate().skip(off).take(TODO_VISIBLE) {
+                        let label = if td.recur.is_some() { format!("{} ↻", td.text) } else { td.text.clone() };
+                        self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, past, false);
+                        ry += 20.0;
+                    }
+                    if more {
+                        p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, ry, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
                     }
                     y += h + 8.0;
                 }
@@ -686,6 +1001,37 @@ impl SidebarUi {
         // 卡片管理
         p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE);
         self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 24.0 }, SbAction::CardManage));
+    }
+
+    /// 待办单行：勾选圈 + 优先级色点 + 文本（可带前缀）+（逾期的加“→”顺延）+ 编辑/删除
+    fn paint_todo_row(&mut self, p: &Painter, cx: f32, cw: f32, ry: f32, gi: usize, td: &Todo, label: &str, red: bool, overdue: bool) {
+        let col = if td.done { SUB_DIM } else if red { RED } else { ROW_TXT };
+        p.stroke_circle(cx + 21.0, ry + 10.0, 5.0, 1.2, if td.done { BLUE } else { SUB });
+        if td.done {
+            p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE);
+        }
+        let mut tx = cx + 36.0;
+        if let Some(pc) = priority_color(td.priority) {
+            p.fill_circle(cx + 35.0, ry + 9.0, 3.0, pc);
+            tx = cx + 44.0;
+        }
+        p.text(label, tx, ry, cx + cw - 58.0 - tx, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
+        if td.done {
+            let w = p.measure(label, 12.0, false, false).0;
+            p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM);
+        }
+        if overdue {
+            let ph = self.hover == Some(SbAction::TodoPostpone(gi));
+            p.text("→", cx + cw - 76.0, ry, 20.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if ph { BLUE } else { RED });
+            self.regions.push((gdi::RectF { x: cx + cw - 78.0, y: ry, w: 22.0, h: 20.0 }, SbAction::TodoPostpone(gi)));
+        }
+        let ed_hover = self.hover == Some(SbAction::TodoEdit(gi));
+        p.text("✎", cx + cw - 52.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, if ed_hover { BLUE } else { SUB_DIM });
+        let del_hover = self.hover == Some(SbAction::TodoDelete(gi));
+        p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+        self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoToggle(gi)));
+        self.regions.push((gdi::RectF { x: cx + cw - 54.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoEdit(gi)));
+        self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoDelete(gi)));
     }
 
     fn paint_date_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, date: NaiveDate, today: NaiveDate) {
@@ -759,24 +1105,33 @@ impl SidebarUi {
 
     fn paint_agenda_card(&mut self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
         p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-        let key = key_of_date(date);
-        let items = self.agenda.lock().unwrap().get(&key).cloned().unwrap_or_default();
+        // 解析当日生效日程（含按天重复展开），缓存原 key/下标供编辑/删除定位
+        let rows = crate::events::agenda_on(&self.agenda.lock().unwrap(), date);
+        self.agenda_rows = rows.clone();
+        let n = rows.len();
+        self.agenda_count = n;
         let wd = ["日", "一", "二", "三", "四", "五", "六"][date.weekday().num_days_from_sunday() as usize];
-        if items.is_empty() {
+        if n == 0 {
             p.text(&format!("{}年{}月{}日 星期{} 还没有日程", date.year(), date.month(), date.day(), wd), cx, y, cw, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
-        } else {
-            p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
-            for (i, item) in items.iter().take(4).enumerate() {
-                let ry = y + 28.0 + i as f32 * 20.0;
-                let text = crate::events::display(item);
-                p.text(&text, cx + 14.0, ry, cw - 56.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
-                let del_hover = self.hover == Some(SbAction::AgendaDelete(i));
-                p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
-                self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::AgendaDelete(i)));
-            }
-            if items.len() > 4 {
-                p.text(&format!("… 共 {} 条", items.len()), cx + 14.0, y + 28.0 + 4.0 * 20.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
-            }
+            return;
+        }
+        p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
+        let list_top = y + 28.0;
+        self.agenda_band = (list_top, list_top + AGENDA_VISIBLE as f32 * 20.0);
+        let off = self.agenda_scroll.min(n.saturating_sub(AGENDA_VISIBLE));
+        for (vi, (_, _, item)) in rows.iter().enumerate().skip(off).take(AGENDA_VISIBLE) {
+            let ry = list_top + (vi - off) as f32 * 20.0;
+            let text = crate::events::display(item);
+            let ed_hov = self.hover == Some(SbAction::AgendaEdit(vi));
+            p.text(&text, cx + 14.0, ry, cw - 48.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if ed_hov { BLUE } else { ROW_TXT });
+            // 行体点击 → 编辑弹窗
+            self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: cw - 48.0, h: 18.0 }, SbAction::AgendaEdit(vi)));
+            let del_hover = self.hover == Some(SbAction::AgendaDelete(vi));
+            p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+            self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::AgendaDelete(vi)));
+        }
+        if n > AGENDA_VISIBLE {
+            p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, list_top + AGENDA_VISIBLE as f32 * 20.0, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
         }
     }
 
@@ -923,43 +1278,144 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                         crate::flyout::show_settings_tab(2);
                     }
                     Some(SbAction::TodoToggle(i)) => {
-                        if let Some(d) = f.date {
-                            let key = crate::ics::key_of_date(d);
-                            crate::sidebar::toggle_todo_for(&key, i);
+                        // 按天重复的待办按“当前查看的日子”记录完成
+                        let key = f.date.map(crate::ics::key_of_date).unwrap_or_default();
+                        crate::sidebar::toggle_todo_on(i, &key);
+                        f.redraw();
+                    }
+                    Some(SbAction::TodoDelete(i)) => {
+                        // 重复待办：✕ 弹“仅这一天/整个系列”选择；普通待办直接删
+                        let td = crate::sidebar::todo_at(i);
+                        if td.as_ref().map(|t| t.recur.is_some()).unwrap_or(false) {
+                            let date = f.date.unwrap_or_else(|| chrono::Local::now().date_naive());
+                            drop(guard);
+                            let mut pt = POINT { x: 0, y: 0 };
+                            unsafe { GetCursorPos(&mut pt) };
+                            crate::recur_menu::open(pt.x, pt.y, crate::recur_menu::RmTarget::Todo { gi: i, date });
+                        } else {
+                            crate::sidebar::remove_todo_at(i);
                             f.redraw();
                         }
                     }
-                    Some(SbAction::TodoDelete(i)) => {
-                        if let Some(d) = f.date {
-                            let key = crate::ics::key_of_date(d);
-                            crate::sidebar::remove_todo_for(&key, i);
-                            f.redraw();
+                    Some(SbAction::TodoPostpone(i)) => {
+                        crate::sidebar::postpone_todo_to_today(i);
+                        f.redraw();
+                    }
+                    Some(SbAction::TodoClearDone) => {
+                        crate::sidebar::clear_done_todos();
+                        f.redraw();
+                    }
+                    Some(SbAction::TodoEdit(i)) => {
+                        // 取出待办后在锁外打开编辑弹窗（inputbox 会激活窗口）
+                        let td = crate::sidebar::todo_at(i);
+                        let occ = if td.as_ref().map(|t| t.recur.is_some()).unwrap_or(false) {
+                            f.date
+                        } else {
+                            None
+                        };
+                        let hwnd = f.hwnd;
+                        drop(guard);
+                        if let Some(td) = td {
+                            let mut r: RECT = std::mem::zeroed();
+                            unsafe { GetWindowRect(hwnd as HWND, &mut r) };
+                            crate::inputbox::open_todo_edit(r.left, r.top, i, &td, occ);
+                        }
+                    }
+                    Some(SbAction::AgendaEdit(i)) => {
+                        // 取出解析行（含重复展开的行）后在锁外打开编辑弹窗
+                        let target = f.agenda_rows.get(i).map(|(k, idx, e)| (k.clone(), *idx, e.clone()));
+                        let occ = f.date;
+                        let hwnd = f.hwnd;
+                        drop(guard);
+                        if let Some((key, idx, entry)) = target {
+                            let ev = match entry {
+                                crate::events::AgendaEntry::Rich(r) => r,
+                                crate::events::AgendaEntry::Legacy(text) => {
+                                    // 旧纯文本条目：转为富条目编辑（保存后替换）
+                                    crate::events::RichEvent {
+                                        id: String::new(),
+                                        name: text,
+                                        all_day: false,
+                                        start: format!("{} 09:00", key),
+                                        end: format!("{} 10:00", key),
+                                        remind: None,
+                                        repeat: None,
+                                        recur: None,
+                                        recur_until: None,
+                                        skip_dates: Vec::new(),
+                                    }
+                                }
+                            };
+                            let mut r: RECT = std::mem::zeroed();
+                            unsafe { GetWindowRect(hwnd as HWND, &mut r) };
+                            crate::inputbox::open_agenda_edit(r.left, r.top, &key, idx, &ev, occ);
                         }
                     }
                     Some(SbAction::AgendaDelete(i)) => {
-                        if let Some(d) = f.date {
-                            let key = crate::ics::key_of_date(d);
+                        // 用解析行的原 key/下标定位（重复日程行也指向主条目）
+                        let target = f.agenda_rows.get(i).map(|(k, idx, e)| (k.clone(), *idx, e.clone()));
+                        let is_recur = matches!(&target, Some((_, _, crate::events::AgendaEntry::Rich(r))) if r.recur.is_some());
+                        if is_recur {
+                            // 重复日程：✕ 弹“仅这一天/整个系列”选择
+                            let (key, idx) = match target {
+                                Some((k, idx, _)) => (k, idx),
+                                None => unreachable!(),
+                            };
+                            let date = f.date.unwrap_or_else(|| chrono::Local::now().date_naive());
+                            drop(guard);
+                            let mut pt = POINT { x: 0, y: 0 };
+                            unsafe { GetCursorPos(&mut pt) };
+                            crate::recur_menu::open(pt.x, pt.y, crate::recur_menu::RmTarget::Agenda { key, idx, date });
+                        } else if let Some((key, idx, _)) = target {
                             let mut map = f.agenda.lock().unwrap();
-                            let mut removed = false;
-                            if let Some(v) = map.get_mut(&key) {
-                                if i < v.len() {
-                                    v.remove(i);
-                                    if v.is_empty() {
-                                        map.remove(&key);
-                                    }
-                                    if let Ok(json) = serde_json::to_string(&*map) {
-                                        let _ = std::fs::write(crate::config::data_dir().join("agenda.json"), json);
-                                    }
-                                    removed = true;
-                                }
-                            }
+                            let removed = crate::events::agenda_remove_at(&mut map, &key, idx);
                             drop(map);
                             if removed {
+                                let m = f.agenda.lock().unwrap();
+                                crate::events::save(&m);
+                                drop(m);
                                 f.redraw();
                             }
                         }
                     }
                     _ => {}
+                }
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            // 滚轮作用于光标所在的卡片列表（日程/待办），翻动溢出内容
+            let delta = ((wp as i32) >> 16) as i16 as f32;
+            let mut guard = SIDEBAR_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                let f = &mut f.0;
+                let mut pt = POINT { x: 0, y: 0 };
+                unsafe {
+                    GetCursorPos(&mut pt);
+                    ScreenToClient(hwnd as HWND, &mut pt);
+                }
+                let cy = pt.y as f32 / f.sf;
+                let (target, count) = if cy >= f.agenda_band.0 && cy < f.agenda_band.1 && f.agenda_count > AGENDA_VISIBLE {
+                    (0, f.agenda_count)
+                } else if cy >= f.todo_band.0 && cy < f.todo_band.1 && f.todo_count > TODO_VISIBLE {
+                    (1, f.todo_count)
+                } else {
+                    (-1, 0)
+                };
+                if target >= 0 {
+                    let visible = if target == 0 { AGENDA_VISIBLE } else { TODO_VISIBLE };
+                    let max_off = count.saturating_sub(visible);
+                    let step = ((delta / 120.0) * 2.0).round() as i32; // 每格滚 2 行
+                    let cur = if target == 0 { f.agenda_scroll } else { f.todo_scroll };
+                    let next = (cur as i32 - step).clamp(0, max_off as i32) as usize;
+                    if next != cur {
+                        if target == 0 {
+                            f.agenda_scroll = next;
+                        } else {
+                            f.todo_scroll = next;
+                        }
+                        f.redraw();
+                    }
                 }
             }
             0

@@ -51,22 +51,46 @@ struct BdcReverse {
     city: String,
 }
 
+/// DNS 解析：IPv4 地址排在 IPv6 之前。电信等运营商的 IPv6 出口在 IP 定位库中
+/// 常被错标城市（如广东电信 IPv6 被标到海南儋州），IPv4 数据准确得多，
+/// 故天气相关请求一律优先走 IPv4 出口定位（无 IPv4 时仍可回退 IPv6）。
+fn resolve_v4_first(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    let mut addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(netloc)?.collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    Ok(addrs)
+}
+
+/// 天气相关请求共用 Agent（IPv4 优先解析）
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().resolver(resolve_v4_first).build())
+}
+
 /// 主定位：ip-api.com（大陆城市定位准确，直接返回简体中文城市名 + 坐标）
 fn fetch_ip_api() -> Option<(f64, f64, String)> {
-    // 该服务对不同客户端可能返回错误的 charset 头（GBK），故按原始字节强制 UTF-8 解析
-    let mut body = ureq::get("http://ip-api.com/json/?lang=zh-CN&fields=status,message,city,lat,lon")
-        .timeout(std::time::Duration::from_secs(8))
-        .call()
-        .ok()?
-        .into_reader()
-        .take(1 << 20); // 上限 1MB，防异常响应撑爆内存
-    let mut buf = Vec::new();
-    body.read_to_end(&mut buf).ok()?;
-    let v: IpApi = serde_json::from_slice(&buf).ok()?;
-    if v.status != "success" || v.city.is_empty() {
-        return None;
+    // 该服务对不同客户端可能返回错误的 charset 头（GBK），故按原始字节强制 UTF-8 解析；
+    // 境外明文 HTTP 服务从国内访问偶发超时，重试一次以减少落入备用定位
+    for _ in 0..2 {
+        let Ok(resp) = agent()
+            .get("http://ip-api.com/json/?lang=zh-CN&fields=status,message,city,lat,lon")
+            .timeout(std::time::Duration::from_secs(8))
+            .call()
+        else {
+            continue;
+        };
+        let mut body = resp.into_reader().take(1 << 20); // 上限 1MB，防异常响应撑爆内存
+        let mut buf = Vec::new();
+        if body.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<IpApi>(&buf) else {
+            continue;
+        };
+        if v.status == "success" && !v.city.is_empty() {
+            return Some((v.lat, v.lon, v.city.trim_end_matches('市').to_string()));
+        }
     }
-    Some((v.lat, v.lon, v.city.trim_end_matches('市').to_string()))
+    None
 }
 
 /// 坐标 → 简体中文城市名（BigDataCloud 免费反向地理编码；失败返回 None）
@@ -75,7 +99,8 @@ fn fetch_city_cn(lat: f64, lon: f64) -> Option<String> {
         "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={}&longitude={}&localityLanguage=zh-Hans",
         lat, lon
     );
-    let text = ureq::get(&url)
+    let text = agent()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(8))
         .call()
         .ok()?
@@ -208,7 +233,8 @@ pub fn fetch() -> Option<Weather> {
         Some(v) => v,
         None => {
             let loc: IpWho = serde_json::from_str(
-                &ureq::get("https://ipwho.is/")
+                &agent()
+                    .get("https://ipwho.is/")
                     .timeout(std::time::Duration::from_secs(8))
                     .call()
                     .ok()?
@@ -227,7 +253,8 @@ pub fn fetch() -> Option<Weather> {
         "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current_weather=true&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7",
         lat, lon
     );
-    let text = ureq::get(&url)
+    let text = agent()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(8))
         .call()
         .ok()?
@@ -252,7 +279,7 @@ pub fn fetch() -> Option<Weather> {
             "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={}&longitude={}&hourly=us_aqi&timezone=auto&forecast_days=7",
             lat, lon
         );
-        if let Ok(resp) = ureq::get(&aq_url).timeout(std::time::Duration::from_secs(8)).call() {
+        if let Ok(resp) = agent().get(&aq_url).timeout(std::time::Duration::from_secs(8)).call() {
             if let Ok(t) = resp.into_string() {
                 apply_aqi(&mut days, &t);
             }
@@ -380,6 +407,15 @@ pub fn fake() -> Weather {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolver_v4_first() {
+        let addrs = super::resolve_v4_first("localhost:1234").expect("resolve localhost");
+        assert!(!addrs.is_empty());
+        if let Some(i) = addrs.iter().position(|a| a.is_ipv6()) {
+            assert!(addrs[i..].iter().all(|a| a.is_ipv6()), "IPv4 应排在 IPv6 之前");
+        }
+    }
+
     #[test]
     fn parse_forecast_and_aqi() {
         let fc = r#"{"current_weather":{"temperature":26.4,"weathercode":95},"daily":{"time":["2026-09-20","2026-09-21"],"weather_code":[95,3],"temperature_2m_max":[35.2,33.0],"temperature_2m_min":[25.1,24.4]}}"#;

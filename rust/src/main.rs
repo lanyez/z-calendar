@@ -14,7 +14,10 @@ mod lunar;
 mod lunar_data;
 mod motto;
 mod overlay;
+mod recur_menu;
+mod reminder;
 mod sidebar;
+mod toast;
 mod tray;
 mod weather;
 
@@ -86,6 +89,7 @@ fn main() {
     gdi::startup();
 
     let config = config::Config::load();
+    config::init_flags(&config);
     let holidays = ics::load_cache();
     // 历史上的今天：删除不是当天的缓存数据
     history::purge_stale();
@@ -110,6 +114,9 @@ fn main() {
         weather_tx,
     };
 
+    // 提醒弹窗线程先起（日程/待办加载若触发数据自愈，通知才能送达）
+    let toast_tx = toast::spawn();
+
     let agenda = Arc::new(Mutex::new(flyout::load_agenda()));
     let tray = Arc::new(Mutex::new(tray::create(&st.config.lock().unwrap())));
     // 托盘图标可见性按配置（默认显示）
@@ -125,6 +132,7 @@ fn main() {
     ctxmenu::create_window(st.clone(), tray.clone());
     ctxmenu::ctxmenu_date::create_date_menu_window();
     inputbox::create_window(agenda.clone());
+    recur_menu::create_window(agenda.clone());
     flyout::create_settings_window(st.clone(), tray);
     flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);
@@ -171,6 +179,9 @@ fn main() {
 
     spawn_fetch(st.clone(), refresh_rx);
     spawn_weather(st, weather_rx);
+
+    // 提醒引擎：扫描日程/待办到期提醒，经 toast 弹窗通知
+    reminder::spawn(toast_tx);
 
     // 主线程消息循环
     unsafe {
