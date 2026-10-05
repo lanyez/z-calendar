@@ -19,13 +19,15 @@ mod reminder;
 mod sidebar;
 mod toast;
 mod tray;
+mod uia_clock;
 mod weather;
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use winapi::um::winuser::{DispatchMessageW, GetMessageW, TranslateMessage};
+use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
+use winapi::um::winuser::{DispatchMessageW, GetMessageW, SetProcessDPIAware, TranslateMessage};
 
 /// UTF-16 编码（供各模块拼 Win32 字符串）
 pub fn wide(s: &str) -> Vec<u16> {
@@ -70,7 +72,38 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 进程 DPI 感知：不声明时（DPI Unaware）DWM 会把整窗位图拉伸到当前显示缩放
+/// 比例，文字和图形整体发虚（125%/150% 缩放的 Win11 上尤其明显）。
+/// 用 Per-Monitor V2：所有坐标（窗口矩形 / 低级鼠标钩子 / UIA / 光标）恒为物理
+/// 像素并实时反映当前缩放——System Aware 的坐标系固定在登录时的 DPI，用户改
+/// 缩放后时钟矩形与钩子坐标错位，点击时钟会穿透给系统日历。缩放变化由
+/// flyout 的定时器轮询（gdi::primary_scale）感知并全局重缩放。
+/// 已知限制：多显示器不同缩放时按主屏 sf 绘制，副屏由 DWM 微调（逐窗口
+/// 不同 sf 需要随 WM_DPICHANGED 重排，暂未做）。
+unsafe fn set_dpi_aware() {
+    let user32 = GetModuleHandleW(wide("user32.dll").as_ptr());
+    if !user32.is_null() {
+        let f = GetProcAddress(user32, b"SetProcessDpiAwarenessContext\0".as_ptr() as *const i8);
+        if !f.is_null() {
+            type SetCtxFn = unsafe extern "system" fn(winapi::shared::windef::HWND) -> i32;
+            let f: SetCtxFn = std::mem::transmute(f);
+            // DPI_AWARENESS_CONTEXT：PER_MONITOR_AWARE_V2 = -4，SYSTEM_AWARE = -2
+            if f(-4isize as winapi::shared::windef::HWND) != 0 {
+                return;
+            }
+            if f(-2isize as winapi::shared::windef::HWND) != 0 {
+                return;
+            }
+        }
+    }
+    // 老系统回退
+    SetProcessDPIAware();
+}
+
 fn main() {
+    // 必须先于一切窗口/DPI 相关调用
+    unsafe { set_dpi_aware() };
+
     // 单实例：重复启动时通知已有实例弹出日历，然后退出
     let show_event: usize;
     unsafe {
@@ -136,6 +169,11 @@ fn main() {
     flyout::create_settings_window(st.clone(), tray);
     flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);
+    // Win11 的任务栏时钟是 XAML 渲染（无 TrayClockWClass 窗口），由 UIA 定位线程
+    // 提供时钟矩形；Win10 走 overlay 的经典窗口链，无需此线程
+    if uia_clock::is_win11_or_newer() {
+        uia_clock::spawn();
+    }
 
     // 调试：启动即显示设置窗口
     if std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false) {

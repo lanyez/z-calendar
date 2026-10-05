@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
 use winapi::um::winuser::*;
 
 use crate::almanac;
@@ -53,6 +52,7 @@ struct SidebarUi {
     w: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -622,7 +622,36 @@ pub fn sidebar_hide() {
         unsafe {
             ShowWindow(h as HWND, SW_HIDE);
         }
+        // 释放后台位图压缩内存（下次 sidebar_show 重绘时重建）
+        let mut guard = SIDEBAR_UI.lock().unwrap();
+        if let Some(f) = guard.as_mut() {
+            let ui = &mut f.0;
+            unsafe {
+                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+            }
+        }
         crate::trim_working_set();
+    }
+}
+
+/// 屏幕缩放变化：更新 sf、释放位图；可见时按主面板重新锚定（等价重新打开）
+pub fn rescale(sf: f32) {
+    let date;
+    {
+        let mut guard = SIDEBAR_UI.lock().unwrap();
+        let Some(f) = guard.as_mut() else { return };
+        let ui = &mut f.0;
+        ui.sf = sf;
+        date = ui.date;
+        unsafe {
+            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+        }
+    }
+    if sidebar_visible() {
+        sidebar_hide();
+        if let Some(d) = date {
+            sidebar_show(d); // 重新定位/定高/重绘（惰性重建位图）
+        }
     }
 }
 
@@ -663,11 +692,12 @@ pub fn sidebar_show(date: NaiveDate) {
         }
         let mut mr: RECT = std::mem::zeroed();
         GetWindowRect(mh as HWND, &mut mr);
-        let x = mr.left + 10 - SB_W as i32;
-        let y = mr.top + 10;
-        // 高度与日历可见高度一致
-        f.h = ((mr.bottom - mr.top - 20).max(300) as f32);
-        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, SB_W as i32, f.h as i32, SWP_NOACTIVATE);
+        // 主窗口矩形为物理像素，偏移与侧栏宽度按 sf 换算
+        let x = mr.left + gdi::phys(10.0) as i32 - gdi::phys(SB_W) as i32;
+        let y = mr.top + gdi::phys(10.0) as i32;
+        // 高度与日历可见高度一致（换回逻辑坐标存入 f.h）
+        f.h = (((mr.bottom - mr.top) as f32 / f.sf) - 20.0).max(300.0);
+        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(SB_W) as i32, gdi::phys(f.h) as i32, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
     }
@@ -684,8 +714,8 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        let w = SB_W as i32;
-        let h = 716;
+        let w = gdi::phys(SB_W) as i32;
+        let h = gdi::phys(716.0) as i32;
         let title = crate::wide("Z日历详情");
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -708,10 +738,11 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
 
         let mut sui = Box::new(SidebarUi {
             hwnd: hwnd as usize,
-            sf: 1.0,
-            w: w as f32,
-            h: h as f32,
+            sf: gdi::scale(),
+            w: SB_W,
+            h: 716.0,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -731,37 +762,21 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
             todo_band: (0.0, 0.0),
             agenda_rows: Vec::new(),
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        sui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = sui.w as i32;
-        bmi.bmiHeader.biHeight = -(sui.h as i32);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(sui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(
-            sui.w as i32,
-            sui.h as i32,
-            (sui.w * 4.0) as i32,
-            gdi::PIXEL_FORMAT_32BPP_PARGB,
-            bits as *mut u8,
-            &mut bmp,
-        );
-        sui.bmp = bmp;
-        sui.scan0 = bits as *mut u8;
-        GdipGetImageGraphicsContext(sui.bmp, &mut sui.g);
+        // 后台位图不在创建时分配：sidebar_show→redraw 惰性分配，隐藏即释放
         SIDEBAR_UI.lock().unwrap().replace(SendSb(sui));
     }
 }
 
 impl SidebarUi {
     fn redraw(&mut self) {
+        if self.bmp.is_null() {
+            // 隐藏时位图已释放压缩内存：显示前重建
+            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
+            self.mem_dc = mem_dc;
+            self.hbmp = hbmp;
+            self.bmp = bmp;
+            self.scan0 = scan0;
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -769,7 +784,7 @@ impl SidebarUi {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
         self.paint(&p);
@@ -777,7 +792,7 @@ impl SidebarUi {
 
         if !self.dumped && !self.dump_path.is_empty() {
             self.dumped = true;
-            save_bmp(self.scan0, self.w as i32, self.h as i32, &self.dump_path);
+            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
             if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
                 unsafe {
                     PostMessageW(crate::flyout::hwnd() as HWND, WM_CLOSE, 0, 0);
@@ -791,7 +806,7 @@ impl SidebarUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -1233,8 +1248,8 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
             let mut guard = SIDEBAR_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 let clickable = hit.is_some();
                 if hit != f.hover {
@@ -1269,8 +1284,8 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
             let mut guard = SIDEBAR_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 match hit {
                     Some(SbAction::CardManage) => {

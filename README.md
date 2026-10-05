@@ -1,10 +1,10 @@
 # Z日历（任务栏日历，Rust 版）
 
-替换 Windows 任务栏"点击时间弹出日历"的日历应用，Rust 原生实现（GDI+ 自绘渲染，无 GPU 框架），编译为**单个约 1.9MB 的独立 exe**，无任何运行时依赖，**常驻内存约 6MB（工作集，私有内存约 12MB）**，可直接拷贝到任意目录运行。
+替换 Windows 任务栏"点击时间弹出日历"的日历应用，Rust 原生实现（GDI+ 自绘渲染，无 GPU 框架），编译为**单个约 1.9MB 的独立 exe**，无任何运行时依赖，**常驻内存极低：隐藏态提交内存约 4MB / 工作集约 1MB，显示日历时约 6MB**（后台位图隐藏即释放、显示时惰性重建），可直接拷贝到任意目录运行。
 
 ## 功能
 
-- **接管任务栏时钟**：通过低级鼠标钩子（WH_MOUSE_LL）拦截对任务栏时钟的点击并弹出本日历（点击被吞掉，系统日历不会再弹出；右键时钟弹出菜单：软件设置 / 开机自启（开启时左侧打勾）/ 日期与时间（打开系统设置）/ 退出Z日历）。不建窗口、不遮挡、不修改原生时钟，时钟样式与悬停效果保持系统原样；全屏应用时自动放行，退出软件自动移除钩子。
+- **接管任务栏时钟**（Windows 10 / 11）：通过低级鼠标钩子（WH_MOUSE_LL）拦截对任务栏时钟的点击并弹出本日历（点击被吞掉，系统日历不会再弹出；右键时钟弹出菜单：软件设置 / 开机自启（开启时左侧打勾）/ 日期与时间（打开系统设置）/ 退出Z日历）。不建窗口、不遮挡、不修改原生时钟，时钟样式与悬停效果保持系统原样；全屏应用时自动放行，退出软件自动移除钩子。
 - **纯后台运行**：日历弹窗带 `WS_EX_TOOLWINDOW`，任务栏和 Alt-Tab 中不出现程序；常驻入口只有托盘图标。
 - **法定节假日自动对接**：数据来自 [chinese-days](https://github.com/yaavi/chinese-days)（`cdn.jsdelivr.net/npm/chinese-days/dist/holidays.ics`），法定节假日"休"（蓝角标）与调休补班"班"（红角标）。启动及每 30 分钟检查一次，距上次成功更新超过 12 小时自动重新拉取（约每天一次），缓存到本地；数据源每年发布新年份数据后自动跟进（当前覆盖 2024~2026）。
 - **农历 / 节气 / 节日**：内置 1900~2100 农历与二十四节气数据表（由 lunar-javascript 数据一次性生成，见 `rust/gen-lunar.js`），传统节日（春节/除夕红色）、公历节日、纪念日（烈士纪念日等红色）本地计算，离线可用。
@@ -56,6 +56,7 @@ rust/                 源码（Cargo 项目）
   src/flyout.rs       日历弹窗（Win32 窗口 + GDI+ 绘制日历/日程/设置/近一周天气面板 + IME 输入）
   src/gdi.rs          GDI+ 平面 API 封装与绘制助手
   src/overlay.rs      任务栏时钟接管（Win32 透明覆盖层线程）
+  src/uia_clock.rs    Win11 时钟 UIA 定位线程（手写最小 UIA COM 声明，含活机测试）
   src/tray.rs         托盘图标与菜单（图标来自构建期生成的 RGBA）
   src/config.rs       配置读写与开机自启（注册表 Run）
   src/ics.rs          holidays.ics 下载解析（休/班/假期区间）
@@ -82,9 +83,11 @@ rust/                 源码（Cargo 项目）
 
 ## 实现要点
 
-- 时钟定位：`Shell_TrayWnd → TrayNotifyWnd → TrayClockWClass`（Win10），每秒校正；覆盖层全窗 alpha=1/255（肉眼不可见但可接收点击）；全屏应用或任务栏隐藏时自动隐藏覆盖层，explorer 重启后自动恢复。
+- 时钟定位：Win10 走经典窗口链 `Shell_TrayWnd → TrayNotifyWnd → TrayClockWClass`；Win11 任务栏时钟是 XAML 渲染、没有对应 Win32 子窗口，由独立 UIA 定位线程（`src/uia_clock.rs`，winapi 无 UIA 绑定，手写最小 COM 声明）在 `Shell_TrayWnd` 子树里找"UIA Name 是日期时间文本"的元素、取最右者得到时钟矩形。每秒校正，经典链优先（ExplorerPatcher 恢复经典任务栏时自动走 Win10 链）；UIA 是跨进程 COM 调用可能阻塞，独立成线程以免装低级钩子的线程被卡、钩子超时被系统摘除。全屏应用或任务栏隐藏时自动隐藏覆盖层，explorer 重启后自动恢复。
 - 弹窗常驻渲染：窗口"隐藏"时停放在屏幕外 (32000,32000)（winit 对隐藏窗口不派发重绘，事件循环会停摆，离屏方案绕开此限制）。
 - 渲染：GDI+ 双缓冲 + UpdateLayeredWindow 分层窗口（无 GPU 框架，锁屏/远程会话均可运行）。
+- **DPI 感知**：进程声明 Per-Monitor V2（老系统回退 System Aware），窗口矩形 / 低级鼠标钩子 / UIA / 光标坐标恒为物理像素且实时反映当前缩放——改屏幕缩放不会出现坐标系错位（System Aware 下坐标滞留在登录时的 DPI，缩放后点击时钟会穿透给系统日历）。主面板定时器轮询 shcore!GetDpiForMonitor，发现缩放变化即按新系数全局重建/重摆全部窗口（`gdi::set_scale` + 各窗口位图惰性重建 + 主面板 `SetWindowRgn` 命中区域重建，否则日历被创建时的旧区域裁剪显示不全）。已知限制：多显示器不同缩放时按主屏系数绘制，副屏由 DWM 缩放；内存位图上的 GDI+ 文本一律灰度抗锯齿（ClearType 在 Graphics-from-bitmap 上被 GDI+ 静默回退）。
+- **内存压缩**：各分层窗口的后台位图（合计约 5MB @100% 缩放，高 DPI 下更大）不再常驻——隐藏时整体释放、显示时惰性重建（`gdi::alloc_dib/free_dib`；DIBSection 句柄记录在 Ui 结构里，避免每次循环泄漏 GDI 句柄），设置/天气/新建弹窗等次窗口创建时也不分配。隐藏态提交内存从 ~16MB 降到 ~4MB；工作集修剪（SetProcessWorkingSetSize + HeapCompact，空闲时降频）沿用。
 - **点击外部关闭**：点击软件自身弹窗（设置、天气侧栏等，均为 NOACTIVATE 窗口且 `WM_MOUSEACTIVATE` 返回 `MA_NOACTIVATE`）不会关闭日历；只有点击发生在软件相关窗口之外（其他应用/桌面，日历失焦）时才关闭；光标位于软件弹窗之上时的失焦同样保持显示（双保险）。
 - 配色取自设计图：背景 `#202838`、强调蓝 `#3E87FA`、周末红 `#E54B4B`。
-- 调试钩子（环境变量）：`CAL_PAGE=agenda|settings`、`CAL_SETTINGS=1` 指定起始页面，`CAL_YM=2026-10` 指定起始月份，`CAL_FAKE_WX=1` 使用离线假天气数据，`CAL_SIDEBAR=1` 弹出日历时自动打开日期侧边栏，`CAL_DUMP=x.bmp` / `CAL_DUMP2=x.bmp` / `CAL_DUMP3=x.bmp` / `CAL_DUMP4=x.bmp` 保存日历/设置窗/天气面板/日期侧栏首帧，`CAL_DUMP_EXIT=1` 退出时转储状态。
+- 调试钩子（环境变量）：`CAL_PAGE=agenda|settings`、`CAL_SETTINGS=1` 指定起始页面，`CAL_YM=2026-10` 指定起始月份，`CAL_FAKE_WX=1` 使用离线假天气数据，`CAL_SIDEBAR=1` 弹出日历时自动打开日期侧边栏，`CAL_SF=1.25/1.5/2` 强制缩放系数（覆盖时缩放轮询停用，在 100% 缩放的机器上验证高 DPI 布局），`CAL_TEXT_HINT=0~5` 覆盖 GDI+ 文本渲染模式，`CAL_UIA_LOG=1` 把 Win11 时钟 UIA 定位的每轮扫描结果写到 `%APPDATA%\z-calendar\uia.log`，`CAL_DUMP=x.bmp` / `CAL_DUMP2=x.bmp` / `CAL_DUMP3=x.bmp` / `CAL_DUMP4=x.bmp` 保存日历/设置窗/天气面板/日期侧栏首帧，`CAL_DUMP_EXIT=1` 退出时转储状态。

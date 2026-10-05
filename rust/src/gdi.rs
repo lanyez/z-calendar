@@ -1,5 +1,6 @@
 //! GDI+ 平面 API 封装（最小子集）+ 绘制助手
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 pub type Gp = *mut winapi::ctypes::c_void;
@@ -7,12 +8,176 @@ pub type Gp = *mut winapi::ctypes::c_void;
 pub const PIXEL_FORMAT_32BPP_PARGB: i32 = 0xE200B;
 pub const UNIT_PIXEL: i32 = 2;
 pub const SMOOTH_ANTI_ALIAS: i32 = 4;
-pub const TEXT_AA_GRID_FIT: i32 = 4;
+// TextRenderingHint（GDI+ 枚举原值）：1=无抗锯齿 3=灰度抗锯齿+网格对齐
+// 4=纯灰度抗锯齿（无网格对齐，文字发虚） 5=ClearType 子像素（最锐利）
+// 注意：从内存位图创建的 Graphics 上 GDI+ 一律回退为灰度抗锯齿（含 ClearType），
+// 锐利与否取决于进程是否 DPI 感知（未感知会被 DWM 整窗拉伸发虚）
+pub const TEXT_HINT_AA_GRID_FIT: i32 = 3;
+pub const TEXT_HINT_CLEAR_TYPE: i32 = 5;
 pub const FONT_STYLE_NORMAL: i32 = 0;
 pub const FONT_STYLE_BOLD: i32 = 1;
 pub const HALIGN_NEAR: i32 = 0;
 pub const HALIGN_CENTER: i32 = 1;
 pub const HALIGN_FAR: i32 = 2;
+
+static SCALE: AtomicU32 = AtomicU32::new(0); // ×1000；0 = 未初始化
+static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 全局缩放系数（逻辑 px → 物理 px）。进程为 Per-Monitor V2 感知；屏幕缩放
+/// 变化时由 flyout 的轮询经 set_scale 更新，所有窗口随后重建/重摆。
+/// 调试钩子 CAL_SF=1.25/1.5/2 可强制覆盖（覆盖时不参与缩放轮询）。
+pub fn scale() -> f32 {
+    let v = SCALE.load(Ordering::Relaxed);
+    if v != 0 {
+        return v as f32 / 1000.0;
+    }
+    let s = unsafe { detect_scale() };
+    set_scale(s);
+    s
+}
+
+/// 调试覆盖 CAL_SF=… 生效时为 true：缩放轮询停用，避免真实 DPI 覆盖调试值
+pub fn scale_overridden() -> bool {
+    *OVERRIDE.get_or_init(|| std::env::var("CAL_SF").is_ok())
+}
+
+pub fn set_scale(s: f32) {
+    SCALE.store((s * 1000.0).round().max(1.0) as u32, Ordering::Relaxed);
+}
+
+/// 主屏当前有效缩放（真实值，shcore!GetDpiForMonitor 实时反映屏幕设置）。
+/// 注意 System-Aware 进程的 GetDeviceCaps(LOGPIXELSX) 固定在登录时的 DPI，
+/// 改缩放后拿不到新值，故探测优先走 GetDpiForMonitor。
+pub fn primary_scale() -> f32 {
+    if scale_overridden() {
+        return scale();
+    }
+    unsafe { detect_scale() }
+}
+
+unsafe fn detect_scale() -> f32 {
+    if let Ok(v) = std::env::var("CAL_SF") {
+        if let Ok(f) = v.parse::<f32>() {
+            if f > 0.0 {
+                return f;
+            }
+        }
+    }
+    #[link(name = "shcore")]
+    extern "system" {
+        fn GetDpiForMonitor(
+            hmonitor: winapi::shared::windef::HMONITOR,
+            dpi_type: u32,
+            dpi_x: *mut u32,
+            dpi_y: *mut u32,
+        ) -> i32;
+    }
+    use winapi::shared::windef::POINT;
+    use winapi::um::wingdi::{GetDeviceCaps, LOGPIXELSX};
+    use winapi::um::winuser::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+    let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+    if !mon.is_null() {
+        let (mut dx, mut dy) = (0u32, 0u32);
+        if GetDpiForMonitor(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mut dx, &mut dy) == 0 && dx > 0 {
+            return dx as f32 / 96.0;
+        }
+    }
+    let hdc = GetDC(std::ptr::null_mut());
+    let dpi = if hdc.is_null() { 96 } else { GetDeviceCaps(hdc, LOGPIXELSX) };
+    if !hdc.is_null() {
+        ReleaseDC(std::ptr::null_mut(), hdc);
+    }
+    if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
+}
+
+/// 逻辑坐标 → 物理像素
+pub fn phys(v: f32) -> f32 {
+    v * scale()
+}
+
+// ---------- 后台位图生命周期（隐藏时释放以压缩提交内存，显示时重建） ----------
+
+/// 为分层窗口分配后台位图（物理尺寸 = 逻辑 × sf）：
+/// 内存 DC + 32bpp DIBSection + 绑定 scan0 的 GDI+ Bitmap。
+/// 返回 (mem_dc, hbmp, bmp, scan0)；Graphics 由调用方 GdipGetImageGraphicsContext 获取。
+pub unsafe fn alloc_dib(logical_w: f32, logical_h: f32) -> (usize, usize, Gp, *mut u8) {
+    use winapi::shared::windef::HDC;
+    use winapi::um::wingdi::{CreateCompatibleDC, CreateDIBSection, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER};
+    let w_px = phys(logical_w) as i32;
+    let h_px = phys(logical_h) as i32;
+    let hdc = GetDC(std::ptr::null_mut());
+    let mem_dc = CreateCompatibleDC(hdc) as usize;
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w_px;
+    bmi.bmiHeader.biHeight = -h_px;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+    let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
+    SelectObject(mem_dc as HDC, hbmp as *mut winapi::ctypes::c_void);
+    ReleaseDC(std::ptr::null_mut(), hdc);
+    let mut bmp: Gp = std::ptr::null_mut();
+    GdipCreateBitmapFromScan0(w_px, h_px, w_px * 4, PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
+    (mem_dc, hbmp as usize, bmp, bits as *mut u8)
+}
+
+/// 释放后台位图。幂等；显示后 redraw 前需重新 alloc_dib 并重新获取 Graphics。
+/// hbmp 必须记录：DIBSection 句柄不会随 DC 删除，漏删会在每次显示/隐藏循环中泄漏。
+pub unsafe fn free_dib(mem_dc: &mut usize, hbmp: &mut usize, bmp: &mut Gp, g: &mut Gp, scan0: &mut *mut u8) {
+    if !g.is_null() {
+        GdipDeleteGraphics(*g);
+        *g = std::ptr::null_mut();
+    }
+    if !bmp.is_null() {
+        GdipDisposeImage(*bmp);
+        *bmp = std::ptr::null_mut();
+    }
+    if *mem_dc != 0 {
+        DeleteDC(*mem_dc as winapi::shared::windef::HDC);
+        *mem_dc = 0;
+    }
+    if *hbmp != 0 {
+        DeleteObject(*hbmp as *mut winapi::ctypes::c_void);
+        *hbmp = 0;
+    }
+    *scan0 = std::ptr::null_mut();
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn CreateCompatibleDC(hdc: winapi::shared::windef::HDC) -> winapi::shared::windef::HDC;
+    fn DeleteDC(hdc: winapi::shared::windef::HDC) -> i32;
+    fn CreateDIBSection(
+        hdc: winapi::shared::windef::HDC,
+        bmi: *const winapi::um::wingdi::BITMAPINFO,
+        usage: u32,
+        bits: *mut *mut winapi::ctypes::c_void,
+        section: winapi::shared::ntdef::HANDLE,
+        offset: u32,
+    ) -> winapi::shared::windef::HBITMAP;
+    fn SelectObject(hdc: winapi::shared::windef::HDC, obj: *mut winapi::ctypes::c_void) -> *mut winapi::ctypes::c_void;
+    fn DeleteObject(obj: *mut winapi::ctypes::c_void) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetDC(hwnd: winapi::shared::windef::HWND) -> winapi::shared::windef::HDC;
+    fn ReleaseDC(hwnd: winapi::shared::windef::HWND, hdc: winapi::shared::windef::HDC) -> i32;
+}
+
+/// 文本渲染模式，默认 ClearType。调试钩子 CAL_TEXT_HINT=0~5 可覆盖（对比渲染效果用）。
+pub fn text_hint() -> i32 {
+    static HINT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *HINT.get_or_init(|| {
+        std::env::var("CAL_TEXT_HINT")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|&v| (0..=5).contains(&v))
+            .unwrap_or(TEXT_HINT_CLEAR_TYPE)
+    })
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]

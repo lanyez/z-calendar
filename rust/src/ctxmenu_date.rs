@@ -35,7 +35,10 @@ enum DmAction {
 
 struct DateMenuUi {
     hwnd: usize,
+    /// 创建/最近重建位图时的 sf（redraw 检测失配后按 gdi::scale() 重建）
+    sf: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -80,7 +83,8 @@ pub fn date_menu_toggle(x: i32, y: i32, date: chrono::NaiveDate) {
         let f = &mut f.0;
         let pt = POINT { x, y };
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut wa = (0, 0, x + CM_W as i32, y + 76);
+        let (cm_w, dm_h) = (gdi::phys(CM_W) as i32, gdi::phys(76.0) as i32);
+        let mut wa = (0, 0, x + cm_w, y + dm_h);
         if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -90,18 +94,18 @@ pub fn date_menu_toggle(x: i32, y: i32, date: chrono::NaiveDate) {
         }
         let mut mx = x;
         let mut my = y;
-        if mx + CM_W as i32 > wa.2 {
-            mx = x - CM_W as i32;
+        if mx + cm_w > wa.2 {
+            mx = x - cm_w;
         }
-        if my + 76 > wa.3 {
-            my = y - 76;
+        if my + dm_h > wa.3 {
+            my = y - dm_h;
         }
         mx = mx.max(wa.0);
         my = my.max(wa.1);
-        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, CM_W as i32, 76, SWP_NOACTIVATE);
+        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, cm_w, dm_h, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
-        *DM_RECT.lock().unwrap() = Some((mx, my, mx + CM_W as i32, my + 76));
+        *DM_RECT.lock().unwrap() = Some((mx, my, mx + cm_w, my + dm_h));
     }
 }
 
@@ -124,8 +128,8 @@ pub fn create_date_menu_window() {
             WS_POPUP,
             32000,
             32000,
-            CM_W as i32,
-            76,
+            gdi::phys(CM_W) as i32,
+            gdi::phys(76.0) as i32,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -138,7 +142,9 @@ pub fn create_date_menu_window() {
 
         let mut ui = Box::new(DateMenuUi {
             hwnd: hwnd as usize,
+            sf: gdi::scale(),
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -146,35 +152,29 @@ pub fn create_date_menu_window() {
             regions: Vec::new(),
             hover: None,
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        ui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = CM_W as i32;
-        bmi.bmiHeader.biHeight = -76;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(ui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(CM_W as i32, 76, CM_W as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
-        GdipGetImageGraphicsContext(bmp, &mut ui.g);
-        ui.bmp = bmp;
-        ui.scan0 = bits as *mut u8;
         DM_UI.lock().unwrap().replace(SendDm(ui));
     }
 }
 
 impl DateMenuUi {
     fn redraw(&mut self) {
+        // 屏幕缩放变化：按新 sf 重建位图（常驻窗口，位图随 sf 失配惰性重建）
+        if (self.sf - gdi::scale()).abs() > 0.001 || self.bmp.is_null() {
+            unsafe {
+                gdi::free_dib(&mut self.mem_dc, &mut self.hbmp, &mut self.bmp, &mut self.g, &mut self.scan0);
+                let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(CM_W, 76.0);
+                self.mem_dc = mem_dc;
+                self.hbmp = hbmp;
+                self.bmp = bmp;
+                self.scan0 = scan0;
+            }
+            self.sf = gdi::scale();
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
         let cache_ptr: *const Cache = &self.cache;
-        let p = Painter { g: self.g, cache: cache_ptr, sf: 1.0, w: CM_W, h: 76.0 };
+        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: CM_W, h: 76.0 };
         self.paint(&p);
         self.ulw();
     }
@@ -184,7 +184,7 @@ impl DateMenuUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: CM_W as i32, cy: 76 };
+            let mut size = SIZE { cx: gdi::phys(CM_W) as i32, cy: gdi::phys(76.0) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -236,8 +236,9 @@ unsafe extern "system" fn date_menu_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, l
             let mut guard = DM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let s = gdi::scale();
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if hit != f.hover {
                     f.hover = hit;
@@ -250,8 +251,9 @@ unsafe extern "system" fn date_menu_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, l
             let mut guard = DM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let s = gdi::scale();
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if let Some(act) = hit {
                     let date = DM_DATE.lock().unwrap().unwrap_or_else(|| chrono::Local::now().date_naive());

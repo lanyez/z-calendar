@@ -49,8 +49,12 @@ enum RmAction {
 
 struct RecurMenuUi {
     hwnd: usize,
+    /// 创建/最近重建位图时的 sf（redraw 检测失配后按 gdi::scale() 重建）
+    sf: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
+    scan0: *mut u8,
     g: gdi::Gp,
     cache: Cache,
     regions: Vec<(gdi::RectF, RmAction)>,
@@ -84,7 +88,8 @@ pub fn open(x: i32, y: i32, target: RmTarget) {
         let f = &mut f.0;
         let pt = POINT { x, y };
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut wa = (0, 0, x + RM_W as i32, y + RM_H as i32);
+        let (rm_w, rm_h) = (gdi::phys(RM_W) as i32, gdi::phys(RM_H) as i32);
+        let mut wa = (0, 0, x + rm_w, y + rm_h);
         if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -94,15 +99,15 @@ pub fn open(x: i32, y: i32, target: RmTarget) {
         }
         let mut mx = x;
         let mut my = y;
-        if mx + RM_W as i32 > wa.2 {
-            mx = x - RM_W as i32;
+        if mx + rm_w > wa.2 {
+            mx = x - rm_w;
         }
-        if my + RM_H as i32 > wa.3 {
-            my = y - RM_H as i32;
+        if my + rm_h > wa.3 {
+            my = y - rm_h;
         }
         mx = mx.max(wa.0);
         my = my.max(wa.1);
-        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, RM_W as i32, RM_H as i32, SWP_NOACTIVATE);
+        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, rm_w, rm_h, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
     }
@@ -128,8 +133,8 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             WS_POPUP,
             32000,
             32000,
-            RM_W as i32,
-            RM_H as i32,
+            gdi::phys(RM_W) as i32,
+            gdi::phys(RM_H) as i32,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -142,30 +147,16 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
 
         let mut ui = Box::new(RecurMenuUi {
             hwnd: hwnd as usize,
+            sf: gdi::scale(),
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
+            scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
             cache: Cache::new(),
             regions: Vec::new(),
             hover: None,
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        ui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = RM_W as i32;
-        bmi.bmiHeader.biHeight = -RM_H as i32;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(ui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(RM_W as i32, RM_H as i32, RM_W as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
-        GdipGetImageGraphicsContext(bmp, &mut ui.g);
-        ui.bmp = bmp;
         RM_UI.lock().unwrap().replace(SendRm(ui));
     }
 }
@@ -180,14 +171,26 @@ fn refresh() {
 
 impl RecurMenuUi {
     fn redraw(&mut self) {
+        // 屏幕缩放变化：按新 sf 重建位图（常驻窗口，位图随 sf 失配惰性重建）
+        if (self.sf - gdi::scale()).abs() > 0.001 || self.bmp.is_null() {
+            unsafe {
+                gdi::free_dib(&mut self.mem_dc, &mut self.hbmp, &mut self.bmp, &mut self.g, &mut self.scan0);
+                let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(RM_W, RM_H);
+                self.mem_dc = mem_dc;
+                self.hbmp = hbmp;
+                self.bmp = bmp;
+                self.scan0 = scan0;
+            }
+            self.sf = gdi::scale();
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
         let cache_ptr: *const Cache = &self.cache;
-        let p = Painter { g: self.g, cache: cache_ptr, sf: 1.0, w: RM_W, h: RM_H };
+        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: RM_W, h: RM_H };
         unsafe {
             GdipSetSmoothingMode(self.g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(self.g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(self.g, gdi::text_hint());
         }
         self.paint(&p);
         self.ulw();
@@ -198,7 +201,7 @@ impl RecurMenuUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: RM_W as i32, cy: RM_H as i32 };
+            let mut size = SIZE { cx: gdi::phys(RM_W) as i32, cy: gdi::phys(RM_H) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -250,8 +253,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = RM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let s = gdi::scale();
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if hit != f.hover {
                     f.hover = hit;
@@ -264,8 +268,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = RM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let s = gdi::scale();
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if let Some(act) = hit {
                     let target = RM_TARGET.lock().unwrap().take();

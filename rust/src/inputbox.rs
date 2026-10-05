@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
 use winapi::um::winuser::*;
 
 use crate::events::{self, AgendaEntry, AgendaMap, RichEvent};
@@ -133,6 +132,7 @@ struct DialogUi {
     sf: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -250,8 +250,8 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             WS_POPUP,
             32000,
             32000,
-            DL_W as i32,
-            H_MAX as i32,
+            gdi::phys(DL_W) as i32,
+            gdi::phys(H_MAX) as i32,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
@@ -265,9 +265,10 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
         let now = chrono::Local::now().naive_local();
         let mut ui = Box::new(DialogUi {
             hwnd: hwnd as usize,
-            sf: 1.0,
+            sf: gdi::scale(),
             h: 386.0,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -296,24 +297,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             edit_agenda: None,
             edit_todo: None,
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        ui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = DL_W as i32;
-        bmi.bmiHeader.biHeight = -H_MAX as i32;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(ui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(DL_W as i32, H_MAX as i32, DL_W as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
-        GdipGetImageGraphicsContext(bmp, &mut ui.g);
-        ui.bmp = bmp;
-        ui.scan0 = bits as *mut u8;
+        // 后台位图不在创建时分配：open_with→redraw 惰性分配，关闭即释放
         IB_UI.lock().unwrap().replace(SendIb(ui));
     }
 }
@@ -492,7 +476,7 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
                 f.h = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
             }
         }
-        // 工作区钳制（鼠标所在显示器）
+        // 工作区钳制（鼠标所在显示器，物理像素）
         let mon = MonitorFromPoint(POINT { x: at_x, y: at_y }, MONITOR_DEFAULTTONEAREST);
         let (wa_l, wa_t, wa_r, wa_b) = if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
@@ -500,10 +484,10 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
             if GetMonitorInfoW(mon, &mut mi) != 0 {
                 (mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom)
             } else {
-                (0, 0, at_x + DL_W as i32, at_y + 400)
+                (0, 0, at_x + gdi::phys(DL_W) as i32, at_y + gdi::phys(400.0) as i32)
             }
         } else {
-            (0, 0, at_x + DL_W as i32, at_y + 400)
+            (0, 0, at_x + gdi::phys(DL_W) as i32, at_y + gdi::phys(400.0) as i32)
         };
         let hh;
         {
@@ -511,9 +495,9 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
             hh = guard.as_ref().map(|s| s.0.h).unwrap_or(386.0);
         }
         // 屏幕正中间（鼠标所在显示器的工作区）
-        let x = wa_l + (wa_r - wa_l - DL_W as i32) / 2;
-        let y = wa_t + (wa_b - wa_t - hh as i32) / 2;
-        SetWindowPos(h, HWND_TOPMOST, x, y, DL_W as i32, hh as i32, SWP_NOACTIVATE);
+        let x = wa_l + (wa_r - wa_l - gdi::phys(DL_W) as i32) / 2;
+        let y = wa_t + (wa_b - wa_t - gdi::phys(hh) as i32) / 2;
+        SetWindowPos(h, HWND_TOPMOST, x, y, gdi::phys(DL_W) as i32, gdi::phys(hh) as i32, SWP_NOACTIVATE);
         ShowWindow(h, SW_SHOW);
         SetForegroundWindow(h);
         SetFocus(h);
@@ -534,25 +518,34 @@ fn redraw() {
 unsafe fn resize_keep_center(hwnd: HWND, old_h: f32, new_h: f32) {
     let mut r: RECT = std::mem::zeroed();
     GetWindowRect(hwnd, &mut r);
-    let mut ny = r.top - ((new_h - old_h) / 2.0) as i32;
+    let mut ny = r.top - (gdi::phys((new_h - old_h) / 2.0)) as i32;
     let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     if !mon.is_null() {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(mon, &mut mi) != 0 {
-            if ny + new_h as i32 > mi.rcWork.bottom {
-                ny = mi.rcWork.bottom - new_h as i32;
+            if ny + gdi::phys(new_h) as i32 > mi.rcWork.bottom {
+                ny = mi.rcWork.bottom - gdi::phys(new_h) as i32;
             }
             if ny < mi.rcWork.top {
                 ny = mi.rcWork.top;
             }
         }
     }
-    SetWindowPos(hwnd, std::ptr::null_mut(), r.left, ny, DL_W as i32, new_h as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(hwnd, std::ptr::null_mut(), r.left, ny, gdi::phys(DL_W) as i32, gdi::phys(new_h) as i32, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 impl DialogUi {
     fn redraw(&mut self) {
+        if self.bmp.is_null() {
+            // 隐藏时位图已释放压缩内存：显示前重建。
+            // 必须按最大高度分配：弹窗高度随表单内容动态增长（ULW 直接提交新高度）
+            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(DL_W, H_MAX) };
+            self.mem_dc = mem_dc;
+            self.hbmp = hbmp;
+            self.bmp = bmp;
+            self.scan0 = scan0;
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -560,7 +553,7 @@ impl DialogUi {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = Painter { g, cache: cache_ptr, sf: self.sf, w: DL_W, h: self.h };
         self.paint(&p);
@@ -572,7 +565,7 @@ impl DialogUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: DL_W as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: gdi::phys(DL_W) as i32, cy: gdi::phys(self.h) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -1251,9 +1244,21 @@ fn confirm() {
             KillTimer(h as HWND, 1);
         }
     }
+    free_surface();
     crate::sidebar::sidebar_repaint();
     crate::flyout::flyout_repaint();
     crate::trim_working_set();
+}
+
+/// 释放弹窗后台位图压缩内存（下次 redraw 重建）
+fn free_surface() {
+    let mut guard = IB_UI.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        let ui = &mut f.0;
+        unsafe {
+            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+        }
+    }
 }
 
 fn cancel() {
@@ -1264,7 +1269,35 @@ fn cancel() {
             KillTimer(h as HWND, 1);
         }
     }
+    free_surface();
     crate::trim_working_set();
+}
+
+/// 屏幕缩放变化：更新 sf、释放位图；可见时原地重设尺寸并重绘（保留已输入内容）
+pub fn rescale(sf: f32) {
+    let vis = visible();
+    let mut guard = IB_UI.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        let ui = &mut f.0;
+        ui.sf = sf;
+        unsafe {
+            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+        }
+        if vis {
+            unsafe {
+                SetWindowPos(
+                    ui.hwnd as HWND,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    gdi::phys(DL_W) as i32,
+                    gdi::phys(ui.h) as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            ui.redraw();
+        }
+    }
 }
 
 unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
@@ -1404,8 +1437,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_LBUTTONDOWN => {
-            let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-            let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+            let s = gdi::scale();
+            let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
+            let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
             SetForegroundWindow(hwnd);
             let mut guard = IB_UI.lock().unwrap();
             let Some(sui) = guard.as_mut() else { return 0 };
@@ -1604,8 +1638,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = IB_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if hit != f.hover {
                     f.hover = hit;
@@ -1646,8 +1680,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let (px, py, pw, _) = f.drop_rect();
                     let ly = py + 34.0;
                     let lbot = ly + PICK_VISIBLE as f32 * PICK_ROW;
-                    let in_hour = (pt.x as f32) >= px + 18.0 && (pt.x as f32) < px + 18.0 + 122.0 && (pt.y as f32) >= ly && (pt.y as f32) < lbot;
-                    let in_min = (pt.x as f32) >= px + pw - 140.0 && (pt.x as f32) < px + pw - 140.0 + 122.0 && (pt.y as f32) >= ly && (pt.y as f32) < lbot;
+                    let (cx, cy) = (pt.x as f32 / f.sf, pt.y as f32 / f.sf);
+                    let in_hour = cx >= px + 18.0 && cx < px + 18.0 + 122.0 && cy >= ly && cy < lbot;
+                    let in_min = cx >= px + pw - 140.0 && cx < px + pw - 140.0 + 122.0 && cy >= ly && cy < lbot;
                     if let Some(Drop::Time { h_off, m_off, .. }) = &mut f.drop {
                         if in_hour {
                             *h_off = (*h_off - delta / 120).clamp(0, 24 - PICK_VISIBLE);

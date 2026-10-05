@@ -12,7 +12,7 @@ path = "src/main.rs"
 winapi = { version = "0.3", features = [
     "winuser", "windef", "minwindef", "ntdef", "libloaderapi", "synchapi",
     "errhandlingapi", "winbase", "processthreadsapi", "handleapi", "winnt", "wingdi", "minwinbase",
-    "playsoundapi",
+    "playsoundapi", "combaseapi", "objbase", "oaidl", "oleauto", "wtypes",
 ] }
 tray-icon = "0.14"
 ureq = { version = "2", default-features = false, features = ["tls"] }

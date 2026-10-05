@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, RECT};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::winuser::*;
 
@@ -136,6 +136,9 @@ unsafe extern "system" fn hook_proc(n_code: i32, wp: WPARAM, lp: LPARAM) -> LRES
     CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp)
 }
 
+/// 时钟定位：先试 Win10 经典窗口链（含 ExplorerPatcher 在 Win11 恢复经典任务栏的
+/// 情形）；找不到（Win11 原生任务栏时钟是 XAML 渲染，无 TrayClockWClass）则回退
+/// 读取 uia_clock 定位线程的快照。
 unsafe fn find_clock() -> Option<ClockInfo> {
     let tray = FindWindowExW(
         std::ptr::null_mut(),
@@ -146,6 +149,14 @@ unsafe fn find_clock() -> Option<ClockInfo> {
     if tray.is_null() || IsWindowVisible(tray) == 0 {
         return None;
     }
+    if let Some(ci) = find_clock_classic(tray) {
+        return Some(ci);
+    }
+    find_clock_uia()
+}
+
+/// Win10 经典链：Shell_TrayWnd → TrayNotifyWnd → TrayClockWClass
+unsafe fn find_clock_classic(tray: HWND) -> Option<ClockInfo> {
     let tn = FindWindowExW(tray, std::ptr::null_mut(), wide("TrayNotifyWnd").as_ptr(), std::ptr::null());
     if tn.is_null() {
         return None;
@@ -161,7 +172,22 @@ unsafe fn find_clock() -> Option<ClockInfo> {
     if rect.right - rect.left <= 0 || rect.bottom - rect.top <= 0 {
         return None;
     }
-    let mon = MonitorFromWindow(clk, MONITOR_DEFAULTTONEAREST);
+    monitor_info_at(rect)
+}
+
+/// Win11：XAML 时钟无 HWND，矩形来自 UIA 后台线程（uia_clock）的定位快照
+unsafe fn find_clock_uia() -> Option<ClockInfo> {
+    let rect = crate::uia_clock::snapshot_rect()?;
+    if rect.right - rect.left <= 0 || rect.bottom - rect.top <= 0 {
+        return None;
+    }
+    monitor_info_at(rect)
+}
+
+/// 时钟矩形所在显示器及其工作区（矩形中心点定位显示器）
+unsafe fn monitor_info_at(rect: RECT) -> Option<ClockInfo> {
+    let pt = POINT { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+    let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     if mon.is_null() {
         return None;
     }

@@ -155,6 +155,20 @@ pub fn spawn() -> Sender<ToastMsg> {
     tx
 }
 
+/// 屏幕缩放变化：可见时按新 sf 重摆重绘（toast 的绘制/尺寸均实时读 gdi::scale()）
+pub fn rescale() {
+    let mut guard = TOAST_UI.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        let f = &mut f.0;
+        if !f.items.is_empty() {
+            unsafe {
+                position(f.hwnd as HWND, f.items.len());
+            }
+            repaint(f);
+        }
+    }
+}
+
 unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null_mut());
     let cls = crate::wide("z-calendar-toast");
@@ -165,7 +179,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     wc.lpszClassName = cls.as_ptr();
     RegisterClassW(&wc);
 
-    let max_h = (ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32) as i32;
+    let max_h = gdi::phys(ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32) as i32;
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
         cls.as_ptr(),
@@ -173,7 +187,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
         WS_POPUP,
         32000,
         32000,
-        TOAST_W as i32,
+        gdi::phys(TOAST_W) as i32,
         max_h,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -188,7 +202,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     let mem_dc = CreateCompatibleDC(hdc) as usize;
     let mut bmi: BITMAPINFO = std::mem::zeroed();
     bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = TOAST_W as i32;
+    bmi.bmiHeader.biWidth = gdi::phys(TOAST_W) as i32;
     bmi.bmiHeader.biHeight = -max_h;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
@@ -198,7 +212,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     SelectObject(mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
     ReleaseDC(std::ptr::null_mut(), hdc);
     let mut bmp: gdi::Gp = std::ptr::null_mut();
-    GdipCreateBitmapFromScan0(TOAST_W as i32, max_h, TOAST_W as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
+    GdipCreateBitmapFromScan0(gdi::phys(TOAST_W) as i32, max_h, gdi::phys(TOAST_W) as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
     let mut g: gdi::Gp = std::ptr::null_mut();
     GdipGetImageGraphicsContext(bmp, &mut g);
 
@@ -304,14 +318,14 @@ fn play_alert() {
     }
 }
 
-/// 摆放到主屏工作区右下角
+/// 摆放到主屏工作区右下角（工作区为物理像素，尺寸/边距按 sf 换算）
 unsafe fn position(hwnd: HWND, n: usize) {
     let mut wa: RECT = std::mem::zeroed();
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as *mut winapi::ctypes::c_void, 0);
-    let h = (ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
-    let x = wa.right - TOAST_W as i32 - MARGIN;
-    let y = wa.bottom - h - MARGIN;
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, TOAST_W as i32, h, SWP_NOACTIVATE);
+    let h = gdi::phys(ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
+    let x = wa.right - gdi::phys(TOAST_W) as i32 - gdi::phys(MARGIN as f32) as i32;
+    let y = wa.bottom - h - gdi::phys(MARGIN as f32) as i32;
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, gdi::phys(TOAST_W) as i32, h, SWP_NOACTIVATE);
 }
 
 fn repaint(f: &mut ToastUi) {
@@ -321,8 +335,8 @@ fn repaint(f: &mut ToastUi) {
         }
         let cache_ptr: *const Cache = &f.cache;
         GdipSetSmoothingMode(f.g, gdi::SMOOTH_ANTI_ALIAS);
-        GdipSetTextRenderingHint(f.g, gdi::TEXT_AA_GRID_FIT);
-        let p = Painter { g: f.g, cache: cache_ptr, sf: 1.0, w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 };
+        GdipSetTextRenderingHint(f.g, gdi::text_hint());
+        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 };
         p.clear();
         let n = f.items.len();
         for (i, it) in f.items.iter().enumerate() {
@@ -330,9 +344,9 @@ fn repaint(f: &mut ToastUi) {
         }
         let mut r: RECT = std::mem::zeroed();
         GetWindowRect(f.hwnd as HWND, &mut r);
-        let h = (ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
+        let h = gdi::phys(ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
         let mut ppt = POINT { x: r.left, y: r.top };
-        let mut size = SIZE { cx: TOAST_W as i32, cy: h };
+        let mut size = SIZE { cx: gdi::phys(TOAST_W) as i32, cy: h };
         let mut src = POINT { x: 0, y: 0 };
         let mut blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
         UpdateLayeredWindow(
@@ -405,7 +419,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-            let (x, y) = (x_of(lp) as f32, y_of(lp) as f32);
+            let s = gdi::scale();
+            let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
             let mut hover_btn = None;
             {
                 let guard = TOAST_UI.lock().unwrap();
@@ -458,7 +473,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_LBUTTONDOWN => {
-            let (x, y) = (x_of(lp) as f32, y_of(lp) as f32);
+            let s = gdi::scale();
+            let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
             // 命中判定：先按钮，后卡片本体
             let mut hit: Option<(usize, u8)> = None; // 1=稍后 2=完成 0=本体
             {

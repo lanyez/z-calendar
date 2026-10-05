@@ -55,6 +55,7 @@ struct ContextMenuUi {
     w: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -117,7 +118,8 @@ pub fn toggle(x: i32, y: i32) {
         let f = &mut f.0;
         let pt = POINT { x, y };
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut wa = (0, 0, x + CM_W as i32, y + CM_H as i32);
+        let (cm_w, cm_h) = (gdi::phys(CM_W) as i32, gdi::phys(CM_H) as i32);
+        let mut wa = (0, 0, x + cm_w, y + cm_h);
         if !mon.is_null() {
             let mut mi: MONITORINFO = std::mem::zeroed();
             mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -127,18 +129,18 @@ pub fn toggle(x: i32, y: i32) {
         }
         let mut mx = x;
         let mut my = y;
-        if mx + CM_W as i32 > wa.2 {
-            mx = x - CM_W as i32;
+        if mx + cm_w > wa.2 {
+            mx = x - cm_w;
         }
-        if my + CM_H as i32 > wa.3 {
-            my = y - CM_H as i32;
+        if my + cm_h > wa.3 {
+            my = y - cm_h;
         }
         mx = mx.max(wa.0);
         my = my.max(wa.1);
-        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, CM_W as i32, CM_H as i32, SWP_NOACTIVATE);
+        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, cm_w, cm_h, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
-        *CM_RECT.lock().unwrap() = Some((mx, my, mx + CM_W as i32, my + CM_H as i32));
+        *CM_RECT.lock().unwrap() = Some((mx, my, mx + cm_w, my + cm_h));
     }
 }
 
@@ -153,8 +155,8 @@ pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        let w = CM_W as i32;
-        let h = CM_H as i32;
+        let w = gdi::phys(CM_W) as i32;
+        let h = gdi::phys(CM_H) as i32;
         let title = crate::wide("Z日历菜单");
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -177,10 +179,11 @@ pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
 
         let mut cui = Box::new(ContextMenuUi {
             hwnd: hwnd as usize,
-            sf: 1.0,
-            w: w as f32,
-            h: h as f32,
+            sf: gdi::scale(),
+            w: CM_W,
+            h: CM_H,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -190,30 +193,11 @@ pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
             regions: Vec::new(),
             hover: None,
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        cui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = cui.w as i32;
-        bmi.bmiHeader.biHeight = -(cui.h as i32);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(cui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(
-            cui.w as i32,
-            cui.h as i32,
-            (cui.w * 4.0) as i32,
-            gdi::PIXEL_FORMAT_32BPP_PARGB,
-            bits as *mut u8,
-            &mut bmp,
-        );
-        cui.bmp = bmp;
-        cui.scan0 = bits as *mut u8;
+        let (c_mem_dc, c_hbmp, c_bmp, c_scan0) = gdi::alloc_dib(cui.w, cui.h);
+        cui.mem_dc = c_mem_dc;
+        cui.hbmp = c_hbmp;
+        cui.bmp = c_bmp;
+        cui.scan0 = c_scan0;
         GdipGetImageGraphicsContext(cui.bmp, &mut cui.g);
         CM_UI.lock().unwrap().replace(SendCm(cui));
     }
@@ -221,6 +205,18 @@ pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
 
 impl ContextMenuUi {
     fn redraw(&mut self) {
+        // 屏幕缩放变化：按新 sf 重建位图（菜单窗口常驻，位图随 sf 失配惰性重建）
+        if (self.sf - gdi::scale()).abs() > 0.001 || self.bmp.is_null() {
+            unsafe {
+                gdi::free_dib(&mut self.mem_dc, &mut self.hbmp, &mut self.bmp, &mut self.g, &mut self.scan0);
+                let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(self.w, self.h);
+                self.mem_dc = mem_dc;
+                self.hbmp = hbmp;
+                self.bmp = bmp;
+                self.scan0 = scan0;
+            }
+            self.sf = gdi::scale();
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -228,7 +224,7 @@ impl ContextMenuUi {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
         self.paint(&p);
@@ -240,7 +236,7 @@ impl ContextMenuUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -301,8 +297,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = CM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if hit != f.hover {
                     f.hover = hit;
@@ -333,8 +329,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = CM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 match hit {
                     Some(CmAction::Settings) => {

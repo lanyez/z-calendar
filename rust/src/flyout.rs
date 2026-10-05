@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, CreateRectRgn, SelectObject};
+use winapi::um::wingdi::CreateRectRgn;
 use winapi::um::winuser::*;
 
 use crate::config::{apply_autostart, Config};
@@ -114,6 +114,7 @@ struct Ui {
     w: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -203,6 +204,7 @@ struct SettingsUi {
     w: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -238,8 +240,8 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        let w = SETTINGS_W as i32;
-        let h = SETTINGS_H as i32;
+        let w = gdi::phys(SETTINGS_W) as i32;
+        let h = gdi::phys(SETTINGS_H) as i32;
         let title = crate::wide("Z日历 · 设置");
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -262,10 +264,11 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
 
         let mut sui = Box::new(SettingsUi {
             hwnd: hwnd as usize,
-            sf: 1.0,
-            w: w as f32,
-            h: h as f32,
+            sf: gdi::scale(),
+            w: SETTINGS_W,
+            h: SETTINGS_H,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -283,37 +286,7 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             dumped: false,
             dump_path: std::env::var("CAL_DUMP2").unwrap_or_default(),
         });
-        unsafe {
-            let hdc = GetDC(std::ptr::null_mut());
-            sui.mem_dc = CreateCompatibleDC(hdc) as usize;
-            let mut bmi: BITMAPINFO = std::mem::zeroed();
-            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = sui.w as i32;
-            bmi.bmiHeader.biHeight = -(sui.h as i32);
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-            let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-            SelectObject(sui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-            ReleaseDC(std::ptr::null_mut(), hdc);
-            let mut bmp: gdi::Gp = std::ptr::null_mut();
-            GdipCreateBitmapFromScan0(
-                sui.w as i32,
-                sui.h as i32,
-                (sui.w * 4.0) as i32,
-                gdi::PIXEL_FORMAT_32BPP_PARGB,
-                bits as *mut u8,
-                &mut bmp,
-            );
-            sui.bmp = bmp;
-            sui.scan0 = bits as *mut u8;
-            // 常驻 Graphics：redraw 复用，避免每次创建/销毁撑大堆
-            GdipGetImageGraphicsContext(sui.bmp, &mut sui.g);
-            GdipSetSmoothingMode(sui.g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(sui.g, gdi::TEXT_AA_GRID_FIT);
-        }
-
+        // 后台位图不在创建时分配：show_settings→redraw 惰性分配，隐藏即释放
         SETTINGS_UI.lock().unwrap().replace(SendSettings(sui));
     }
 }
@@ -329,8 +302,8 @@ fn settings_position() -> (i32, i32) {
     unsafe {
         let mut wa: RECT = std::mem::zeroed();
         SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
-        let x = wa.left + ((wa.right - wa.left) - SETTINGS_W as i32) / 2;
-        let y = wa.top + ((wa.bottom - wa.top) - SETTINGS_H as i32) / 2;
+        let x = wa.left + ((wa.right - wa.left) - gdi::phys(SETTINGS_W) as i32) / 2;
+        let y = wa.top + ((wa.bottom - wa.top) - gdi::phys(SETTINGS_H) as i32) / 2;
         (x, y)
     }
 }
@@ -377,7 +350,7 @@ pub fn show_settings() {
     unsafe {
         // WS_EX_NOACTIVATE + SW_SHOWNA：设置窗口从不抢焦点，
         // 日历面板保持激活与显示，二者共存
-        SetWindowPos(hwnd as HWND, HWND_TOPMOST, x, y, SETTINGS_W as i32, SETTINGS_H as i32, SWP_NOACTIVATE);
+        SetWindowPos(hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(SETTINGS_W) as i32, gdi::phys(SETTINGS_H) as i32, SWP_NOACTIVATE);
         ShowWindow(hwnd as HWND, SW_SHOWNA);
     }
     {
@@ -410,6 +383,8 @@ fn hide_settings() {
     if hwnd == 0 {
         return;
     }
+    // 注意：本函数绝不能拿 SETTINGS_UI 锁——WM_LBUTTONDOWN 的确定/✕ 路径
+    // 持有该锁调用进来，重入加锁会同线程死锁；位图释放由调用方在锁外先做
     unsafe {
         if IsWindowVisible(hwnd as HWND) != 0 {
             let mut r: RECT = std::mem::zeroed();
@@ -427,6 +402,18 @@ fn hide_settings() {
     }
 }
 
+/// 释放设置窗口后台位图（隐藏时压缩内存；下次 show_settings 重绘时重建）。
+/// 必须在 SETTINGS_UI 锁外调用。
+fn free_settings_surface() {
+    let mut guard = SETTINGS_UI.lock().unwrap();
+    if let Some(sui) = guard.as_mut() {
+        let ui = &mut sui.0;
+        unsafe {
+            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+        }
+    }
+}
+
 impl SettingsUi {
     fn hit_add(regions: &mut Vec<(gdi::RectF, SAction)>, x: f32, y: f32, w: f32, h: f32, a: SAction) {
         regions.push((gdi::RectF { x, y, w, h }, a));
@@ -437,6 +424,14 @@ impl SettingsUi {
     }
 
     fn redraw(&mut self) {
+        if self.bmp.is_null() {
+            // 隐藏时位图已释放压缩内存：显示前重建
+            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
+            self.mem_dc = mem_dc;
+            self.hbmp = hbmp;
+            self.bmp = bmp;
+            self.scan0 = scan0;
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -444,7 +439,7 @@ impl SettingsUi {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = unsafe {
             Painter {
@@ -463,7 +458,7 @@ impl SettingsUi {
 
         if !self.dumped && !self.dump_path.is_empty() {
             self.dumped = true;
-            save_bmp(self.scan0, self.w as i32, self.h as i32, &self.dump_path);
+            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
             if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
                 unsafe {
                     PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
@@ -477,7 +472,7 @@ impl SettingsUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -942,7 +937,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             GetWindowRect(hwnd, &mut r);
             let cx = (x - r.left) as f32;
             let cy = (y - r.top) as f32;
-            if cx >= 10.0 && cx <= (r.right - r.left) as f32 - 40.0 && cy >= 10.0 && cy <= 50.0 {
+            if cx >= gdi::phys(10.0) && cx <= (r.right - r.left) as f32 - gdi::phys(40.0) && cy >= gdi::phys(10.0) && cy <= gdi::phys(50.0) {
                 2 // HTCAPTION
             } else {
                 DefWindowProcW(hwnd, msg, wp, lp)
@@ -979,42 +974,50 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 }
                 return 0;
             }
-            let mut guard = SETTINGS_UI.lock().unwrap();
-            if let Some(sui) = guard.as_mut() {
-                let ui = &mut sui.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
-                let a = ui.action_at(x, y);
-                if ui.week_menu_open {
-                    // 下拉展开中：仅选项/控件本身响应，点其他位置只收起
-                    match a {
-                        Some(SAction::WeekPick(i)) => ui.handle_action(&SAction::WeekPick(i)),
-                        _ => {
-                            ui.week_menu_open = false;
-                            ui.hover = None;
-                            ui.redraw();
+            let mut request_close = false;
+            {
+                let mut guard = SETTINGS_UI.lock().unwrap();
+                if let Some(sui) = guard.as_mut() {
+                    let ui = &mut sui.0;
+                    let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
+                    let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
+                    let a = ui.action_at(x, y);
+                    if ui.week_menu_open {
+                        // 下拉展开中：仅选项/控件本身响应，点其他位置只收起
+                        match a {
+                            Some(SAction::WeekPick(i)) => ui.handle_action(&SAction::WeekPick(i)),
+                            _ => {
+                                ui.week_menu_open = false;
+                                ui.hover = None;
+                                ui.redraw();
+                            }
                         }
-                    }
-                } else if ui.motto_menu_open {
-                    match a {
-                        Some(SAction::MottoPick(i)) => ui.handle_action(&SAction::MottoPick(i)),
-                        _ => {
-                            ui.motto_menu_open = false;
-                            ui.hover = None;
-                            ui.redraw();
+                    } else if ui.motto_menu_open {
+                        match a {
+                            Some(SAction::MottoPick(i)) => ui.handle_action(&SAction::MottoPick(i)),
+                            _ => {
+                                ui.motto_menu_open = false;
+                                ui.hover = None;
+                                ui.redraw();
+                            }
                         }
-                    }
-                } else if let Some(a) = a {
-                    match a {
-                        SAction::Toggle(_) | SAction::WeekDropdown | SAction::MottoDropdown | SAction::Refresh | SAction::Tab(_) => {
-                            ui.handle_action(&a);
+                    } else if let Some(a) = a {
+                        match a {
+                            SAction::Toggle(_) | SAction::WeekDropdown | SAction::MottoDropdown | SAction::Refresh | SAction::Tab(_) => {
+                                ui.handle_action(&a);
+                            }
+                            // 确认/关闭在锁外处理（hide_settings/free 不能持锁重入）
+                            SAction::Confirm | SAction::Close => {
+                                request_close = true;
+                            }
+                            _ => {}
                         }
-                        SAction::Confirm | SAction::Close => {
-                            hide_settings();
-                        }
-                        _ => {}
                     }
                 }
+            }
+            if request_close {
+                free_settings_surface();
+                hide_settings();
             }
             0
         }
@@ -1103,6 +1106,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         }
         WM_KEYDOWN => {
             if wp as i32 == 0x1B {
+                free_settings_surface();
                 hide_settings();
             }
             0
@@ -1143,6 +1147,7 @@ struct ForecastUi {
     w: f32,
     h: f32,
     mem_dc: usize,
+    hbmp: usize,
     bmp: gdi::Gp,
     scan0: *mut u8,
     g: gdi::Gp,
@@ -1173,8 +1178,8 @@ pub fn create_forecast_window(st: SharedState) {
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        let w = FC_W as i32;
-        let h = FC_H as i32;
+        let w = gdi::phys(FC_W) as i32;
+        let h = gdi::phys(FC_H) as i32;
         let title = crate::wide("Z日历天气");
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -1197,10 +1202,11 @@ pub fn create_forecast_window(st: SharedState) {
 
         let mut fui = Box::new(ForecastUi {
             hwnd: hwnd as usize,
-            sf: 1.0,
-            w: w as f32,
-            h: h as f32,
+            sf: gdi::scale(),
+            w: FC_W,
+            h: FC_H,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -1212,34 +1218,21 @@ pub fn create_forecast_window(st: SharedState) {
             link_hover: false,
             refreshing: None,
         });
-        let hdc = GetDC(std::ptr::null_mut());
-        fui.mem_dc = CreateCompatibleDC(hdc) as usize;
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = fui.w as i32;
-        bmi.bmiHeader.biHeight = -(fui.h as i32);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-        SelectObject(fui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-        ReleaseDC(std::ptr::null_mut(), hdc);
-        let mut bmp: gdi::Gp = std::ptr::null_mut();
-        GdipCreateBitmapFromScan0(
-            fui.w as i32,
-            fui.h as i32,
-            (fui.w * 4.0) as i32,
-            gdi::PIXEL_FORMAT_32BPP_PARGB,
-            bits as *mut u8,
-            &mut bmp,
-        );
-        fui.bmp = bmp;
-        fui.scan0 = bits as *mut u8;
+        let (f_mem_dc, f_hbmp, f_bmp, f_scan0) = gdi::alloc_dib(fui.w, fui.h);
+        fui.mem_dc = f_mem_dc;
+        fui.hbmp = f_hbmp;
+        fui.bmp = f_bmp;
+        fui.scan0 = f_scan0;
         GdipGetImageGraphicsContext(fui.bmp, &mut fui.g);
 
-        // 初始绘制（兼 CAL_DUMP3 首帧转储）
-        fui.redraw();
+        // 初始绘制仅服务于 CAL_DUMP3 首帧转储（调试时绘制后立即释放；正常路径由
+        // forecast_open→redraw 惰性分配）
+        if !fui.dump_path.is_empty() {
+            fui.redraw();
+            unsafe {
+                gdi::free_dib(&mut fui.mem_dc, &mut fui.hbmp, &mut fui.bmp, &mut fui.g, &mut fui.scan0);
+            }
+        }
         FORECAST_UI.lock().unwrap().replace(SendFc(fui));
     }
 }
@@ -1266,24 +1259,25 @@ pub fn forecast_open(main_hwnd: usize) {
         let mut wa: RECT = std::mem::zeroed();
         SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
         // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐；
-        // 日期侧栏打开时锚定到侧栏左缘（向左串联）
+        // 日期侧栏打开时锚定到侧栏左缘（向左串联）。anchor/工作区均为物理像素，
+        // 偏移与面板尺寸按 sf 放大
         let anchor = match crate::sidebar::sidebar_left_x() {
             Some(sx) => sx,
-            None => mr.left + 10,
+            None => mr.left + gdi::phys(10.0) as i32,
         };
-        let mut x = anchor - FC_W as i32;
-        let mut y = mr.top + 10;
-        if y + FC_H as i32 > wa.bottom - 4 {
-            y = wa.bottom - 4 - FC_H as i32;
+        let mut x = anchor - gdi::phys(FC_W) as i32;
+        let mut y = mr.top + gdi::phys(10.0) as i32;
+        if y + gdi::phys(FC_H) as i32 > wa.bottom - gdi::phys(4.0) as i32 {
+            y = wa.bottom - gdi::phys(4.0) as i32 - gdi::phys(FC_H) as i32;
         }
-        if y < wa.top + 4 {
-            y = wa.top + 4;
+        if y < wa.top + gdi::phys(4.0) as i32 {
+            y = wa.top + gdi::phys(4.0) as i32;
         }
         // 左侧放不下（屏幕过窄）：贴着工作区左缘，宁可压住日历也不越出屏幕
         // （窗口为贴屏幕右缘摆放，右缘已伸出屏幕外，不能再用窗口右缘做退路）
-        let xmax = wa.right - FC_W as i32 - 4;
-        x = x.max(wa.left + 4).min(xmax);
-        SetWindowPos(fh, HWND_TOPMOST, x, y, FC_W as i32, FC_H as i32, SWP_NOACTIVATE);
+        let xmax = wa.right - gdi::phys(FC_W) as i32 - gdi::phys(4.0) as i32;
+        x = x.max(wa.left + gdi::phys(4.0) as i32).min(xmax);
+        SetWindowPos(fh, HWND_TOPMOST, x, y, gdi::phys(FC_W) as i32, gdi::phys(FC_H) as i32, SWP_NOACTIVATE);
         ShowWindow(fh, SW_SHOWNA);
         f.redraw();
     }
@@ -1308,6 +1302,14 @@ pub fn forecast_close() {
     if h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 } {
         unsafe {
             ShowWindow(h as HWND, SW_HIDE);
+        }
+        // 释放后台位图压缩内存（下次 forecast_open 重绘时重建）
+        let mut guard = FORECAST_UI.lock().unwrap();
+        if let Some(f) = guard.as_mut() {
+            let ui = &mut f.0;
+            unsafe {
+                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+            }
         }
         crate::trim_working_set();
     }
@@ -1369,6 +1371,14 @@ pub fn forecast_redraw() {
 
 impl ForecastUi {
     fn redraw(&mut self) {
+        if self.bmp.is_null() {
+            // 隐藏时位图已释放压缩内存：显示前重建
+            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
+            self.mem_dc = mem_dc;
+            self.hbmp = hbmp;
+            self.bmp = bmp;
+            self.scan0 = scan0;
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -1376,7 +1386,7 @@ impl ForecastUi {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
         self.paint(&p);
@@ -1384,7 +1394,7 @@ impl ForecastUi {
 
         if !self.dumped && !self.dump_path.is_empty() {
             self.dumped = true;
-            save_bmp(self.scan0, self.w as i32, self.h as i32, &self.dump_path);
+            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
             if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
                 unsafe {
                     PostMessageW(hwnd() as HWND, WM_CLOSE, 0, 0);
@@ -1398,7 +1408,7 @@ impl ForecastUi {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -1519,8 +1529,8 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             let mut guard = FORECAST_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let r = f.link_rect;
                 let hit = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
                 if hit != f.link_hover {
@@ -1556,8 +1566,8 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             let mut guard = FORECAST_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                let x = ((lp & 0xFFFF) as u16 as i16) as f32;
-                let y = (((lp as usize) >> 16) as u16 as i16) as f32;
+                let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
+                let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let r = f.link_rect;
                 let refreshing = f
                     .refreshing
@@ -1588,8 +1598,8 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
         wc.lpszClassName = cls.as_ptr();
         RegisterClassW(&wc);
 
-        let w = WIN_W as i32;
-        let h = WIN_H as i32;
+        let w = gdi::phys(WIN_W) as i32;
+        let h = gdi::phys(WIN_H) as i32;
         let title = crate::wide("Z日历");
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
@@ -1611,13 +1621,7 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
         FLYOUT_HWND.store(hwnd as usize, Ordering::Relaxed);
         // 命中区域只取可见面板：窗口为贴屏幕右缘与任务栏摆放，四周那一圈透明内缩会超出
         // 屏幕/压在任务栏上，不设区域就会吞掉任务栏上的点击
-        let rgn = CreateRectRgn(
-            PANEL_INSET as i32,
-            PANEL_INSET as i32,
-            w - PANEL_INSET as i32,
-            h - PANEL_INSET as i32,
-        );
-        SetWindowRgn(hwnd, rgn, 0);
+        set_flyout_region(hwnd);
 
         let page = match std::env::var("CAL_PAGE").as_deref() {
             Ok("agenda") => Page::Agenda,
@@ -1640,10 +1644,11 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
 
         let mut ui = Box::new(Ui {
             hwnd: hwnd as usize,
-            sf: 1.0,
-            w: w as f32,
-            h: h as f32,
+            sf: gdi::scale(),
+            w: WIN_W,
+            h: WIN_H,
             mem_dc: 0,
+            hbmp: 0,
             bmp: std::ptr::null_mut(),
             scan0: std::ptr::null_mut(),
             g: std::ptr::null_mut(),
@@ -1671,21 +1676,16 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             dumped: false,
             dump_path: std::env::var("CAL_DUMP").unwrap_or_default(),
         });
-        create_dib(&mut ui);
-        // 常驻 Graphics：redraw 复用，避免每次创建/销毁撑大堆
-        unsafe {
-            GdipGetImageGraphicsContext(ui.bmp, &mut ui.g);
-            GdipSetSmoothingMode(ui.g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(ui.g, gdi::TEXT_AA_GRID_FIT);
-        }
-
+        // 后台位图不再启动时常驻：显示时 perform_show→redraw 惰性分配，隐藏即释放。
+        // 初始绘制仅服务于 CAL_DUMP 首帧转储（转储完成立即释放）
         UI.lock().unwrap().replace(SendUi(ui));
-
-        // 初始绘制（调试 dump 依赖 + 保证显示前内容就绪）
         {
             let mut guard = UI.lock().unwrap();
             if let Some(sui) = guard.as_mut() {
-                sui.0.redraw();
+                if !sui.0.dump_path.is_empty() {
+                    sui.0.redraw();
+                    free_surface(&mut sui.0);
+                }
             }
         }
 
@@ -1795,9 +1795,9 @@ fn perform_show(hwnd: HWND) {
         let clock = ui.st.clock.lock().unwrap().clone();
         position_for(clock.as_ref(), ui.sf, ui.w as i32, ui.h as i32)
     };
-    let (w, h) = (WIN_W as i32, WIN_H as i32);
+    let (w, h) = (gdi::phys(WIN_W) as i32, gdi::phys(WIN_H) as i32);
     unsafe {
-        SetWindowPos(hwnd, HWND_TOPMOST, p.x, p.y, w, h, SWP_NOACTIVATE);
+        SetWindowPos(hwnd, HWND_TOPMOST, gdi::phys(p.x as f32) as i32, gdi::phys(p.y as f32) as i32, w, h, SWP_NOACTIVATE);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
@@ -1824,6 +1824,9 @@ fn perform_hide(hwnd: HWND) {
             Some(sui) => {
                 was_shown = sui.0.shown;
                 sui.0.shown = false;
+                if was_shown {
+                    free_surface(&mut sui.0);
+                }
             }
             None => was_shown = false,
         }
@@ -1845,9 +1848,99 @@ fn toggle(ui: &mut Ui) {
     set_shown(ui, show);
 }
 
+/// 主面板窗口命中区域：可见面板四周内缩 PANEL_INSET（物理像素）。
+/// 区域是固定像素裁剪，屏幕缩放变化后必须按新 sf 重建，否则窗口被旧区域
+/// 裁剪、日历显示不全。
+fn set_flyout_region(hwnd: HWND) {
+    let inset = gdi::phys(PANEL_INSET) as i32;
+    let w = gdi::phys(WIN_W) as i32;
+    let h = gdi::phys(WIN_H) as i32;
+    unsafe {
+        let rgn = CreateRectRgn(inset, inset, w - inset, h - inset);
+        SetWindowRgn(hwnd, rgn, 0);
+    }
+}
+
+// ================= 屏幕缩放变化（PMv2 轮询） =================
+
+/// 轮询主屏有效 DPI：与当前 sf 不同 → 全局按新 sf 重建/重摆。
+/// 在主面板 WM_TIMER（锁外）调用。
+fn poll_scale_change() {
+    if gdi::scale_overridden() {
+        return;
+    }
+    let now = gdi::primary_scale();
+    if now > 0.0 && (now - gdi::scale()).abs() > 0.001 {
+        gdi::set_scale(now);
+        rescale_all(now);
+    }
+}
+
+/// 屏幕缩放变化：所有窗口按新 sf 重建/重摆（仅 UI 线程调用，内部自行加锁，
+/// 调用方不得持有任何 UI 锁）
+fn rescale_all(sf: f32) {
+    // 主面板：命中区域与位图都按新 sf 重建；显示中 → 立即按新 sf 重摆重绘
+    let shown;
+    {
+        let mut guard = UI.lock().unwrap();
+        if let Some(sui) = guard.as_mut() {
+            let ui = &mut sui.0;
+            ui.sf = sf;
+            free_surface(ui);
+            shown = ui.shown;
+        } else {
+            shown = false;
+        }
+    }
+    let h = FLYOUT_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        set_flyout_region(h as HWND);
+    }
+    if shown && h != 0 {
+        perform_show(h as HWND);
+    }
+    // 设置窗口：可见 → 原地重设尺寸并重绘；不可见 → 仅更新 sf（位图已释放）
+    let settings_vis = settings_visible();
+    {
+        let mut guard = SETTINGS_UI.lock().unwrap();
+        if let Some(sui) = guard.as_mut() {
+            let ui = &mut sui.0;
+            ui.sf = sf;
+            unsafe {
+                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+            }
+            if settings_vis {
+                unsafe {
+                    SetWindowPos(
+                        ui.hwnd as HWND,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        gdi::phys(SETTINGS_W) as i32,
+                        gdi::phys(SETTINGS_H) as i32,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                ui.redraw();
+            }
+        }
+    }
+    // 近一周天气面板：瞬态，收起（下次悬停自动按新 sf 重建重摆）
+    forecast_close();
+    // 日期侧栏 / 新建编辑弹窗 / 提醒卡片
+    crate::sidebar::rescale(sf);
+    crate::inputbox::rescale(sf);
+    crate::toast::rescale();
+    // 三个右键菜单：下次打开时按新 sf 自愈重建（redraw 检测 sf 失配），无需处理
+}
+
 // ================= 绘制 =================
 impl Ui {
     fn redraw(&mut self) {
+        if self.bmp.is_null() {
+            // 隐藏时位图已释放压缩内存：显示前重建
+            unsafe { create_dib(self); }
+        }
         if self.g.is_null() {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
@@ -1855,7 +1948,7 @@ impl Ui {
         let g = self.g;
         unsafe {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::TEXT_AA_GRID_FIT);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
         }
         let p = unsafe {
             Painter {
@@ -1877,7 +1970,7 @@ impl Ui {
 
         if !self.dumped && !self.dump_path.is_empty() {
             self.dumped = true;
-            save_bmp(self.scan0, self.w as i32, self.h as i32, &self.dump_path);
+            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
             if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
                 unsafe {
                     PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
@@ -1891,7 +1984,7 @@ impl Ui {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(self.hwnd as HWND, &mut r);
             let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: self.w as i32, cy: self.h as i32 };
+            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
             let mut src = POINT { x: 0, y: 0 };
             let mut blend = winapi::um::wingdi::BLENDFUNCTION {
                 BlendOp: 0,
@@ -2610,30 +2703,18 @@ impl Ui {
 
 // ================= 窗口过程 =================
 unsafe fn create_dib(ui: &mut Ui) {
-    let hdc = GetDC(std::ptr::null_mut());
-    ui.mem_dc = CreateCompatibleDC(hdc) as usize;
-    let mut bmi: BITMAPINFO = std::mem::zeroed();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = ui.w as i32;
-    bmi.bmiHeader.biHeight = -(ui.h as i32);
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-    SelectObject(ui.mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-    ReleaseDC(std::ptr::null_mut(), hdc);
-    let mut bmp: gdi::Gp = std::ptr::null_mut();
-    GdipCreateBitmapFromScan0(
-        ui.w as i32,
-        ui.h as i32,
-        (ui.w * 4.0) as i32,
-        gdi::PIXEL_FORMAT_32BPP_PARGB,
-        bits as *mut u8,
-        &mut bmp,
-    );
+    let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(ui.w, ui.h);
+    ui.mem_dc = mem_dc;
+    ui.hbmp = hbmp;
     ui.bmp = bmp;
-    ui.scan0 = bits as *mut u8;
+    ui.scan0 = scan0;
+}
+
+/// 释放后台位图（隐藏时调用压缩内存；下次 redraw 自动重建）
+fn free_surface(ui: &mut Ui) {
+    unsafe {
+        gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+    }
 }
 
 #[link(name = "gdiplus")]
@@ -2750,6 +2831,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             if idle_retune {
                 SetTimer(hwnd, 1, new_interval, None);
             }
+            // 屏幕缩放轮询（PMv2）：真实 DPI 与 sf 不同 → 全局重缩放（锁外、内部自行加锁）
+            poll_scale_change();
             0
         }
         WM_RBUTTONDOWN => {
@@ -2910,6 +2993,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 ui.redraw();
                             } else {
                                 ui.shown = false;
+                                free_surface(ui);
                                 hide = true;
                             }
                         }
@@ -2937,6 +3021,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 unsafe { ShowWindow(hwnd, SW_HIDE); }
                 forecast_close();
                 crate::sidebar::sidebar_hide();
+                crate::trim_working_set();
             }
             0
         }
@@ -3001,6 +3086,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         let ui = &mut sui.0;
                         if ui.shown {
                             ui.shown = false;
+                            free_surface(ui);
                             hide = true;
                         }
                     }
