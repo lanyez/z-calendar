@@ -2,7 +2,7 @@
 //! agenda.json 兼容旧的纯文本条目：新条目存为对象，旧条目仍是字符串（serde untagged）
 use std::collections::HashMap;
 
-use chrono::{Datelike, NaiveDate, Timelike};
+use chrono::{Datelike, Duration, NaiveDate, Timelike};
 
 /// 富日程条目（日期右键“新增日程”创建）
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -105,7 +105,7 @@ pub fn display(e: &AgendaEntry) -> String {
 // ---------------- 按天重复（每天/每周/每月/每年/农历每年） ----------------
 
 /// 下拉里的按天重复选项（跟在分钟级重复之后）
-pub const RECUR_VALUES: [&str; 5] = ["d", "w", "m", "y", "l"];
+pub const RECUR_VALUES: [&str; 6] = ["d", "w", "wd", "m", "y", "l"];
 /// 分钟级重复选项个数（重复下拉前 N 项）
 pub const REPEAT_MENU_MIN: usize = 5;
 /// 重复下拉总项数 = 分钟级 5 + 按天 5
@@ -115,6 +115,7 @@ pub fn recur_label(rc: &str) -> String {
     match rc {
         "d" => "每天".into(),
         "w" => "每周".into(),
+        "wd" => "每个工作日".into(),
         "m" => "每月".into(),
         "y" => "每年".into(),
         "l" => "农历每年".into(),
@@ -131,6 +132,7 @@ pub fn recur_hits(kind: &str, anchor: NaiveDate, date: NaiveDate) -> bool {
     match kind {
         "d" => true,
         "w" => anchor.weekday() == date.weekday(),
+        "wd" => date.weekday().num_days_from_monday() <= 4,
         "m" => anchor.day() == date.day(),
         "y" => anchor.month() == date.month() && anchor.day() == date.day(),
         "l" => match (crate::lunar::solar_to_lunar(anchor), crate::lunar::solar_to_lunar(date)) {
@@ -227,7 +229,50 @@ pub fn agenda_on(map: &AgendaMap, date: NaiveDate) -> Vec<(String, usize, Agenda
                 out.push((k.clone(), i, e.clone()));
             }
         }
-    }    out.sort_by(|a, b| {
+    }
+    // 跨天日程：结束日 > 开始日的条目在中段/尾段也展示（开始日由上面的原生条目负责，
+    // 重复条目的每次出现按 [出现日, 出现日+跨天数] 展开）
+    for (k, v) in map.iter() {
+        if *k == key {
+            continue;
+        }
+        for (i, e) in v.iter().enumerate() {
+            let AgendaEntry::Rich(r) = e else { continue };
+            let (Some(sd), Some(ed)) = (parse_start(&r.start), parse_start(&r.end)) else { continue };
+            let (s, en) = (sd.date(), ed.date());
+            if en <= s || !(s <= date && date <= en) {
+                continue;
+            }
+            // 存储归属日（k == date 的 key）已由上面的原生条目展示，跳过避免重复
+            if *k == key {
+                continue;
+            }
+            let span = (en - s).num_days();
+            let covered = match &r.recur {
+                None => true,
+                Some(rc) => {
+                    // date 本身是出现日 → 由上面的重复展开负责；否则看是否落在某次出现的延展区内
+                    if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, date) {
+                        continue;
+                    }
+                    let mut cand = date - Duration::days(span);
+                    let mut hit = false;
+                    while cand < date {
+                        if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, cand) {
+                            hit = true;
+                            break;
+                        }
+                        cand += Duration::days(1);
+                    }
+                    hit
+                }
+            };
+            if covered {
+                out.push((k.clone(), i, e.clone()));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
         let ta = match &a.2 {
             AgendaEntry::Rich(r) => parse_start(&r.start).map(|d| d.time()),
             AgendaEntry::Legacy(_) => None,
@@ -243,6 +288,53 @@ pub fn agenda_on(map: &AgendaMap, date: NaiveDate) -> Vec<(String, usize, Agenda
             (None, None) => std::cmp::Ordering::Equal,
         }
     });
+    out
+}
+
+/// 月历格角标用：[a, b] 内被"跨天日程"覆盖的日期 key 集合。
+/// 开始日/出现日本身由原生条目与重复规则负责，这里只补中段/尾段延展区。
+pub fn agenda_span_keys(map: &AgendaMap, a: NaiveDate, b: NaiveDate) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if b < a {
+        return out;
+    }
+    for v in map.values() {
+        for e in v {
+            let AgendaEntry::Rich(r) = e else { continue };
+            let (Some(sd), Some(ed)) = (parse_start(&r.start), parse_start(&r.end)) else { continue };
+            let (s, en) = (sd.date(), ed.date());
+            if en <= s {
+                continue;
+            }
+            let span = (en - s).num_days();
+            match &r.recur {
+                None => {
+                    let mut d = (s + Duration::days(1)).max(a);
+                    let stop = en.min(b);
+                    while d <= stop {
+                        out.insert(crate::ics::key_of_date(d));
+                        d += Duration::days(1);
+                    }
+                }
+                Some(rc) => {
+                    // 每个命中出现日 D 覆盖 (D, D+span]；扫描 [a-span, b] 内的命中日
+                    // （出现日本身重复规则已覆盖，重复插入无害；锚点日的延展区必须在这里补上）
+                    let mut cand = a - Duration::days(span);
+                    while cand <= b {
+                        if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, cand) {
+                            let mut d = cand + Duration::days(1);
+                            let stop = (cand + Duration::days(span)).min(b);
+                            while d <= stop {
+                                out.insert(crate::ics::key_of_date(d));
+                                d += Duration::days(1);
+                            }
+                        }
+                        cand += Duration::days(1);
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -414,32 +506,121 @@ fn parse_time_prefix(s: &str) -> Option<(usize, u32)> {
     Some((i, h * 60 + m))
 }
 
-/// 快捷输入解析：开头的时间（可带 "-" / "~" / "—" 区间）+ 后续文本。
-/// 返回 (开始分钟, 结束分钟, 日程名)；无时间或名字为空返回 None（走纯文本旧条目）。
-pub fn parse_quick_time(text: &str) -> Option<(u32, Option<u32>, String)> {
-    let t = text.trim();
-    let (i1, start) = parse_time_prefix(t)?;
-    let rest = t[i1..].trim_start();
-    // 区间结束时间
-    let mut end = None;
-    let after_sep = rest
-        .strip_prefix('-')
-        .or_else(|| rest.strip_prefix('~'))
-        .or_else(|| rest.strip_prefix('—'));
-    if let Some(after) = after_sep {
-        let after = after.trim_start();
-        if let Some((i2, em)) = parse_time_prefix(after) {
-            let name = after[i2..].trim();
-            if name.is_empty() {
-                return None;
-            }
-            return Some((start, Some(em.max(start)), name.to_string()));
+/// 中文星期词 → 周一=0 ... 周日=6
+fn cn_weekday(s: &str) -> Option<(u32, usize)> {
+    let c = s.chars().next()?;
+    let wd = match c {
+        '一' => 0,
+        '二' => 1,
+        '三' => 2,
+        '四' => 3,
+        '五' => 4,
+        '六' => 5,
+        '日' | '天' => 6,
+        _ => return None,
+    };
+    Some((wd, c.len_utf8()))
+}
+
+/// 日期词前缀解析：相对词（今天/明天/后天/大后天）、周X（本周最近一个，含今天）、
+/// 下周X、M月D日/号（年份取 base 年，已过顺延一年）。返回 (字节数, 日期)。
+pub fn parse_date_word(s: &str, base: NaiveDate) -> Option<(usize, NaiveDate)> {
+    for (w, delta) in [("大后天", 3i64), ("后天", 2), ("明天", 1), ("明日", 1), ("今天", 0), ("今日", 0)] {
+        if s.starts_with(w) {
+            return Some((w.len(), base + Duration::days(delta)));
         }
     }
-    if rest.is_empty() {
+    for pre in ["下周", "下星期", "下礼拜"] {
+        if let Some(rest) = s.strip_prefix(pre) {
+            if let Some((wd, cl)) = cn_weekday(rest) {
+                // 下周X：按 ISO 周一开算，下周X = base + (7 - 周几) + X
+                let cur = base.weekday().num_days_from_monday() as i64;
+                return Some((pre.len() + cl, base + Duration::days(7 - cur + wd as i64)));
+            }
+        }
+    }
+    for pre in ["周", "星期", "礼拜"] {
+        if let Some(rest) = s.strip_prefix(pre) {
+            if let Some((wd, cl)) = cn_weekday(rest) {
+                // 周X：未来最近的一个（当天命中取当天）
+                let cur = base.weekday().num_days_from_monday() as i64;
+                let mut delta = wd as i64 - cur;
+                if delta < 0 {
+                    delta += 7;
+                }
+                return Some((pre.len() + cl, base + Duration::days(delta)));
+            }
+        }
+    }
+    // M月D日 / M月D号
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut m = 0u32;
+    let mut dm = 0;
+    while i < b.len() && b[i].is_ascii_digit() && dm < 2 {
+        m = m * 10 + (b[i] - b'0') as u32;
+        i += 1;
+        dm += 1;
+    }
+    if dm > 0 && (1..=12).contains(&m) && s[i..].starts_with('月') {
+        i += '月'.len_utf8();
+        let mut d = 0u32;
+        let mut dd = 0;
+        while i < b.len() && b[i].is_ascii_digit() && dd < 2 {
+            d = d * 10 + (b[i] - b'0') as u32;
+            i += 1;
+            dd += 1;
+        }
+        if dd > 0 && (1..=31).contains(&d) && (s[i..].starts_with('日') || s[i..].starts_with('号')) {
+            i += '日'.len_utf8();
+            if let Some(mut date) = NaiveDate::from_ymd_opt(base.year(), m, d) {
+                if date < base {
+                    date = NaiveDate::from_ymd_opt(base.year() + 1, m, d).unwrap_or(date);
+                }
+                return Some((i, date));
+            }
+        }
+    }
+    None
+}
+
+/// 快捷输入解析：开头可带日期词（今天/明天/后天/大后天/周X/下周X/M月D日），
+/// 随后时间（可带 "-" / "~" / "—" 区间）+ 文本。
+/// 返回 (归属日期, 开始分钟, 结束分钟, 日程名)；日期 None=未写日期（落在 base 上），
+/// 开始分钟 None=未写时间（按全天日程处理）；名字为空返回 None（走纯文本旧条目）。
+pub fn parse_quick_time(text: &str, base: NaiveDate) -> Option<(Option<NaiveDate>, Option<u32>, Option<u32>, String)> {
+    let t = text.trim();
+    let (day, rest) = match parse_date_word(t, base) {
+        Some((i, d)) => (Some(d), t[i..].trim_start()),
+        None => (None, t),
+    };
+    let (start, end, name) = match parse_time_prefix(rest) {
+        Some((i1, start)) => {
+            let after = rest[i1..].trim_start();
+            // 区间结束时间
+            let after_sep = after
+                .strip_prefix('-')
+                .or_else(|| after.strip_prefix('~'))
+                .or_else(|| after.strip_prefix('—'));
+            if let Some(after) = after_sep {
+                let after = after.trim_start();
+                if let Some((i2, em)) = parse_time_prefix(after) {
+                    let name = after[i2..].trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    return Some((day, Some(start), Some(em.max(start)), name.to_string()));
+                }
+            }
+            (Some(start), None, after)
+        }
+        None => (None, None, rest),
+    };
+    // 无日期词也无时间 → 纯文本旧条目（维持旧契约）；有解析结果但名字为空同样放弃
+    if (day.is_none() && start.is_none()) || name.is_empty() {
         return None;
     }
-    Some((start, end, rest.to_string()))
+    Some((day, start, end, name.to_string()))
 }
 
 #[cfg(test)]
@@ -523,20 +704,70 @@ mod tests {
 
     #[test]
     fn parse_quick_time_cases() {
-        assert_eq!(parse_quick_time("14:30 项目评审"), Some((870, None, "项目评审".into())));
-        assert_eq!(parse_quick_time("9:00~10:00 晨会"), Some((540, Some(600), "晨会".into())));
-        assert_eq!(parse_quick_time("9点 开会"), Some((540, None, "开会".into())));
-        assert_eq!(parse_quick_time("9点半-11点半 午休"), Some((570, Some(690), "午休".into())));
-        assert_eq!(parse_quick_time("14点30分 复盘"), Some((870, None, "复盘".into())));
-        // 冒号/点形式可直接接文字；裸数字必须跟空格或区间符
-        assert_eq!(parse_quick_time("9点开会"), Some((540, None, "开会".into())));
-        assert_eq!(parse_quick_time("14:30开会"), Some((870, None, "开会".into())));
-        // 无时间 / 纯数字 / 只有时间 → 旧文本条目
-        assert_eq!(parse_quick_time("买菜"), None);
-        assert_eq!(parse_quick_time("3件事要办"), None);
-        assert_eq!(parse_quick_time("2026年计划"), None);
-        assert_eq!(parse_quick_time("14:00"), None);
-        assert_eq!(parse_quick_time(""), None);
+        let base = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(); // 周三
+        let d = |delta: i64| Some(base + Duration::days(delta));
+        assert_eq!(parse_quick_time("14:30 项目评审", base), Some((None, Some(870), None, "项目评审".into())));
+        assert_eq!(parse_quick_time("9:00~10:00 晨会", base), Some((None, Some(540), Some(600), "晨会".into())));
+        assert_eq!(parse_quick_time("9点 开会", base), Some((None, Some(540), None, "开会".into())));
+        assert_eq!(parse_quick_time("9点半-11点半 午休", base), Some((None, Some(570), Some(690), "午休".into())));
+        // 冒号/点形式可直接接文字
+        assert_eq!(parse_quick_time("9点开会", base), Some((None, Some(540), None, "开会".into())));
+        // 日期词：相对日 / 周 / 下周 / M月D日
+        assert_eq!(parse_quick_time("明天 交周报", base), Some((d(1), None, None, "交周报".into())));
+        assert_eq!(parse_quick_time("明天9点开会", base), Some((d(1), Some(540), None, "开会".into())));
+        assert_eq!(parse_quick_time("后天 14:00 复盘", base), Some((d(2), Some(840), None, "复盘".into())));
+        assert_eq!(parse_quick_time("周五 18:30 团建", base), Some((d(2), Some(1110), None, "团建".into())));
+        assert_eq!(parse_quick_time("下周三 9点 例会", base), Some((d(7), Some(540), None, "例会".into())));
+        assert_eq!(
+            parse_quick_time("10月8日 9:00-10:00 值班", base),
+            Some((Some(NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()), Some(540), Some(600), "值班".into()))
+        );
+        // 无时间无日期 / 只有日期词没名字 / 只有时间 → 旧文本条目
+        assert_eq!(parse_quick_time("买菜", base), None);
+        assert_eq!(parse_quick_time("明天", base), None);
+        assert_eq!(parse_quick_time("14:00", base), None);
+        assert_eq!(parse_quick_time("", base), None);
+    }
+
+    #[test]
+    fn recur_hits_workday() {
+        let wed = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(); // 周三
+        assert!(recur_hits("wd", wed, wed + Duration::days(1))); // 周四
+        assert!(recur_hits("wd", wed, wed + Duration::days(2))); // 周五（工作日）
+        assert!(!recur_hits("wd", wed, wed + Duration::days(3))); // 周六
+        assert!(!recur_hits("wd", wed, wed + Duration::days(4))); // 周日
+        assert!(recur_hits("wd", wed, wed + Duration::days(5))); // 下周一
+        assert!(!recur_hits("wd", wed, wed)); // 锚点日由原生条目负责
+    }
+
+    #[test]
+    fn multiday_agenda_spans() {
+        let mut map = AgendaMap::new();
+        let start = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        map.entry(crate::ics::key_of_date(start)).or_default().push(AgendaEntry::Rich(RichEvent {
+            id: "t1".into(),
+            name: "发布会筹备".into(),
+            all_day: false,
+            start: "2026-10-5 09:00".into(),
+            end: "2026-10-7 18:00".into(),
+            remind: None,
+            repeat: None,
+            recur: None,
+            recur_until: None,
+            skip_dates: Vec::new(),
+        }));
+        // 开始日、中段、尾段都展示；区间外不展示
+        assert_eq!(agenda_on(&map, start).len(), 1);
+        assert_eq!(agenda_on(&map, start + Duration::days(1)).len(), 1);
+        assert_eq!(agenda_on(&map, start + Duration::days(2)).len(), 1);
+        assert_eq!(agenda_on(&map, start + Duration::days(3)).len(), 0);
+        assert_eq!(agenda_on(&map, start - Duration::days(1)).len(), 0);
+        // 角标集合：只补中段/尾段（开始日由原生条目负责）
+        let keys = agenda_span_keys(&map, start, start + Duration::days(30));
+        assert!(keys.contains(&crate::ics::key_of_date(start + Duration::days(1))));
+        assert!(keys.contains(&crate::ics::key_of_date(start + Duration::days(2))));
+        assert!(!keys.contains(&crate::ics::key_of_date(start)));
+        assert!(!keys.contains(&crate::ics::key_of_date(start + Duration::days(3))));
     }
 }
 

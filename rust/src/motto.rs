@@ -117,7 +117,8 @@ pub fn purge_stale() {
 /// 请求一言 API（阻塞，仅后台线程调用）
 fn fetch_quote(ty: &str) -> Option<Motto> {
     let url = format!("https://v1.hitokoto.cn/?c={}", ty);
-    let mut body = ureq::get(&url)
+    let mut body = crate::net::agent()
+        .get(&url)
         .timeout(std::time::Duration::from_secs(8))
         .call()
         .ok()?

@@ -54,16 +54,9 @@ struct BdcReverse {
 /// DNS 解析：IPv4 地址排在 IPv6 之前。电信等运营商的 IPv6 出口在 IP 定位库中
 /// 常被错标城市（如广东电信 IPv6 被标到海南儋州），IPv4 数据准确得多，
 /// 故天气相关请求一律优先走 IPv4 出口定位（无 IPv4 时仍可回退 IPv6）。
-fn resolve_v4_first(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
-    let mut addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(netloc)?.collect();
-    addrs.sort_by_key(|a| !a.is_ipv4());
-    Ok(addrs)
-}
-
-/// 天气相关请求共用 Agent（IPv4 优先解析）
+/// 天气相关请求共用 Agent（IPv4 优先解析，实现在 net.rs）
 fn agent() -> &'static ureq::Agent {
-    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| ureq::AgentBuilder::new().resolver(resolve_v4_first).build())
+    crate::net::agent()
 }
 
 /// 主定位：ip-api.com（大陆城市定位准确，直接返回简体中文城市名 + 坐标）
@@ -409,7 +402,7 @@ pub fn fake() -> Weather {
 mod tests {
     #[test]
     fn resolver_v4_first() {
-        let addrs = super::resolve_v4_first("localhost:1234").expect("resolve localhost");
+        let addrs = crate::net::resolve_v4_first("localhost:1234").expect("resolve localhost");
         assert!(!addrs.is_empty());
         if let Some(i) = addrs.iter().position(|a| a.is_ipv6()) {
             assert!(addrs[i..].iter().all(|a| a.is_ipv6()), "IPv4 应排在 IPv6 之前");

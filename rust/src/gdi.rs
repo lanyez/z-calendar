@@ -179,6 +179,55 @@ pub fn text_hint() -> i32 {
     })
 }
 
+// ---------- 界面字号（设置里 100%/110%/125%）与 GDI ClearType 文本路径 ----------
+
+static TEXT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000); // ×1000
+
+/// 界面字号系数（只作用于正文文本，图标字体不受影响）
+pub fn text_scale() -> f32 {
+    TEXT_SCALE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+}
+
+pub fn set_text_scale(v: f32) {
+    let v = v.clamp(0.5, 3.0);
+    TEXT_SCALE.store((v * 1000.0).round() as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// GDI HFONT 缓存（px 已含缩放与字号系数；进程内按需创建，数量有限不释放）
+static GFONTS: std::sync::LazyLock<Mutex<HashMap<i64, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+unsafe fn gdi_font(px: i32, bold: bool) -> usize {
+    use winapi::um::wingdi::{
+        CreateFontW, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS,
+    };
+    let key = ((px as i64) << 1) | bold as i64;
+    let mut map = GFONTS.lock().unwrap();
+    if let Some(f) = map.get(&key) {
+        return *f;
+    }
+    let face = wide("Microsoft YaHei UI");
+    let hfont = CreateFontW(
+        -px,
+        0,
+        0,
+        0,
+        if bold { FW_BOLD as i32 } else { FW_NORMAL as i32 },
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET as u32,
+        OUT_DEFAULT_PRECIS as u32,
+        CLIP_DEFAULT_PRECIS as u32,
+        CLEARTYPE_QUALITY as u32,
+        0,
+        face.as_ptr(),
+    );
+    let hf = hfont as usize;
+    map.insert(key, hf);
+    hf
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RectF {
@@ -365,6 +414,9 @@ pub struct Painter {
     pub sf: f32,
     pub w: f32,
     pub h: f32,
+    /// 后台 DIBSection 的内存 DC 与像素指针（GDI ClearType 文本路径用；0/null 走 GDI+）
+    pub dc: usize,
+    pub scan0: *mut u8,
 }
 
 impl Painter {
@@ -453,6 +505,15 @@ impl Painter {
     }
 
     pub fn text(&self, s: &str, x: f32, y: f32, w: f32, h: f32, halign: i32, valign: i32, px: f32, bold: bool, mdl2: bool, color: u32) {
+        // 界面字号系数只作用于正文文本（mdl2 图标字体保持原大）
+        let px = px * text_scale();
+        // 内存位图上 GDI+ 的 ClearType 被静默回退为灰度；正文改走 GDI DrawTextW 保留子像素渲染。
+        // CAL_TEXT_HINT 覆盖时走 GDI+（保留调试 A/B 通道），图标字体也保持 GDI+ 灰度。
+        if !mdl2 && self.dc != 0 && !self.scan0.is_null() && text_hint() == TEXT_HINT_CLEAR_TYPE
+            && self.text_gdi(s, x, y, w, h, halign, valign, px, bold, color)
+        {
+            return;
+        }
         unsafe {
             let rect = RectF { x: self.s(x), y: self.s(y), w: self.s(w), h: self.s(h) };
             GdipSetStringFormatAlign((*self.cache).format, halign);
@@ -473,12 +534,85 @@ impl Painter {
         }
     }
 
+    /// GDI ClearType 文本路径。成功绘制返回 true。
+    /// GDI 写 32bpp DIB 会把字形像素的 alpha 清零：绘制前快照、绘制后按差分把
+    /// 被触碰的像素 alpha 置回 255，未触碰像素（含半透明底）原样保留。
+    fn text_gdi(&self, s: &str, x: f32, y: f32, w: f32, h: f32, halign: i32, valign: i32, px: f32, bold: bool, color: u32) -> bool {
+        use winapi::um::wingdi::{GdiFlush, SelectObject, SetBkMode, SetTextColor, TRANSPARENT};
+        use winapi::um::winuser::{DrawTextW, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER};
+        let bw = self.s(self.w) as i32;
+        let bh = self.s(self.h) as i32;
+        let (rx, ry, rw, rh) = (
+            self.s(x).round() as i32,
+            self.s(y).round() as i32,
+            (self.s(w).ceil() as i32).max(1),
+            (self.s(h).ceil() as i32).max(1),
+        );
+        // 与位图求交（裁剪语义与 GDI+ 一致）
+        let (cx0, cy0) = (rx.max(0), ry.max(0));
+        let (cx1, cy1) = ((rx + rw).min(bw), (ry + rh).min(bh));
+        if cx1 <= cx0 || cy1 <= cy0 {
+            return true;
+        }
+        let px_i = self.s(px).round() as i32;
+        if px_i <= 0 {
+            return false;
+        }
+        let stride = bw as usize * 4;
+        let rows = (cy1 - cy0) as usize;
+        let cols = (cx1 - cx0) as usize;
+        let rect_bytes = rows * cols * 4;
+        let mut snap = vec![0u8; rect_bytes];
+        unsafe {
+            let hdc = self.dc as winapi::shared::windef::HDC;
+            let hfont = gdi_font(px_i, bold);
+            if hfont == 0 {
+                return false;
+            }
+            // 快照
+            let base = self.scan0.add(cy0 as usize * stride + cx0 as usize * 4);
+            std::ptr::copy_nonoverlapping(base, snap.as_mut_ptr(), rect_bytes);
+            let prev = SelectObject(hdc, hfont as *mut winapi::ctypes::c_void);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            // COLORREF = 0x00BBGGRR，与 GDI+ 的 0xAARRGGBB 字节序相反
+            let cr = ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF);
+            SetTextColor(hdc, cr as u32);
+            let mut rc = winapi::shared::windef::RECT { left: rx, top: ry, right: rx + rw, bottom: ry + rh };
+            let mut fmt = DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+            fmt |= match halign {
+                HALIGN_CENTER => DT_CENTER,
+                HALIGN_FAR => DT_RIGHT,
+                _ => 0,
+            };
+            if valign == HALIGN_CENTER {
+                fmt |= DT_VCENTER;
+            }
+            let mut buf: Vec<u16> = s.encode_utf16().collect();
+            buf.push(0);
+            DrawTextW(hdc, buf.as_mut_ptr(), (buf.len() - 1) as i32, &mut rc, fmt);
+            GdiFlush();
+            SelectObject(hdc, prev);
+            // 差分修复：字形触碰的像素 alpha 置回 255；未触碰像素原样保留
+            for row in 0..rows {
+                let dst = self.scan0.add((cy0 as usize + row) * stride + cx0 as usize * 4) as *mut u32;
+                let src = snap.as_ptr().add(row * cols * 4) as *const u32;
+                for col in 0..cols {
+                    if *dst.add(col) != *src.add(col) {
+                        *dst.add(col) |= 0xFF00_0000;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// 居中单行文本（快捷）
     pub fn text_c(&self, s: &str, cx: f32, cy: f32, px: f32, bold: bool, mdl2: bool, color: u32) {
         self.text(s, cx - 150.0, cy - 20.0, 300.0, 40.0, HALIGN_CENTER, HALIGN_CENTER, px, bold, mdl2, color);
     }
 
     pub fn measure(&self, s: &str, px: f32, bold: bool, mdl2: bool) -> (f32, f32) {
+        let px = px * text_scale();
         unsafe {
             let layout = RectF { x: 0.0, y: 0.0, w: 10000.0, h: 200.0 };
             let mut out = RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };

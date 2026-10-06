@@ -208,7 +208,8 @@ fn fetch_and_split() -> Option<()> {
 /// 依次尝试镜像源下载全量数据集（阻塞，仅后台线程调用）
 fn fetch_dataset() -> Option<String> {
     for url in SOURCES {
-        let Ok(resp) = ureq::get(*url)
+        let Ok(resp) = crate::net::agent()
+            .get(*url)
             .timeout(std::time::Duration::from_secs(30))
             .call()
         else {

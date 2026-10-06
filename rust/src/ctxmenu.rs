@@ -22,11 +22,11 @@ extern "system" {
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
 }
 
-// 配色（与主面板一致）
-const BLUE: u32 = gdi::argb(255, 0x3E, 0x87, 0xFA);
-const RED: u32 = gdi::argb(255, 0xE5, 0x4B, 0x4B);
-const ROW_TXT: u32 = gdi::argb(255, 0xD7, 0xDD, 0xE4);
-const POPUP_BG: u32 = gdi::argb(255, 0x2A, 0x33, 0x45);
+// 配色（与主面板一致，取自 theme 色板）
+fn BLUE() -> u32 { crate::theme::pal().blue }
+fn RED() -> u32 { crate::theme::pal().red }
+fn ROW_TXT() -> u32 { crate::theme::pal().row }
+fn POPUP_BG() -> u32 { crate::theme::pal().popup }
 
 const CM_W: f32 = 186.0;
 const CM_ROW: f32 = 34.0;
@@ -226,7 +226,7 @@ impl ContextMenuUi {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
+        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
         self.paint(&p);
         self.ulw();
     }
@@ -260,8 +260,8 @@ impl ContextMenuUi {
 
     fn paint(&mut self, p: &Painter) {
         p.clear();
-        p.fill_round(0.0, 0.0, CM_W, CM_H, 10.0, POPUP_BG);
-        p.stroke_round(0.0, 0.0, CM_W, CM_H, 10.0, 1.0, gdi::argb(26, 255, 255, 255));
+        p.fill_round(0.0, 0.0, CM_W, CM_H, 10.0, POPUP_BG());
+        p.stroke_round(0.0, 0.0, CM_W, CM_H, 10.0, 1.0, crate::theme::ov(26));
         let autostart = self.st.config.lock().unwrap().autostart;
         let items: [(CmAction, &str, bool); 4] = [
             (CmAction::Settings, "软件设置", false),
@@ -275,11 +275,11 @@ impl ContextMenuUi {
             self.regions.push((gdi::RectF { x: 6.0, y, w: CM_W - 12.0, h: CM_ROW - 2.0 }, *act));
             let hov = self.hover == Some(*act);
             if hov {
-                p.fill_round(6.0, y, CM_W - 12.0, CM_ROW - 2.0, 6.0, gdi::argb(16, 255, 255, 255));
+                p.fill_round(6.0, y, CM_W - 12.0, CM_ROW - 2.0, 6.0, crate::theme::ov(16));
             }
-            let col = if *act == CmAction::Quit { RED } else { ROW_TXT };
+            let col = if *act == CmAction::Quit { RED() } else { ROW_TXT() };
             // 开机自启开启时在左侧打勾
-            p.text(if *checked { "✓" } else { "" }, 10.0, y, 16.0, CM_ROW - 2.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE);
+            p.text(if *checked { "✓" } else { "" }, 10.0, y, 16.0, CM_ROW - 2.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
             p.text(name, 30.0, y, CM_W - 42.0, CM_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, col);
         }
     }

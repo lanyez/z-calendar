@@ -27,32 +27,35 @@ const LIST_ROW: f32 = 30.0; // 下拉项行高
 const PICK_ROW: f32 = 24.0; // 时/分列表行高
 const PICK_VISIBLE: i32 = 8; // 时/分列表可见行数
 
-// 配色（与主面板/侧栏一致）
-const BLUE: u32 = gdi::argb(255, 0x3E, 0x87, 0xFA);
-const BLUE_HOV: u32 = gdi::argb(255, 0x53, 0x99, 0xFB);
-const RED: u32 = gdi::argb(255, 0xE5, 0x48, 0x4D);
-const ORANGE: u32 = gdi::argb(255, 0xE8, 0x96, 0x3C);
-const SLATE: u32 = gdi::argb(255, 0x8A, 0x93, 0xA0);
-const BG_PAGE: u32 = gdi::argb(255, 0x20, 0x28, 0x38);
-const CARD_BG: u32 = gdi::argb(255, 0x26, 0x30, 0x42);
-const FIELD_BG: u32 = gdi::argb(255, 0x2A, 0x33, 0x45);
-const TITLE_COL: u32 = gdi::argb(255, 0xDF, 0xE5, 0xEC);
-const ROW_TXT: u32 = gdi::argb(255, 0xD7, 0xDD, 0xE4);
-const SUB: u32 = gdi::argb(255, 0x9A, 0xA1, 0xA9);
-const SUB_DIM: u32 = gdi::argb(255, 0x5C, 0x66, 0x73);
+// 配色（与主面板/侧栏一致，取自 theme 色板）
+fn BLUE() -> u32 { crate::theme::pal().blue }
+fn BLUE_HOV() -> u32 { crate::theme::pal().blue_hov }
+fn RED() -> u32 { crate::theme::pal().red }
+fn ORANGE() -> u32 { crate::theme::pal().orange2 }
+fn SLATE() -> u32 { crate::theme::pal().slate }
+fn BG_PAGE() -> u32 { crate::theme::pal().bg }
+fn CARD_BG() -> u32 { crate::theme::pal().card }
+fn FIELD_BG() -> u32 { crate::theme::pal().popup }
+fn TITLE_COL() -> u32 { crate::theme::pal().title }
+fn ROW_TXT() -> u32 { crate::theme::pal().row }
+fn SUB() -> u32 { crate::theme::pal().sub }
+fn SUB_DIM() -> u32 { crate::theme::pal().dim }
 const WHITE: u32 = gdi::argb(255, 255, 255, 255);
-const HOVER_BG: u32 = gdi::argb(14, 255, 255, 255);
-const SEL_BG: u32 = gdi::argb(36, 62, 135, 250);
-const BORDER_SUB: u32 = gdi::argb(24, 255, 255, 255);
-const DROP_BG: u32 = gdi::argb(255, 0x24, 0x2E, 0x40);
+fn HOVER_BG() -> u32 { crate::theme::ov(14) }
+fn SEL_BG() -> u32 { crate::theme::pal().sel_bg }
+fn BORDER_SUB() -> u32 { crate::theme::ov(24) }
+fn DROP_BG() -> u32 { crate::theme::pal().drop }
+fn ON_BG() -> u32 { crate::theme::pal().on_bg }
 
 // 优先级：0=不选（默认），1..4 对应四象限
-const PRIORITIES: [(u8, &str, &str, u32); 4] = [
-    (1, "Ⅰ", "重要且紧急", RED),
-    (2, "Ⅱ", "重要但不紧急", ORANGE),
-    (3, "Ⅲ", "紧急但不重要", BLUE),
-    (4, "Ⅳ", "不重要不紧急", SLATE),
-];
+fn PRIORITIES() -> [(u8, &'static str, &'static str, u32); 4] {
+    [
+        (1, "Ⅰ", "重要且紧急", RED()),
+        (2, "Ⅱ", "重要但不紧急", ORANGE()),
+        (3, "Ⅲ", "紧急但不重要", BLUE()),
+        (4, "Ⅳ", "不重要不紧急", SLATE()),
+    ]
+}
 
 fn priority_label(p: u8) -> &'static str {
     match p {
@@ -66,10 +69,10 @@ fn priority_label(p: u8) -> &'static str {
 
 fn priority_badge(p: u8) -> Option<(&'static str, u32)> {
     match p {
-        1 => Some(("Ⅰ", RED)),
-        2 => Some(("Ⅱ", ORANGE)),
-        3 => Some(("Ⅲ", BLUE)),
-        4 => Some(("Ⅳ", SLATE)),
+        1 => Some(("Ⅰ", RED())),
+        2 => Some(("Ⅱ", ORANGE())),
+        3 => Some(("Ⅲ", BLUE())),
+        4 => Some(("Ⅳ", SLATE())),
         _ => None,
     }
 }
@@ -555,7 +558,7 @@ impl DialogUi {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: DL_W, h: self.h };
+        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: DL_W, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
         self.paint(&p);
         self.ulw();
     }
@@ -646,7 +649,7 @@ impl DialogUi {
                 let n = match list {
                     0 => events::REMIND_VALUES.len(),
                     1 => events::REPEAT_MENU_LEN,
-                    _ => 1 + PRIORITIES.len(),
+                    _ => 1 + PRIORITIES().len(),
                 };
                 let ph = n as f32 * LIST_ROW + 8.0;
                 (194.0, py(ph), 190.0, ph)
@@ -656,7 +659,7 @@ impl DialogUi {
 
     fn paint(&mut self, p: &Painter) {
         p.clear();
-        p.fill_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, BG_PAGE);
+        p.fill_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, BG_PAGE());
         p.stroke_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, 1.0, gdi::argb(120, 62, 135, 250));
         self.regions.clear();
 
@@ -678,9 +681,9 @@ impl DialogUi {
                 }
             }
         };
-        p.text(title, 16.0, 0.0, 160.0, TITLE_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL);
+        p.text(title, 16.0, 0.0, 160.0, TITLE_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL());
         let close_hov = self.hover == Some(DlAction::Close);
-        p.text("✕", DL_W - 38.0, 7.0, 30.0, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if close_hov { WHITE } else { SUB });
+        p.text("✕", DL_W - 38.0, 7.0, 30.0, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if close_hov { ON_BG() } else { SUB() });
         Self::hit_add(&mut self.regions, DL_W - 40.0, 6.0, 32.0, 32.0, DlAction::Close);
         Self::hit_add(&mut self.regions, 0.0, 0.0, DL_W - 46.0, TITLE_H, DlAction::Drag);
 
@@ -698,8 +701,8 @@ impl DialogUi {
                 self.paint_text_card(p, y, 56.0, "输入日程名称");
                 y += 56.0 + GAP;
                 // 全天（开关点击区与开关图形对齐）
-                p.fill_round(14.0, y, 372.0, 54.0, 8.0, CARD_BG);
-                p.text("全天", 20.0, y, 80.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                p.fill_round(14.0, y, 372.0, 54.0, 8.0, CARD_BG());
+                p.text("全天", 20.0, y, 80.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
                 self.paint_switch(p, DL_W - 52.0, y + 18.0, self.all_day);
                 Self::hit_add(&mut self.regions, 328.0, y + 8.0, 64.0, 38.0, DlAction::ToggleAllDay);
                 y += 54.0 + GAP;
@@ -717,7 +720,7 @@ impl DialogUi {
         let bw = 110.0;
         let bx = (DL_W - bw) / 2.0;
         let save_hov = self.hover == Some(DlAction::Save);
-        p.fill_round(bx, y, bw, SAVE_H, 8.0, if save_hov { BLUE_HOV } else { BLUE });
+        p.fill_round(bx, y, bw, SAVE_H, 8.0, if save_hov { BLUE_HOV() } else { BLUE() });
         p.text("保存", bx, y, bw, SAVE_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.5, false, false, WHITE);
         Self::hit_add(&mut self.regions, bx, y, bw, SAVE_H, DlAction::Save);
 
@@ -736,17 +739,17 @@ impl DialogUi {
 
     /// 文本输入卡片（待办内容多行 / 日程名称单行）
     fn paint_text_card(&mut self, p: &Painter, y: f32, ch: f32, placeholder: &str) {
-        p.fill_round(14.0, y, 372.0, ch, 8.0, FIELD_BG);
-        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB });
+        p.fill_round(14.0, y, 372.0, ch, 8.0, FIELD_BG());
+        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB() });
         Self::hit_add(&mut self.regions, 14.0, y, 372.0, ch, DlAction::Noop);
         let mut shown = self.text_mut().clone();
         shown.push_str(&self.comp);
         let tx = 26.0;
         let tw = 348.0;
         if shown.is_empty() {
-            p.text(placeholder, tx, y + 8.0, tw, ch - 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM);
+            p.text(placeholder, tx, y + 8.0, tw, ch - 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
             if self.caret_on {
-                p.line(tx + 1.0, y + 14.0, tx + 1.0, y + ch - 14.0, 1.2, ROW_TXT);
+                p.line(tx + 1.0, y + 14.0, tx + 1.0, y + ch - 14.0, 1.2, ROW_TXT());
             }
             return;
         }
@@ -755,25 +758,25 @@ impl DialogUi {
         let max_lines = ((ch - 16.0) / lh).floor().max(1.0) as usize;
         let skip = lines.len().saturating_sub(max_lines);
         for (i, line) in lines.iter().skip(skip).enumerate() {
-            p.text(line, tx, y + 8.0 + i as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text(line, tx, y + 8.0 + i as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         }
         if self.caret_on {
             let last = &lines[lines.len() - 1];
             let w = p.measure(last, 12.5, false, false).0;
             let cy = y + 8.0 + (lines.len() - 1 - skip) as f32 * lh;
-            p.line(tx + w + 2.0, cy + 3.0, tx + w + 2.0, cy + lh - 3.0, 1.2, ROW_TXT);
+            p.line(tx + w + 2.0, cy + 3.0, tx + w + 2.0, cy + lh - 3.0, 1.2, ROW_TXT());
         }
     }
 
     /// 优先级行（下拉选择，默认不选）
     fn paint_priority_row(&mut self, p: &Painter, y: f32) {
-        p.fill_round(14.0, y, 372.0, 52.0, 8.0, CARD_BG);
+        p.fill_round(14.0, y, 372.0, 52.0, 8.0, CARD_BG());
         let action = DlAction::DropRow(2);
         let hov = self.hover == Some(action);
         if hov {
-            p.fill_round(16.0, y + 7.0, 368.0, 38.0, 6.0, HOVER_BG);
+            p.fill_round(16.0, y + 7.0, 368.0, 38.0, 6.0, HOVER_BG());
         }
-        p.text("优先级", 20.0, y, 80.0, 52.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+        p.text("优先级", 20.0, y, 80.0, 52.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         let (vx, vw) = (70.0, DL_W - 118.0);
         if let Some((numeral, color)) = priority_badge(self.priority) {
             // 徽标 + 文本右对齐为一组
@@ -782,11 +785,11 @@ impl DialogUi {
             let total = 16.0 + 6.0 + tw;
             let sx = vx + vw - total;
             self.paint_badge(p, sx, y + 18.0, 16.0, numeral, color);
-            p.text(label, sx + 22.0, y + 7.0, tw + 8.0, 38.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text(label, sx + 22.0, y + 7.0, tw + 8.0, 38.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         } else {
-            p.text("不选", vx, y + 7.0, vw, 38.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB);
+            p.text("不选", vx, y + 7.0, vw, 38.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB());
         }
-        p.text("\u{E70D}", DL_W - 44.0, y + 7.0, 24.0, 38.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB);
+        p.text("\u{E70D}", DL_W - 44.0, y + 7.0, 24.0, 38.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB());
         Self::hit_add(&mut self.regions, 16.0, y + 7.0, 368.0, 38.0, action);
     }
 
@@ -796,7 +799,7 @@ impl DialogUi {
     }
 
     fn paint_switch(&self, p: &Painter, x: f32, y: f32, on: bool) {
-        p.fill_round(x, y, 36.0, 18.0, 9.0, if on { BLUE } else { gdi::argb(255, 0x3A, 0x44, 0x5A) });
+        p.fill_round(x, y, 36.0, 18.0, 9.0, if on { BLUE() } else { gdi::argb(255, 0x3A, 0x44, 0x5A) });
         let kx = if on { x + 36.0 - 9.0 - 2.0 } else { x + 2.0 + 7.0 };
         p.fill_circle(kx, y + 9.0, 7.0, WHITE);
     }
@@ -808,10 +811,10 @@ impl DialogUi {
         } else {
             164.0
         };
-        p.fill_round(14.0, y, 372.0, card_h, 8.0, CARD_BG);
+        p.fill_round(14.0, y, 372.0, card_h, 8.0, CARD_BG());
         let mut ry = y + 6.0;
         if with_toggle {
-            p.text("时间", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text("时间", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
             self.paint_switch(p, DL_W - 52.0, ry + 10.0, self.time_on);
             // 点击区与开关图形对齐（348..384）
             Self::hit_add(&mut self.regions, 328.0, ry, 64.0, ROW_H, DlAction::ToggleTime);
@@ -825,32 +828,32 @@ impl DialogUi {
         // 开始 / 结束 / 提醒 / 重复
         for (i, label) in ["开始", "结束", "提醒", "重复"].iter().enumerate() {
             if i > 0 {
-                p.line(20.0, ry, DL_W - 20.0, ry, 1.0, gdi::argb(10, 255, 255, 255));
+                p.line(20.0, ry, DL_W - 20.0, ry, 1.0, crate::theme::ov(10));
             }
             let action = if i < 2 { DlAction::PickRow(i) } else { DlAction::DropRow(i - 2) };
             let hov = self.hover == Some(action);
             if hov {
-                p.fill_round(16.0, ry, 368.0, ROW_H, 6.0, HOVER_BG);
+                p.fill_round(16.0, ry, 368.0, ROW_H, 6.0, HOVER_BG());
             }
-            p.text(*label, 20.0, ry, 60.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text(*label, 20.0, ry, 60.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
             let vx = 70.0;
             let vw = DL_W - 118.0;
             match i {
                 0 => {
                     let s = if self.kind == Kind::Agenda && self.all_day { events::fmt_date_cn(self.a_start.date()) } else { events::fmt_dt_cn(self.a_start) };
-                    p.text(&s, vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                    p.text(&s, vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
                 }
                 1 => {
                     let s = if self.kind == Kind::Agenda && self.all_day { events::fmt_date_cn(self.a_end.date()) } else { events::fmt_dt_cn(self.a_end) };
-                    p.text(&s, vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+                    p.text(&s, vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
                 }
                 2 => {
-                    p.text(&events::remind_label(self.remind), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
-                    p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB);
+                    p.text(&events::remind_label(self.remind), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+                    p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB());
                 }
                 _ => {
-                    p.text(&self.repeat_pill_label(), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
-                    p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB);
+                    p.text(&self.repeat_pill_label(), vx, ry, vw, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+                    p.text("\u{E70D}", DL_W - 44.0, ry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB());
                 }
             }
             Self::hit_add(&mut self.regions, 16.0, ry, 368.0, ROW_H, action);
@@ -862,10 +865,10 @@ impl DialogUi {
     fn paint_recur_extra(&mut self, p: &Painter, y: f32) -> f32 {
         let rows = self.recur_extra_rows();
         let ch = 12.0 + ROW_H * rows as f32;
-        p.fill_round(14.0, y, 372.0, ch, 8.0, CARD_BG);
+        p.fill_round(14.0, y, 372.0, ch, 8.0, CARD_BG());
         let mut ry = y + 6.0;
         if self.scope_date.is_some() {
-            p.text("修改范围", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+            p.text("修改范围", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
             let pills = [("整个系列", true), ("仅这一天", false)];
             let mut px = DL_W - 20.0 - 76.0 * 2.0 - 8.0;
             for (label, on) in pills {
@@ -873,31 +876,31 @@ impl DialogUi {
                 let action = DlAction::ScopeSeries(on);
                 let hov = self.hover == Some(action);
                 if sel || hov {
-                    p.fill_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, if sel { SEL_BG } else { HOVER_BG });
+                    p.fill_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, if sel { SEL_BG() } else { HOVER_BG() });
                 } else {
-                    p.stroke_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, 1.0, BORDER_SUB);
+                    p.stroke_round(px, ry + 8.0, 76.0, ROW_H - 16.0, 6.0, 1.0, BORDER_SUB());
                 }
-                p.text(label, px, ry, 76.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { WHITE } else { ROW_TXT });
+                p.text(label, px, ry, 76.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { ON_BG() } else { ROW_TXT() });
                 Self::hit_add(&mut self.regions, px, ry, 76.0, ROW_H, action);
                 px += 84.0;
             }
-            p.line(20.0, ry + ROW_H, DL_W - 20.0, ry + ROW_H, 1.0, gdi::argb(10, 255, 255, 255));
+            p.line(20.0, ry + ROW_H, DL_W - 20.0, ry + ROW_H, 1.0, crate::theme::ov(10));
             ry += ROW_H;
         }
-        p.text("重复至", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT);
+        p.text("重复至", 20.0, ry, 80.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         self.paint_switch(p, DL_W - 52.0, ry + 10.0, self.until_on);
         Self::hit_add(&mut self.regions, DL_W - 60.0, ry, 56.0, ROW_H, DlAction::ToggleUntil);
         let pick = DlAction::PickRow(2);
         let hov = self.hover == Some(pick);
         if hov {
-            p.fill_round(16.0, ry, 320.0, ROW_H, 6.0, HOVER_BG);
+            p.fill_round(16.0, ry, 320.0, ROW_H, 6.0, HOVER_BG());
         }
         let label = if self.until_on {
             events::fmt_date_cn(self.until_dt.date())
         } else {
             "无限重复".to_string()
         };
-        p.text(&label, 70.0, ry, 230.0, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, if self.until_on { ROW_TXT } else { SUB });
+        p.text(&label, 70.0, ry, 230.0, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, if self.until_on { ROW_TXT() } else { SUB() });
         if self.until_on {
             Self::hit_add(&mut self.regions, 70.0, ry, 230.0, ROW_H, pick);
         }
@@ -911,24 +914,24 @@ impl DialogUi {
         let (px, py, pw, ph) = self.drop_rect();
         // 重复至只选日期（无时间步）
         let timed = row != 2 && (self.kind == Kind::Todo || !self.all_day);
-        p.fill_round(px, py, pw, ph, 10.0, DROP_BG);
+        p.fill_round(px, py, pw, ph, 10.0, DROP_BG());
         p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
 
         // 月份切换
         let prev_hov = self.hover == Some(DlAction::PickMonthPrev);
         let next_hov = self.hover == Some(DlAction::PickMonthNext);
-        p.fill_round(px + 8.0, py + 8.0, 28.0, 26.0, 6.0, if prev_hov { HOVER_BG } else { gdi::argb(0, 0, 0, 0) });
-        p.text("\u{E76B}", px + 8.0, py + 8.0, 28.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, true, if prev_hov { WHITE } else { SUB });
-        p.fill_round(px + pw - 36.0, py + 8.0, 28.0, 26.0, 6.0, if next_hov { HOVER_BG } else { gdi::argb(0, 0, 0, 0) });
-        p.text("\u{E76C}", px + pw - 36.0, py + 8.0, 28.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, true, if next_hov { WHITE } else { SUB });
-        p.text(&format!("{}年{}月", by, bm), px + 40.0, py + 8.0, pw - 80.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
+        p.fill_round(px + 8.0, py + 8.0, 28.0, 26.0, 6.0, if prev_hov { HOVER_BG() } else { gdi::argb(0, 0, 0, 0) });
+        p.text("\u{E76B}", px + 8.0, py + 8.0, 28.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, true, if prev_hov { ON_BG() } else { SUB() });
+        p.fill_round(px + pw - 36.0, py + 8.0, 28.0, 26.0, 6.0, if next_hov { HOVER_BG() } else { gdi::argb(0, 0, 0, 0) });
+        p.text("\u{E76C}", px + pw - 36.0, py + 8.0, 28.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, true, if next_hov { ON_BG() } else { SUB() });
+        p.text(&format!("{}年{}月", by, bm), px + 40.0, py + 8.0, pw - 80.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
         Self::hit_add(&mut self.regions, px + 8.0, py + 8.0, 28.0, 26.0, DlAction::PickMonthPrev);
         Self::hit_add(&mut self.regions, px + pw - 36.0, py + 8.0, 28.0, 26.0, DlAction::PickMonthNext);
 
         // 星期表头 + 日格
         let cw = pw / 7.0;
         for (i, w) in ["日", "一", "二", "三", "四", "五", "六"].iter().enumerate() {
-            p.text(*w, px + i as f32 * cw, py + 40.0, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, SUB);
+            p.text(*w, px + i as f32 * cw, py + 40.0, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, SUB());
         }
         let first_wd = match NaiveDate::from_ymd_opt(by, bm, 1) {
             Some(d) => d.weekday().num_days_from_sunday() as i32,
@@ -950,16 +953,16 @@ impl DialogUi {
             let is_sel = d0 == sel_date;
             let is_today = d0 == today;
             if is_sel {
-                p.fill_circle(cx + cw / 2.0, cy + 13.0, 11.0, BLUE);
+                p.fill_circle(cx + cw / 2.0, cy + 13.0, 11.0, BLUE());
             } else if is_today {
-                p.stroke_circle(cx + cw / 2.0, cy + 13.0, 11.0, 1.0, BLUE);
+                p.stroke_circle(cx + cw / 2.0, cy + 13.0, 11.0, 1.0, BLUE());
             }
-            p.text(&format!("{}", day), cx, cy, cw, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if is_sel { WHITE } else if is_today { BLUE } else { ROW_TXT });
+            p.text(&format!("{}", day), cx, cy, cw, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if is_sel { WHITE } else if is_today { BLUE() } else { ROW_TXT() });
             Self::hit_add(&mut self.regions, cx, cy, cw, 26.0, DlAction::PickDay(idx));
         }
 
         // 底部：当前日期 + 下一步（带时间）/ 完成（全天）
-        p.text(&events::fmt_date_cn(self.row_dt(row).date()), px + 14.0, py + 222.0, 170.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+        p.text(&events::fmt_date_cn(self.row_dt(row).date()), px + 14.0, py + 222.0, 170.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
         let (label, action) = if timed { ("下一步", DlAction::PickNext) } else { ("完成", DlAction::PickDone) };
         self.paint_panel_btn(p, px + pw - 92.0, py + 226.0, 84.0, 28.0, label, action);
     }
@@ -969,12 +972,12 @@ impl DialogUi {
         let Some(Drop::Time { row, h_off, m_off, .. }) = &self.drop else { return };
         let (row, h_off, m_off) = (*row, *h_off, *m_off);
         let (px, py, pw, _ph) = self.drop_rect();
-        p.fill_round(px, py, pw, 274.0, 10.0, DROP_BG);
+        p.fill_round(px, py, pw, 274.0, 10.0, DROP_BG());
         p.stroke_round(px, py, pw, 274.0, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
 
         // 当前时间
         let dt = self.row_dt(row);
-        p.text(&format!("{:02}:{:02}", dt.hour(), dt.minute()), px, py + 6.0, pw, 22.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, true, false, BLUE);
+        p.text(&format!("{:02}:{:02}", dt.hour(), dt.minute()), px, py + 6.0, pw, 22.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, true, false, BLUE());
 
         // 时 / 分列表（可见 8 行，滚轮滚动）
         let ly = py + 34.0;
@@ -982,7 +985,7 @@ impl DialogUi {
         for (li, prefix) in ["时", "分"].iter().enumerate() {
             let lx = if li == 0 { px + 18.0 } else { px + pw - 140.0 };
             let lw = 122.0;
-            p.fill_round(lx, ly, lw, lhh, 6.0, gdi::argb(10, 255, 255, 255));
+            p.fill_round(lx, ly, lw, lhh, 6.0, crate::theme::ov(10));
             let (maxv, cur) = if li == 0 { (23, dt.hour() as i32) } else { (59, dt.minute() as i32) };
             let off = if li == 0 { h_off } else { m_off };
             for k in 0..PICK_VISIBLE {
@@ -995,9 +998,9 @@ impl DialogUi {
                 let sel = v == cur;
                 let hov = self.hover == Some(action);
                 if hov && !sel {
-                    p.fill_round(lx + 4.0, iy, lw - 8.0, PICK_ROW, 4.0, HOVER_BG);
+                    p.fill_round(lx + 4.0, iy, lw - 8.0, PICK_ROW, 4.0, HOVER_BG());
                 }
-                p.text(&format!("{:02}{}", v, prefix), lx, iy, lw, PICK_ROW, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if sel { BLUE } else { ROW_TXT });
+                p.text(&format!("{:02}{}", v, prefix), lx, iy, lw, PICK_ROW, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if sel { BLUE() } else { ROW_TXT() });
                 Self::hit_add(&mut self.regions, lx, iy, lw, PICK_ROW, action);
             }
         }
@@ -1009,9 +1012,9 @@ impl DialogUi {
 
     fn paint_panel_btn(&mut self, p: &Painter, x: f32, y: f32, w: f32, h: f32, label: &str, action: DlAction) {
         let hov = self.hover == Some(action);
-        p.fill_round(x, y, w, h, 8.0, if hov { gdi::argb(34, 255, 255, 255) } else { gdi::argb(16, 255, 255, 255) });
-        p.stroke_round(x, y, w, h, 8.0, 1.0, BORDER_SUB);
-        p.text(label, x, y, w, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
+        p.fill_round(x, y, w, h, 8.0, if hov { crate::theme::ov(34) } else { crate::theme::ov(16) });
+        p.stroke_round(x, y, w, h, 8.0, 1.0, BORDER_SUB());
+        p.text(label, x, y, w, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
         Self::hit_add(&mut self.regions, x, y, w, h, action);
     }
 
@@ -1029,12 +1032,12 @@ impl DialogUi {
         let Some(Drop::List { list, .. }) = &self.drop else { return };
         let list = *list;
         let (px, py, pw, ph) = self.drop_rect();
-        p.fill_round(px, py, pw, ph, 10.0, DROP_BG);
+        p.fill_round(px, py, pw, ph, 10.0, DROP_BG());
         p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
         let n = match list {
             0 => events::REMIND_VALUES.len(),
             1 => events::REPEAT_MENU_LEN,
-            _ => 1 + PRIORITIES.len(),
+            _ => 1 + PRIORITIES().len(),
         };
         for i in 0..n {
             let iy = py + 4.0 + i as f32 * LIST_ROW;
@@ -1049,30 +1052,30 @@ impl DialogUi {
                     }
                 }
                 _ => {
-                    let v = if i == 0 { 0 } else { PRIORITIES[i - 1].0 };
+                    let v = if i == 0 { 0 } else { PRIORITIES()[i - 1].0 };
                     v == self.priority
                 }
             };
             let hov = self.hover == Some(action);
             if hov || sel {
-                p.fill_round(px + 4.0, iy, pw - 8.0, LIST_ROW - 2.0, 6.0, if sel { SEL_BG } else { HOVER_BG });
+                p.fill_round(px + 4.0, iy, pw - 8.0, LIST_ROW - 2.0, 6.0, if sel { SEL_BG() } else { HOVER_BG() });
             }
             if list == 2 {
                 // 优先级：首项“不选”，其后带罗马数字徽标
                 if i == 0 {
-                    p.text("不选", px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
-                } else if let Some((_, numeral, label, color)) = PRIORITIES.get(i - 1) {
+                    p.text("不选", px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE() } else { ROW_TXT() });
+                } else if let Some((_, numeral, label, color)) = PRIORITIES().get(i - 1) {
                     self.paint_badge(p, px + 12.0, iy + 6.0, 16.0, numeral, *color);
-                    p.text(*label, px + 34.0, iy, pw - 44.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
+                    p.text(*label, px + 34.0, iy, pw - 44.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE() } else { ROW_TXT() });
                 }
             } else if list == 1 && i >= events::REPEAT_MENU_MIN {
                 // 按天重复项（跟在分钟级重复之后）
                 let label = events::recur_label(events::RECUR_VALUES[i - events::REPEAT_MENU_MIN]);
-                p.text(&label, px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
+                p.text(&label, px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE() } else { ROW_TXT() });
             } else {
                 let v = if list == 0 { events::REMIND_VALUES.get(i).copied().flatten() } else { events::REPEAT_VALUES.get(i).copied().flatten() };
                 let label = if list == 0 { events::remind_label(v) } else { events::repeat_label(v) };
-                p.text(&label, px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE } else { ROW_TXT });
+                p.text(&label, px + 16.0, iy, pw - 28.0, LIST_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if sel { BLUE() } else { ROW_TXT() });
             }
             Self::hit_add(&mut self.regions, px + 4.0, iy, pw - 8.0, LIST_ROW - 2.0, action);
         }
@@ -1622,7 +1625,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 _ => {
                     if i == 0 {
                         f.priority = 0;
-                    } else if let Some((v, _, _, _)) = PRIORITIES.get(i - 1) {
+                    } else if let Some((v, _, _, _)) = PRIORITIES().get(i - 1) {
                         f.priority = *v;
                     }
                 }

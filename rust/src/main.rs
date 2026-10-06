@@ -13,10 +13,12 @@ mod ics;
 mod lunar;
 mod lunar_data;
 mod motto;
+mod net;
 mod overlay;
 mod recur_menu;
 mod reminder;
 mod sidebar;
+mod theme;
 mod toast;
 mod tray;
 mod uia_clock;
@@ -123,6 +125,8 @@ fn main() {
 
     let config = config::Config::load();
     config::init_flags(&config);
+    gdi::set_text_scale(config.ui_font_scale);
+    theme::set_mode(config.theme);
     let holidays = ics::load_cache();
     // 历史上的今天：删除不是当天的缓存数据
     history::purge_stale();

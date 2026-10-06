@@ -147,8 +147,16 @@ fn save_todos(list: &[Todo]) {
     }
 }
 
-/// 新增待办（日期右键“新增待办”弹窗）
+/// 新增待办（日期右键“新增待办”弹窗），并请求日历重绘。
+/// 注意：不能在持有 flyout UI 锁的上下文调用（flyout_repaint 会重入 UI 锁死锁）——
+/// 日程页底部快捷添加请用 add_todo_quiet 后自行补 sidebar_repaint/redraw。
 pub fn add_todo_full(todo: Todo) {
+    add_todo_quiet(todo);
+    crate::flyout::flyout_repaint();
+}
+
+/// 新增待办（全局列表），不触发任何窗口重绘（调用方自行刷新）
+pub fn add_todo_quiet(todo: Todo) {
     if todo.text.trim().is_empty() {
         return;
     }
@@ -161,8 +169,6 @@ pub fn add_todo_full(todo: Todo) {
     let list = g.get_or_insert_with(|| cached);
     list.push(todo);
     save_todos(list);
-    drop(g);
-    crate::flyout::flyout_repaint();
 }
 
 /// 全局下标取待办（编辑弹窗预填用）
@@ -173,7 +179,7 @@ pub fn todo_at(gi: usize) -> Option<Todo> {
 /// 某日实际生效的待办（下标对应全局列表中的顺序）。
 /// 重复待办在命中日子展开一条（尊重截止日与“仅此次”例外），done 反映当天的完成记录；
 /// 列表按 时间→优先级 排序。
-fn todos_for(key: &str) -> Vec<(usize, Todo)> {
+pub fn todos_for(key: &str) -> Vec<(usize, Todo)> {
     let date = chrono::NaiveDate::parse_from_str(key, "%Y-%m-%d").ok();
     let mut out: Vec<(usize, Todo)> = todos()
         .into_iter()
@@ -325,8 +331,16 @@ pub fn toggle_todo_on(gi: usize, date_key: &str) {
     crate::flyout::flyout_repaint();
 }
 
-/// 删除待办（全局下标）
+/// 删除待办（全局下标），并请求日历重绘。
+/// 注意：不能在持有 flyout UI 锁的上下文调用（flyout_repaint 会重入 UI 锁死锁）——
+/// 日程页合并列表的删除请用 remove_todo_at_quiet 后自行补 sidebar_repaint/redraw。
 pub fn remove_todo_at(gi: usize) {
+    remove_todo_at_quiet(gi);
+    crate::flyout::flyout_repaint();
+}
+
+/// 删除待办（全局下标），不触发任何窗口重绘（调用方自行刷新）
+pub fn remove_todo_at_quiet(gi: usize) {
     let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
     let list = g.get_or_insert_with(|| cached);
@@ -334,8 +348,6 @@ pub fn remove_todo_at(gi: usize) {
         list.remove(gi);
         save_todos(list);
     }
-    drop(g);
-    crate::flyout::flyout_repaint();
 }
 
 /// 编辑替换待办（全局下标；done/id 沿用原条目）
@@ -786,7 +798,7 @@ impl SidebarUi {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h };
+        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
         self.paint(&p);
         self.ulw();
 
@@ -885,7 +897,7 @@ impl SidebarUi {
         self.agenda_rows.clear();
 
         // 页面底
-        p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE);
+        p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE());
 
         let mut y = 8.0;
         let cx = 16.0;
@@ -902,9 +914,9 @@ impl SidebarUi {
                     y += h + 8.0;
                 }
                 "events" => {
-                    p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG);
+                    p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
                     let text = self.next_event_text(date, today);
-                    p.text(&text, cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                    p.text(&text, cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
                     y += 44.0 + 8.0;
                 }
                 "agenda" => {
@@ -933,18 +945,18 @@ impl SidebarUi {
                         }
                     };
                     if items.is_empty() {
-                        p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG);
-                        p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                        p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
+                        p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
                         y += 44.0 + 8.0;
                     } else {
                         let n = items.len().min(3);
                         let h = 8.0 + 18.0 + n as f32 * 18.0 + 8.0;
-                        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-                        p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
+                        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
+                        p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
                         for (i, (y2, t)) in items.iter().take(3).enumerate() {
                             let ytxt = if *y2 < 0 { format!("公元前{}年", -y2) } else { format!("{}年", y2) };
                             let line = format!("{}：{}", ytxt, t);
-                            p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT);
+                            p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT());
                         }
                         y += h + 8.0;
                     }
@@ -969,17 +981,17 @@ impl SidebarUi {
                     let over_h = if over_rows > 0 { over_rows as f32 * 20.0 + 4.0 } else { 0.0 };
                     let more_h = if more { 16.0 } else { 0.0 };
                     let h = 8.0 + 18.0 + 4.0 + over_h + list_h + more_h + 8.0;
-                    p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
-                    p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL);
+                    p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
+                    p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
                     // 清除已完成（存在已完成条目时显示）
                     if has_done_todos() {
                         let bhov = self.hover == Some(SbAction::TodoClearDone);
-                        p.text("清除已完成", cx + cw - 84.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE } else { SUB_DIM });
+                        p.text("清除已完成", cx + cw - 84.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { SUB_DIM() });
                         self.regions.push((gdi::RectF { x: cx + cw - 90.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoClearDone));
                     }
                     let mut ry = y + 28.0;
                     if todos.is_empty() && over_rows == 0 {
-                        p.text("暂无待办", cx, ry, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+                        p.text("暂无待办", cx, ry, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
                         ry += 18.0;
                     }
                     // 逾期区（红字，带原日期前缀；“→”顺延到今天）
@@ -1005,7 +1017,7 @@ impl SidebarUi {
                         ry += 20.0;
                     }
                     if more {
-                        p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, ry, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
+                        p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, ry, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM());
                     }
                     y += h + 8.0;
                 }
@@ -1014,16 +1026,16 @@ impl SidebarUi {
         }
 
         // 卡片管理
-        p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE);
+        p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE());
         self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 24.0 }, SbAction::CardManage));
     }
 
     /// 待办单行：勾选圈 + 优先级色点 + 文本（可带前缀）+（逾期的加“→”顺延）+ 编辑/删除
     fn paint_todo_row(&mut self, p: &Painter, cx: f32, cw: f32, ry: f32, gi: usize, td: &Todo, label: &str, red: bool, overdue: bool) {
-        let col = if td.done { SUB_DIM } else if red { RED } else { ROW_TXT };
-        p.stroke_circle(cx + 21.0, ry + 10.0, 5.0, 1.2, if td.done { BLUE } else { SUB });
+        let col = if td.done { SUB_DIM() } else if red { RED() } else { ROW_TXT() };
+        p.stroke_circle(cx + 21.0, ry + 10.0, 5.0, 1.2, if td.done { BLUE() } else { SUB() });
         if td.done {
-            p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE);
+            p.fill_circle(cx + 21.0, ry + 10.0, 3.0, BLUE());
         }
         let mut tx = cx + 36.0;
         if let Some(pc) = priority_color(td.priority) {
@@ -1033,37 +1045,38 @@ impl SidebarUi {
         p.text(label, tx, ry, cx + cw - 58.0 - tx, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
         if td.done {
             let w = p.measure(label, 12.0, false, false).0;
-            p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM);
+            p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM());
         }
         if overdue {
             let ph = self.hover == Some(SbAction::TodoPostpone(gi));
-            p.text("→", cx + cw - 76.0, ry, 20.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if ph { BLUE } else { RED });
+            p.text("→", cx + cw - 76.0, ry, 20.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if ph { BLUE() } else { RED() });
             self.regions.push((gdi::RectF { x: cx + cw - 78.0, y: ry, w: 22.0, h: 20.0 }, SbAction::TodoPostpone(gi)));
         }
         let ed_hover = self.hover == Some(SbAction::TodoEdit(gi));
-        p.text("✎", cx + cw - 52.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, if ed_hover { BLUE } else { SUB_DIM });
+        p.text("✎", cx + cw - 52.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, if ed_hover { BLUE() } else { SUB_DIM() });
         let del_hover = self.hover == Some(SbAction::TodoDelete(gi));
-        p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+        p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED() } else { SUB_DIM() });
         self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoToggle(gi)));
         self.regions.push((gdi::RectF { x: cx + cw - 54.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoEdit(gi)));
         self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::TodoDelete(gi)));
     }
 
     fn paint_date_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, date: NaiveDate, today: NaiveDate) {
-        p.fill_round(cx, y, cw, 84.0, 10.0, POPUP_BG);
+        p.fill_round(cx, y, cw, 84.0, 10.0, POPUP_BG());
         let ix = cx + 14.0;
         let iy = y + 13.0;
         p.fill_round(ix, iy, 48.0, 48.0, 7.0, WHITE);
-        p.fill_round(ix, iy, 48.0, 13.0, 6.0, RED);
+        p.stroke_round(ix, iy, 48.0, 48.0, 7.0, 1.0, crate::theme::ov(34));
+        p.fill_round(ix, iy, 48.0, 13.0, 6.0, RED());
         p.fill_round(ix, iy + 9.0, 48.0, 39.0, 6.0, WHITE);
-        p.fill_circle(ix + 13.0, iy + 1.0, 2.2, RED);
-        p.fill_circle(ix + 35.0, iy + 1.0, 2.2, RED);
-        p.text(&format!("{}", date.day()), ix, iy + 11.0, 48.0, 36.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 23.0, true, false, BLUE);
+        p.fill_circle(ix + 13.0, iy + 1.0, 2.2, RED());
+        p.fill_circle(ix + 35.0, iy + 1.0, 2.2, RED());
+        p.text(&format!("{}", date.day()), ix, iy + 11.0, 48.0, 36.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 23.0, true, false, BLUE());
 
         let tx = ix + 58.0;
         let tw = cx + cw - 14.0 - tx - 48.0;
         let wd = ["日", "一", "二", "三", "四", "五", "六"][date.weekday().num_days_from_sunday() as usize];
-        p.text(&format!("{}年{}月{}日 星期{}", date.year(), date.month(), date.day(), wd), tx, y + 12.0, tw + 40.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL);
+        p.text(&format!("{}年{}月{}日 星期{}", date.year(), date.month(), date.day(), wd), tx, y + 12.0, tw + 40.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL());
 
         // 相对今天徽标
         let rel = (date - today).num_days();
@@ -1076,18 +1089,18 @@ impl SidebarUi {
         };
         let bw = p.measure(&tag, 10.0, false, false).0 + 14.0;
         let bx = cx + cw - 14.0 - bw;
-        p.fill_round(bx, y + 11.0, bw, 18.0, 9.0, BLUE);
+        p.fill_round(bx, y + 11.0, bw, 18.0, 9.0, BLUE());
         p.text(&tag, bx, y + 11.0, bw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, WHITE);
 
         let l = crate::lunar::solar_to_lunar(date);
-        p.text(&almanac::day_week_line(date), tx, y + 35.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+        p.text(&almanac::day_week_line(date), tx, y + 35.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
         if let Some(l) = l {
-            p.text(&almanac::lunar_ganzhi_line(&l, date), tx, y + 52.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+            p.text(&almanac::lunar_ganzhi_line(&l, date), tx, y + 52.0, cw - 28.0 - 62.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
         }
     }
 
     fn paint_almanac_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
-        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
+        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
         let zhi = almanac::jianzhi(date);
         let (yi, ji) = almanac::jianzhi_yiji(zhi);
         let max_w = cw - 28.0 - 32.0 - 8.0 - 36.0;
@@ -1099,7 +1112,7 @@ impl SidebarUi {
             p.fill_round(cx + 14.0, ry + (row_h - 22.0) / 2.0, 22.0, 22.0, 5.0, bg);
             p.text(label, cx + 14.0, ry + (row_h - 22.0) / 2.0, 22.0, 22.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, true, false, fg);
             for (i, line) in lines.iter().enumerate() {
-                p.text(line, cx + 14.0 + 30.0, ry + (row_h - lines.len() as f32 * 16.0) / 2.0 + i as f32 * 16.0, max_w, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
+                p.text(line, cx + 14.0 + 30.0, ry + (row_h - lines.len() as f32 * 16.0) / 2.0 + i as f32 * 16.0, max_w, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
             }
             ry += row_h + 5.0;
         }
@@ -1114,12 +1127,12 @@ impl SidebarUi {
         let total = chars.len() as f32 * 17.0;
         let start = by + (bh - total) / 2.0;
         for (i, ch) in chars.iter().enumerate() {
-            p.text(&ch.to_string(), bx, start + i as f32 * 17.0, 26.0, 17.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE);
+            p.text(&ch.to_string(), bx, start + i as f32 * 17.0, 26.0, 17.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
         }
     }
 
     fn paint_agenda_card(&mut self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
-        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
+        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
         // 解析当日生效日程（含按天重复展开），缓存原 key/下标供编辑/删除定位
         let rows = crate::events::agenda_on(&self.agenda.lock().unwrap(), date);
         self.agenda_rows = rows.clone();
@@ -1127,10 +1140,10 @@ impl SidebarUi {
         self.agenda_count = n;
         let wd = ["日", "一", "二", "三", "四", "五", "六"][date.weekday().num_days_from_sunday() as usize];
         if n == 0 {
-            p.text(&format!("{}年{}月{}日 星期{} 还没有日程", date.year(), date.month(), date.day(), wd), cx, y, cw, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB);
+            p.text(&format!("{}年{}月{}日 星期{} 还没有日程", date.year(), date.month(), date.day(), wd), cx, y, cw, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
             return;
         }
-        p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL);
+        p.text(&format!("{}年{}月{}日 星期{} 日程", date.year(), date.month(), date.day(), wd), cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, TITLE_COL());
         let list_top = y + 28.0;
         self.agenda_band = (list_top, list_top + AGENDA_VISIBLE as f32 * 20.0);
         let off = self.agenda_scroll.min(n.saturating_sub(AGENDA_VISIBLE));
@@ -1138,26 +1151,26 @@ impl SidebarUi {
             let ry = list_top + (vi - off) as f32 * 20.0;
             let text = crate::events::display(item);
             let ed_hov = self.hover == Some(SbAction::AgendaEdit(vi));
-            p.text(&text, cx + 14.0, ry, cw - 48.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if ed_hov { BLUE } else { ROW_TXT });
+            p.text(&text, cx + 14.0, ry, cw - 48.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, if ed_hov { BLUE() } else { ROW_TXT() });
             // 行体点击 → 编辑弹窗
             self.regions.push((gdi::RectF { x: cx + 12.0, y: ry, w: cw - 48.0, h: 18.0 }, SbAction::AgendaEdit(vi)));
             let del_hover = self.hover == Some(SbAction::AgendaDelete(vi));
-            p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED } else { SUB_DIM });
+            p.text("✕", cx + cw - 30.0, ry, 18.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if del_hover { RED() } else { SUB_DIM() });
             self.regions.push((gdi::RectF { x: cx + cw - 32.0, y: ry, w: 20.0, h: 20.0 }, SbAction::AgendaDelete(vi)));
         }
         if n > AGENDA_VISIBLE {
-            p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, list_top + AGENDA_VISIBLE as f32 * 20.0, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM);
+            p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, list_top + AGENDA_VISIBLE as f32 * 20.0, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM());
         }
     }
 
     fn paint_motto_card(&self, p: &Painter, cx: f32, y: f32, cw: f32, h: f32, date: NaiveDate) {
-        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG);
+        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
         let (quote, author) = self.motto_content(date);
         let lines = wrap_chars(p, &quote, cw - 28.0);
         for (i, line) in lines.iter().enumerate() {
-            p.text(line, cx + 14.0, y + 10.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT);
+            p.text(line, cx + 14.0, y + 10.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
         }
-        p.text(&format!("—— {}", author), cx + 14.0, y + h - 22.0, cw - 28.0, 16.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB);
+        p.text(&format!("—— {}", author), cx + 14.0, y + h - 22.0, cw - 28.0, 16.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB());
     }
 
     fn next_event_text(&self, date: NaiveDate, today: NaiveDate) -> String {
@@ -1439,15 +1452,15 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
     }
 }
 
-// 需要的附加颜色/常量
-const BG_PAGE: u32 = gdi::argb(255, 0x20, 0x28, 0x38);
-const POPUP_BG: u32 = gdi::argb(255, 0x26, 0x30, 0x42);
-const TITLE_COL: u32 = gdi::argb(255, 0xDF, 0xE5, 0xEC);
-const ROW_TXT: u32 = gdi::argb(255, 0xD7, 0xDD, 0xE4);
-const SUB: u32 = gdi::argb(255, 0x9A, 0xA1, 0xA9);
-const SUB_DIM: u32 = gdi::argb(255, 0x5C, 0x66, 0x73);
-const BLUE: u32 = gdi::argb(255, 0x3E, 0x87, 0xFA);
-const RED: u32 = gdi::argb(255, 0xE5, 0x4B, 0x4B);
+// 需要的附加颜色/常量（取自 theme 色板）
+fn BG_PAGE() -> u32 { crate::theme::pal().bg }
+fn POPUP_BG() -> u32 { crate::theme::pal().card }
+fn TITLE_COL() -> u32 { crate::theme::pal().title }
+fn ROW_TXT() -> u32 { crate::theme::pal().row }
+fn SUB() -> u32 { crate::theme::pal().sub }
+fn SUB_DIM() -> u32 { crate::theme::pal().dim }
+fn BLUE() -> u32 { crate::theme::pal().blue }
+fn RED() -> u32 { crate::theme::pal().red }
 const WHITE: u32 = gdi::argb(255, 255, 255, 255);
 
 /// 优先级色点颜色（与新建待办弹窗一致）

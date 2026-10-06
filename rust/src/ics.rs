@@ -166,7 +166,27 @@ fn add_event(
 }
 
 pub fn fetch_map(url: &str) -> Option<HolidayMap> {
-    let resp = ureq::get(url)
+    fetch_map_once(url).or_else(|| {
+        // 主源失败且 URL 是默认 jsdelivr 域名时，换官方镜像域名重试（自定义 URL 不动）
+        let (host, path) = split_host_path(url)?;
+        if host != "cdn.jsdelivr.net" {
+            return None;
+        }
+        ["fastly.jsdelivr.net", "gcore.jsdelivr.net"]
+            .iter()
+            .find_map(|m| fetch_map_once(&format!("https://{}{}", m, path)))
+    })
+}
+
+fn split_host_path(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("https://")?;
+    let i = rest.find('/')?;
+    Some((&rest[..i], &rest[i..]))
+}
+
+fn fetch_map_once(url: &str) -> Option<HolidayMap> {
+    let resp = crate::net::agent()
+        .get(url)
         .timeout(std::time::Duration::from_secs(20))
         .call()
         .ok()?;

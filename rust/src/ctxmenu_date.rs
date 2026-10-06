@@ -174,7 +174,7 @@ impl DateMenuUi {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
         let cache_ptr: *const Cache = &self.cache;
-        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: CM_W, h: 76.0 };
+        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: CM_W, h: 76.0, dc: self.mem_dc, scan0: self.scan0 };
         self.paint(&p);
         self.ulw();
     }
@@ -208,8 +208,8 @@ impl DateMenuUi {
 
     fn paint(&mut self, p: &Painter) {
         p.clear();
-        p.fill_round(0.0, 0.0, CM_W, 76.0, 10.0, POPUP_BG);
-        p.stroke_round(0.0, 0.0, CM_W, 76.0, 10.0, 1.0, gdi::argb(26, 255, 255, 255));
+        p.fill_round(0.0, 0.0, CM_W, 76.0, 10.0, POPUP_BG());
+        p.stroke_round(0.0, 0.0, CM_W, 76.0, 10.0, 1.0, crate::theme::ov(26));
         let items: [(DmAction, &str); 2] = [(DmAction::AddAgenda, "新增日程"), (DmAction::AddTodo, "新增待办")];
         self.regions.clear();
         for (i, (act, name)) in items.iter().enumerate() {
@@ -217,9 +217,9 @@ impl DateMenuUi {
             self.regions.push((gdi::RectF { x: 6.0, y, w: CM_W - 12.0, h: CM_ROW - 2.0 }, *act));
             let hov = self.hover == Some(*act);
             if hov {
-                p.fill_round(6.0, y, CM_W - 12.0, CM_ROW - 2.0, 6.0, gdi::argb(16, 255, 255, 255));
+                p.fill_round(6.0, y, CM_W - 12.0, CM_ROW - 2.0, 6.0, crate::theme::ov(16));
             }
-            p.text(name, 18.0, y, CM_W - 30.0, CM_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, ROW_TXT);
+            p.text(name, 18.0, y, CM_W - 30.0, CM_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, ROW_TXT());
         }
     }
 }

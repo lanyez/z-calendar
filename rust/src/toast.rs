@@ -22,11 +22,12 @@ const MARGIN: i32 = 12;
 /// 稍后提醒的间隔（毫秒）
 const SNOOZE_MS: i64 = 10 * 60 * 1000;
 
-const BG: u32 = gdi::argb(246, 0x20, 0x28, 0x38);
-const BORDER: u32 = gdi::argb(40, 255, 255, 255);
-const BLUE: u32 = gdi::argb(255, 0x3E, 0x87, 0xFA);
+fn BG() -> u32 { crate::theme::pal().toast_bg }
+fn BORDER() -> u32 { crate::theme::ov(40) }
+fn BLUE() -> u32 { crate::theme::pal().blue }
 const WHITE: u32 = gdi::argb(255, 255, 255, 255);
-const SUB: u32 = gdi::argb(170, 255, 255, 255);
+fn SUB() -> u32 { crate::theme::ov(170) }
+fn ON_BG() -> u32 { crate::theme::pal().on_bg }
 
 /// 卡片附带动作：待办提醒可一键完成（按 id 定位；重复待办按日子记录完成）
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
@@ -111,6 +112,8 @@ fn done_rect(item_y: f32) -> (f32, f32, f32, f32) {
 struct ToastUi {
     hwnd: usize,
     mem_dc: usize,
+    /// 后台 DIBSection 像素指针（GDI ClearType 文本路径用）
+    scan0: *mut u8,
     bmp: gdi::Gp,
     g: gdi::Gp,
     cache: Cache,
@@ -219,6 +222,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     *TOAST_UI.lock().unwrap() = Some(SendToast(Box::new(ToastUi {
         hwnd: hwnd as usize,
         mem_dc,
+        scan0: bits as *mut u8,
         bmp,
         g,
         cache: Cache::new(),
@@ -336,7 +340,7 @@ fn repaint(f: &mut ToastUi) {
         let cache_ptr: *const Cache = &f.cache;
         GdipSetSmoothingMode(f.g, gdi::SMOOTH_ANTI_ALIAS);
         GdipSetTextRenderingHint(f.g, gdi::text_hint());
-        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 };
+        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32, dc: f.mem_dc, scan0: f.scan0 };
         p.clear();
         let n = f.items.len();
         for (i, it) in f.items.iter().enumerate() {
@@ -365,19 +369,19 @@ fn repaint(f: &mut ToastUi) {
 
 fn paint_pill(p: &Painter, rect: (f32, f32, f32, f32), label: &str, hov: bool) {
     let (x, y, w, h) = rect;
-    p.fill_round(x, y, w, h, h / 2.0, if hov { gdi::argb(46, 255, 255, 255) } else { gdi::argb(20, 255, 255, 255) });
-    p.stroke_round(x, y, w, h, h / 2.0, 1.0, BORDER);
-    p.text(label, x, y, w, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if hov { WHITE } else { SUB });
+    p.fill_round(x, y, w, h, h / 2.0, if hov { crate::theme::ov(46) } else { crate::theme::ov(20) });
+    p.stroke_round(x, y, w, h, h / 2.0, 1.0, BORDER());
+    p.text(label, x, y, w, h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if hov { ON_BG() } else { SUB() });
 }
 
 fn paint_item(p: &Painter, y: f32, it: &Item, hover_btn: Option<u8>) {
-    p.fill_round(0.0, y, TOAST_W, ITEM_H, 10.0, BG);
-    p.stroke_round(0.5, y + 0.5, TOAST_W - 1.0, ITEM_H - 1.0, 10.0, 1.0, BORDER);
+    p.fill_round(0.0, y, TOAST_W, ITEM_H, 10.0, BG());
+    p.stroke_round(0.5, y + 0.5, TOAST_W - 1.0, ITEM_H - 1.0, 10.0, 1.0, BORDER());
     // 铃铛图标
     p.fill_circle(28.0, y + ITEM_H / 2.0, 14.0, gdi::argb(60, 62, 135, 250));
-    p.text("\u{E7E7}", 14.0, y + ITEM_H / 2.0 - 14.0, 28.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, false, true, BLUE);
+    p.text("\u{E7E7}", 14.0, y + ITEM_H / 2.0 - 14.0, 28.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, false, true, BLUE());
     // 标题 + 正文（最多两行，超出截断加省略号）
-    p.text(&it.title, 52.0, y + 8.0, TOAST_W - 66.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, true, false, WHITE);
+    p.text(&it.title, 52.0, y + 8.0, TOAST_W - 66.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, true, false, ON_BG());
     let max_w = TOAST_W - 66.0 - 8.0;
     let mut cur = String::new();
     let mut lines: Vec<String> = Vec::new();
@@ -402,7 +406,7 @@ fn paint_item(p: &Painter, y: f32, it: &Item, hover_btn: Option<u8>) {
         l2.push('…');
         lines[1] = l2;
     }
-    p.text(&lines.join(""), 52.0, y + 25.0, TOAST_W - 66.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB);
+    p.text(&lines.join(""), 52.0, y + 25.0, TOAST_W - 66.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB());
     // 操作按钮：待办 = 完成 + 稍后；其他 = 稍后
     if it.has_done() {
         paint_pill(p, done_rect(y), "完成", hover_btn == Some(2));

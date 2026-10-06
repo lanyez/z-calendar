@@ -23,9 +23,9 @@ extern "system" {
 const RM_W: f32 = 186.0;
 const RM_ROW: f32 = 34.0;
 const RM_H: f32 = RM_ROW * 2.0 + 8.0;
-const POPUP_BG: u32 = gdi::argb(255, 0x2A, 0x33, 0x45);
-const ROW_TXT: u32 = gdi::argb(255, 0xD7, 0xDD, 0xE4);
-const RED: u32 = gdi::argb(255, 0xE5, 0x4B, 0x4B);
+fn POPUP_BG() -> u32 { crate::theme::pal().popup }
+fn ROW_TXT() -> u32 { crate::theme::pal().row }
+fn RED() -> u32 { crate::theme::pal().red }
 
 static RM_HWND: AtomicUsize = AtomicUsize::new(0);
 static RM_UI: Mutex<Option<SendRm>> = Mutex::new(None);
@@ -187,7 +187,7 @@ impl RecurMenuUi {
             unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
         }
         let cache_ptr: *const Cache = &self.cache;
-        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: RM_W, h: RM_H };
+        let p = Painter { g: self.g, cache: cache_ptr, sf: gdi::scale(), w: RM_W, h: RM_H, dc: self.mem_dc, scan0: self.scan0 };
         unsafe {
             GdipSetSmoothingMode(self.g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(self.g, gdi::text_hint());
@@ -225,16 +225,16 @@ impl RecurMenuUi {
 
     fn paint(&mut self, p: &Painter) {
         p.clear();
-        p.fill_round(0.0, 0.0, RM_W, RM_H, 10.0, POPUP_BG);
-        p.stroke_round(0.0, 0.0, RM_W, RM_H, 10.0, 1.0, gdi::argb(26, 255, 255, 255));
-        let items: [(RmAction, &str, u32); 2] = [(RmAction::ThisDay, "仅删除这一天", ROW_TXT), (RmAction::Series, "删除整个系列", RED)];
+        p.fill_round(0.0, 0.0, RM_W, RM_H, 10.0, POPUP_BG());
+        p.stroke_round(0.0, 0.0, RM_W, RM_H, 10.0, 1.0, crate::theme::ov(26));
+        let items: [(RmAction, &str, u32); 2] = [(RmAction::ThisDay, "仅删除这一天", ROW_TXT()), (RmAction::Series, "删除整个系列", RED())];
         self.regions.clear();
         for (i, (act, name, col)) in items.iter().enumerate() {
             let y = 4.0 + RM_ROW * i as f32;
             self.regions.push((gdi::RectF { x: 6.0, y, w: RM_W - 12.0, h: RM_ROW - 2.0 }, *act));
             let hov = self.hover == Some(*act);
             if hov {
-                p.fill_round(6.0, y, RM_W - 12.0, RM_ROW - 2.0, 6.0, gdi::argb(16, 255, 255, 255));
+                p.fill_round(6.0, y, RM_W - 12.0, RM_ROW - 2.0, 6.0, crate::theme::ov(16));
             }
             p.text(name, 18.0, y, RM_W - 30.0, RM_ROW - 2.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, *col);
         }
@@ -250,7 +250,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-            let mut guard = RM_UI.lock().unwrap();
+        let mut guard = RM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();
@@ -259,13 +259,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if hit != f.hover {
                     f.hover = hit;
-                    f.redraw();
+        f.redraw();
                 }
             }
             0
         }
         WM_LBUTTONDOWN => {
-            let mut guard = RM_UI.lock().unwrap();
+        let mut guard = RM_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();

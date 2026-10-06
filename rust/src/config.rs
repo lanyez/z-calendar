@@ -9,6 +9,12 @@ fn def_true() -> bool {
 fn def_week_start() -> u32 {
     0 // 星期一
 }
+fn def_font_scale() -> f32 {
+    1.0
+}
+fn def_theme() -> u8 {
+    1 // 默认深色主题
+}
 fn def_ics() -> String {
     DEFAULT_ICS_URL.to_string()
 }
@@ -40,6 +46,12 @@ pub struct Config {
     pub show_week_num: bool,    // 显示周数
     #[serde(default = "def_week_start")]
     pub week_start: u32,        // 一周开始：0=星期一 ... 6=星期日
+    /// 界面字号系数（1.0/1.1/1.25）
+    #[serde(default = "def_font_scale")]
+    pub ui_font_scale: f32,
+    /// 主题：0=跟随系统 1=深色（默认） 2=浅色
+    #[serde(default = "def_theme")]
+    pub theme: u8,
     // 其他
     #[serde(default = "def_ics")]
     pub ics_url: String,
@@ -146,6 +158,8 @@ impl Default for Config {
             motto_type: "d".to_string(),
             sidebar_todo: true,
             sidebar_order: Vec::new(),
+            ui_font_scale: 1.0,
+            theme: 1,
         }
     }
 }
