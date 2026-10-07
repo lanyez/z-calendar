@@ -60,6 +60,9 @@ pub struct Config {
     /// 提醒弹窗伴随提示音
     #[serde(default = "def_true")]
     pub remind_sound: bool,
+    /// 提醒走系统通知中心（Win10/11 Toast；失败自动回退内置卡片）
+    #[serde(default = "def_true")]
+    pub use_system_toast: bool,
     // 侧栏卡片（点击日期弹出的侧边栏）
     #[serde(default = "def_true")]
     pub sidebar_date: bool,      // 日期信息
@@ -149,6 +152,7 @@ impl Default for Config {
             ics_url: DEFAULT_ICS_URL.to_string(),
             last_ics_update: 0,
             remind_sound: true,
+            use_system_toast: true,
             sidebar_date: true,
             sidebar_almanac: true,
             sidebar_events: true,
@@ -204,6 +208,7 @@ pub fn load_json_or_bak<T: serde::de::DeserializeOwned>(path: &PathBuf) -> (Opti
 
 static HOUR12: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REMIND_SOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SYS_TOAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn hour12_on() -> bool {
     HOUR12.load(std::sync::atomic::Ordering::Relaxed)
@@ -217,11 +222,19 @@ pub fn remind_sound_on() -> bool {
 pub fn set_remind_sound(v: bool) {
     REMIND_SOUND.store(v, std::sync::atomic::Ordering::Relaxed);
 }
+/// 提醒是否走系统通知中心（提醒线程高频读取走原子缓存）
+pub fn use_system_toast_on() -> bool {
+    SYS_TOAST.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_use_system_toast(v: bool) {
+    SYS_TOAST.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 启动时从配置同步原子缓存
 pub fn init_flags(cfg: &Config) {
     set_hour12(cfg.hour12);
     set_remind_sound(cfg.remind_sound);
+    set_use_system_toast(cfg.use_system_toast);
 }
 
 fn config_path() -> PathBuf {

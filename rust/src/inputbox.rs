@@ -109,6 +109,10 @@ enum DlAction {
     PickDone, // 完成（关闭面板）
     PickNext, // 日期 → 时间
     PickPrev, // 时间 → 日期
+    /// 选择面板底部直接键入框：点击定位光标
+    PickInput,
+    /// 直接键入应用（回车/按钮）
+    PickApply,
     ListItem(usize),
     Noop,
 }
@@ -120,6 +124,17 @@ enum Drop {
     Time { row: usize, h_off: i32, m_off: i32, anchor: f32 },
     /// 下拉列表：0=提醒 1=重复 2=优先级
     List { list: usize, anchor: f32 },
+}
+
+/// 选择面板底部的直接键入编辑器（日期：10-8 9:30；时间：0930 / 9:30）
+#[derive(Clone)]
+struct PickEdit {
+    text: String,
+    comp: String,
+    caret: usize,
+    sel: Option<usize>,
+    /// 解析失败提示（文本, 警示色）
+    hint: Option<(String, bool)>,
 }
 
 impl Drop {
@@ -162,6 +177,11 @@ struct DialogUi {
     scope_date: Option<NaiveDate>,
     comp: String,
     caret_on: bool,
+    /// 主文本（日程名/待办内容）光标（char 下标）与选区锚点
+    caret: usize,
+    sel: Option<usize>,
+    /// 选择面板打开时的“直接键入日期/时间”编辑器
+    pick: Option<PickEdit>,
     drop: Option<Drop>,
     regions: Vec<(gdi::RectF, DlAction)>,
     hover: Option<DlAction>,
@@ -294,6 +314,9 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             scope_date: None,
             comp: String::new(),
             caret_on: true,
+            caret: 0,
+            sel: None,
+            pick: None,
             drop: None,
             regions: Vec::new(),
             hover: None,
@@ -436,6 +459,9 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
                 f.scope_series = true;
                 f.scope_date = None;
                 f.caret_on = true;
+                f.caret = 0;
+                f.sel = None;
+                f.pick = None;
                 f.drop = None;
                 f.hover = None;
                 f.edit_agenda = None;
@@ -635,7 +661,8 @@ impl DialogUi {
         }
     }
 
-    /// 下拉/选择面板矩形（x, y, w, h），锚定并钳制在窗口内
+    /// 下拉/选择面板矩形（x, y, w, h），锚定并钳制在窗口内。
+    /// 日期/时间面板底部带“直接键入”行（高 300/312）
     fn drop_rect(&self) -> (f32, f32, f32, f32) {
         let Some(d) = &self.drop else { return (0.0, 0.0, 0.0, 0.0) };
         let anchor = d.anchor();
@@ -643,8 +670,8 @@ impl DialogUi {
         let pw = 300.0;
         let py = |ph: f32| (anchor + 30.0).min(self.h - ph - 6.0).max(48.0);
         match d {
-            Drop::Date { .. } => (px, py(264.0), pw, 264.0),
-            Drop::Time { .. } => (px, py(274.0), pw, 274.0),
+            Drop::Date { .. } => (px, py(300.0), pw, 300.0),
+            Drop::Time { .. } => (px, py(312.0), pw, 312.0),
             Drop::List { list, .. } => {
                 let n = match list {
                     0 => events::REMIND_VALUES.len(),
@@ -737,15 +764,19 @@ impl DialogUi {
         }
     }
 
-    /// 文本输入卡片（待办内容多行 / 日程名称单行）
+    /// 文本输入卡片（待办内容多行 / 日程名称单行）：
+    /// 光标按位置绘制、选区高亮、IME 组合串内联在光标处
     fn paint_text_card(&mut self, p: &Painter, y: f32, ch: f32, placeholder: &str) {
         p.fill_round(14.0, y, 372.0, ch, 8.0, FIELD_BG());
         p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB() });
         Self::hit_add(&mut self.regions, 14.0, y, 372.0, ch, DlAction::Noop);
-        let mut shown = self.text_mut().clone();
-        shown.push_str(&self.comp);
         let tx = 26.0;
         let tw = 348.0;
+        let text = self.text_mut().clone();
+        // 组合串显示在光标处
+        let chars: Vec<char> = text.chars().collect();
+        let pos = self.caret.min(chars.len());
+        let shown: String = chars[..pos].iter().copied().chain(self.comp.chars()).chain(chars[pos..].iter().copied()).collect();
         if shown.is_empty() {
             p.text(placeholder, tx, y + 8.0, tw, ch - 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
             if self.caret_on {
@@ -753,18 +784,47 @@ impl DialogUi {
             }
             return;
         }
-        let lines = wrap_lines(p, &shown, tw);
+        let layout = layout_lines(p, &shown, tw);
         let lh = 19.0;
         let max_lines = ((ch - 16.0) / lh).floor().max(1.0) as usize;
-        let skip = lines.len().saturating_sub(max_lines);
-        for (i, line) in lines.iter().skip(skip).enumerate() {
+        let skip = layout.len().saturating_sub(max_lines);
+        // 选区高亮（IME 组合中不显示选区）
+        if self.comp.is_empty() {
+            let (sa, sb) = crate::textedit::sel_range(&text, self.caret, self.sel);
+            if sa < sb {
+                for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
+                    let le = ls + line.chars().count();
+                    let a = sa.max(*ls);
+                    let b = sb.min(le);
+                    if a < b {
+                        let pre_a: String = line.chars().take(a - ls).collect();
+                        let pre_b: String = line.chars().take(b - ls).collect();
+                        let x1 = tx + p.measure(&pre_a, 12.5, false, false).0;
+                        let x2 = tx + p.measure(&pre_b, 12.5, false, false).0;
+                        p.fill_round(x1, y + 10.0 + (li - skip) as f32 * lh, (x2 - x1).max(3.0), lh - 4.0, 3.0, SEL_BG());
+                    }
+                }
+            }
+        }
+        for (i, (line, _)) in layout.iter().enumerate().skip(skip) {
             p.text(line, tx, y + 8.0 + i as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         }
+        // 光标：组合串之后的位置
         if self.caret_on {
-            let last = &lines[lines.len() - 1];
-            let w = p.measure(last, 12.5, false, false).0;
-            let cy = y + 8.0 + (lines.len() - 1 - skip) as f32 * lh;
-            p.line(tx + w + 2.0, cy + 3.0, tx + w + 2.0, cy + lh - 3.0, 1.2, ROW_TXT());
+            let caret_shown = pos + self.comp.chars().count();
+            let mut found: Option<(usize, f32)> = None;
+            for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
+                let len = line.chars().count();
+                if caret_shown >= *ls && caret_shown <= ls + len {
+                    let col = caret_shown - ls;
+                    let pre: String = line.chars().take(col).collect();
+                    found = Some((li - skip, p.measure(&pre, 12.5, false, false).0));
+                }
+            }
+            if let Some((row, w)) = found {
+                let cy = y + 8.0 + row as f32 * lh;
+                p.line(tx + w + 1.0, cy + 3.0, tx + w + 1.0, cy + lh - 3.0, 1.2, ROW_TXT());
+            }
         }
     }
 
@@ -965,15 +1025,18 @@ impl DialogUi {
         p.text(&events::fmt_date_cn(self.row_dt(row).date()), px + 14.0, py + 222.0, 170.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
         let (label, action) = if timed { ("下一步", DlAction::PickNext) } else { ("完成", DlAction::PickDone) };
         self.paint_panel_btn(p, px + pw - 92.0, py + 226.0, 84.0, 28.0, label, action);
+
+        // 直接键入行：支持 10-8 9:30 / 明天 / 周五 等（回车或“应用”生效）
+        self.paint_pick_input(p, px, py + 260.0, pw, "直接输入：10-8 9:30");
     }
 
-    /// 时间选择面板（时/分列表 + 上一步/完成）
+    /// 时间选择面板（时/分列表 + 上一步/完成 + 直接键入）
     fn paint_time_panel(&mut self, p: &Painter) {
         let Some(Drop::Time { row, h_off, m_off, .. }) = &self.drop else { return };
         let (row, h_off, m_off) = (*row, *h_off, *m_off);
         let (px, py, pw, _ph) = self.drop_rect();
-        p.fill_round(px, py, pw, 274.0, 10.0, DROP_BG());
-        p.stroke_round(px, py, pw, 274.0, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
+        p.fill_round(px, py, pw, 312.0, 10.0, DROP_BG());
+        p.stroke_round(px, py, pw, 312.0, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
 
         // 当前时间
         let dt = self.row_dt(row);
@@ -1005,9 +1068,89 @@ impl DialogUi {
             }
         }
 
-        // 底部：上一步 / 完成
+        // 底部：上一步 / 完成 + 直接键入行
         self.paint_panel_btn(p, px + 44.0, py + 236.0, 84.0, 28.0, "上一步", DlAction::PickPrev);
         self.paint_panel_btn(p, px + pw - 128.0, py + 236.0, 84.0, 28.0, "完成", DlAction::PickDone);
+        self.paint_pick_input(p, px, py + 272.0, pw, "直接输入：0930 / 9:30");
+    }
+
+    /// 选择面板底部“直接键入”行：输入框 + 应用按钮；解析失败在框内提示
+    fn paint_pick_input(&mut self, p: &Painter, px: f32, iy: f32, pw: f32, placeholder: &str) {
+        let Some(pk) = self.pick.clone() else { return };
+        let ih = 32.0;
+        p.fill_round(px + 14.0, iy, pw - 106.0, ih, 6.0, FIELD_BG());
+        p.stroke_round(px + 14.0, iy, pw - 106.0, ih, 6.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB() });
+        Self::hit_add(&mut self.regions, px + 14.0, iy, pw - 106.0, ih, DlAction::PickInput);
+        let tx = px + 22.0;
+        let tw = pw - 122.0;
+        let chars: Vec<char> = pk.text.chars().collect();
+        let pos = pk.caret.min(chars.len());
+        let shown: String = chars[..pos].iter().copied().chain(pk.comp.chars()).chain(chars[pos..].iter().copied()).collect();
+        if shown.is_empty() {
+            // 解析失败提示优先于占位文本
+            match &pk.hint {
+                Some((msg, warn)) => {
+                    p.text(msg, tx, iy, tw, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, if *warn { RED() } else { BLUE() });
+                }
+                None => {
+                    p.text(placeholder, tx, iy, tw, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB_DIM());
+                }
+            }
+            if self.caret_on {
+                p.line(tx, iy + 6.0, tx, iy + ih - 6.0, 1.2, ROW_TXT());
+            }
+        } else {
+            if pk.comp.is_empty() {
+                let (sa, sb) = crate::textedit::sel_range(&pk.text, pk.caret, pk.sel);
+                if sa < sb {
+                    let pre_a: String = chars[..sa].iter().collect();
+                    let pre_b: String = chars[..sb].iter().collect();
+                    let x1 = tx + p.measure(&pre_a, 11.5, false, false).0;
+                    let x2 = tx + p.measure(&pre_b, 11.5, false, false).0;
+                    p.fill_round(x1, iy + 4.0, (x2 - x1).max(3.0), ih - 8.0, 3.0, SEL_BG());
+                }
+            }
+            p.text(&shown, tx, iy, tw, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT());
+            if self.caret_on {
+                let head: String = chars[..pos].iter().collect();
+                let cx = tx + p.measure(&format!("{}{}", head, pk.comp), 11.5, false, false).0 + 1.0;
+                p.line(cx, iy + 6.0, cx, iy + ih - 6.0, 1.2, ROW_TXT());
+            }
+        }
+        // 应用按钮
+        self.paint_panel_btn(p, px + pw - 84.0, iy, 70.0, ih, "应用", DlAction::PickApply);
+    }
+
+    /// 应用直接键入的日期/时间（解析失败在输入框内提示，面板保持打开）
+    fn pick_apply(&mut self, row: usize) {
+        let Some(pk) = self.pick.clone() else { return };
+        let text = pk.text.trim().to_string();
+        if text.is_empty() {
+            self.pick = None;
+            self.drop = None;
+            return;
+        }
+        let base = self.row_dt(row).date();
+        match crate::events::parse_dt_input(&text, base) {
+            Some((day, minute)) => {
+                let src = self.row_dt(row);
+                let mut dt = src;
+                if let Some(d) = day {
+                    dt = date_at(d, src.hour(), src.minute());
+                }
+                if let Some(m) = minute {
+                    dt = date_at(dt.date(), m / 60, m % 60);
+                }
+                self.set_row_dt(row, dt);
+                self.pick = None;
+                self.drop = None;
+            }
+            None => {
+                if let Some(p2) = &mut self.pick {
+                    p2.hint = Some(("无法识别，试试 10-8 9:30".to_string(), true));
+                }
+            }
+        }
     }
 
     fn paint_panel_btn(&mut self, p: &Painter, x: f32, y: f32, w: f32, h: f32, label: &str, action: DlAction) {
@@ -1090,22 +1233,30 @@ fn days_in_month(y: i32, m: u32) -> i32 {
         .unwrap_or(30)
 }
 
-fn wrap_lines(p: &Painter, s: &str, max_w: f32) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// 带换行的逐行布局：(行文本, 行首 char 下标)；'\n' 之间的空段也产生一行
+/// （光标/选区需要 char 下标 ↔ 视觉行映射，逐字符测宽折行）
+fn layout_lines(p: &Painter, s: &str, max_w: f32) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut char_pos = 0usize;
     for para in s.split('\n') {
         if para.is_empty() {
-            out.push(String::new());
+            out.push((String::new(), char_pos));
+            char_pos += 1; // '\n'
             continue;
         }
         let mut cur = String::new();
-        for ch in para.chars() {
-            let cw = p.measure(&ch.to_string(), 12.5, false, false).0;
+        let mut cur_start = char_pos;
+        for chx in para.chars() {
+            let cw = p.measure(&chx.to_string(), 12.5, false, false).0;
             if !cur.is_empty() && p.measure(&cur, 12.5, false, false).0 + cw > max_w {
-                out.push(std::mem::take(&mut cur));
+                out.push((std::mem::take(&mut cur), cur_start));
+                cur_start = char_pos;
             }
-            cur.push(ch);
+            cur.push(chx);
+            char_pos += 1;
         }
-        out.push(cur);
+        out.push((cur, cur_start));
+        char_pos += 1; // '\n'
     }
     out
 }
@@ -1322,12 +1473,12 @@ unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
     out
 }
 
-unsafe fn paste_clipboard(text: &mut String) {
-    let h = IB_HWND.load(Ordering::Relaxed);
-    if OpenClipboard(h as HWND) == 0 {
-        return;
+unsafe fn read_clipboard(hwnd: usize) -> Option<String> {
+    if OpenClipboard(hwnd as HWND) == 0 {
+        return None;
     }
     let h = GetClipboardData(13); // CF_UNICODETEXT
+    let mut out = None;
     if !h.is_null() {
         let ptr = GlobalLock(h as usize);
         if !ptr.is_null() {
@@ -1336,11 +1487,12 @@ unsafe fn paste_clipboard(text: &mut String) {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
-            text.push_str(&String::from_utf16_lossy(slice));
+            out = Some(String::from_utf16_lossy(slice));
             GlobalUnlock(h as usize);
         }
     }
     CloseClipboard();
+    out
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1365,8 +1517,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let f = &mut f.0;
                 if (wp as u32) >= 0x20 {
                     if let Some(ch) = char::from_u32(wp as u32) {
-                        f.text_mut().push(ch);
-                        f.redraw();
+                        if f.drop.is_some() {
+                            // 选择面板打开：字符进“直接键入”框
+                            if let Some(pk) = f.pick.as_mut() {
+                                crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &ch.to_string());
+                                pk.hint = None;
+                                f.redraw();
+                            }
+                        } else {
+                            let text = match f.kind {
+                                Kind::Todo => &mut f.todo_text,
+                                Kind::Agenda => &mut f.agenda_name,
+                            };
+                            crate::textedit::insert(text, &mut f.caret, &mut f.sel, &ch.to_string());
+                            f.redraw();
+                        }
                     }
                 }
             }
@@ -1376,40 +1541,179 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = IB_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
+                let shift = (GetKeyState(0x10) as u16) & 0x8000 != 0;
+                let ctrl = (GetKeyState(0x11) as u16) & 0x8000 != 0;
+                // ---- 选择面板打开：编辑键路由到“直接键入”框 ----
+                if f.drop.is_some() {
+                    let row = match &f.drop {
+                        Some(Drop::Date { row, .. }) | Some(Drop::Time { row, .. }) => *row,
+                        _ => 0,
+                    };
+                    match wp as i32 {
+                        0x1B => {
+                            // Esc：先收面板
+                            f.drop = None;
+                            f.pick = None;
+                            f.redraw();
+                        }
+                        0x0D => {
+                            // 回车应用直接键入（无键入框时关闭面板）
+                            if f.pick.is_some() {
+                                f.pick_apply(row);
+                            } else {
+                                f.drop = None;
+                            }
+                            f.redraw();
+                        }
+                        _ if f.pick.is_some() => {
+                            let Some(pk) = f.pick.as_mut() else { return 0 };
+                            match wp as i32 {
+                                0x08 => crate::textedit::backspace(&mut pk.text, &mut pk.caret, &mut pk.sel),
+                                0x2E => crate::textedit::delete_fwd(&mut pk.text, &mut pk.caret, &mut pk.sel),
+                                0x25 => crate::textedit::move_caret(&pk.text, &mut pk.caret, &mut pk.sel, -1, shift),
+                                0x27 => crate::textedit::move_caret(&pk.text, &mut pk.caret, &mut pk.sel, 1, shift),
+                                0x24 => crate::textedit::home_end(&pk.text, &mut pk.caret, &mut pk.sel, false, shift),
+                                0x23 => crate::textedit::home_end(&pk.text, &mut pk.caret, &mut pk.sel, true, shift),
+                                0x41 if ctrl => crate::textedit::select_all(&pk.text, &mut pk.caret, &mut pk.sel),
+                                0x43 if ctrl => {
+                                    if let Some(t) = crate::textedit::sel_text(&pk.text, pk.caret, pk.sel) {
+                                        unsafe {
+                                            crate::textedit::set_clipboard(f.hwnd, &t);
+                                        }
+                                    }
+                                }
+                                0x58 if ctrl => {
+                                    if let Some(t) = crate::textedit::sel_text(&pk.text, pk.caret, pk.sel) {
+                                        unsafe {
+                                            crate::textedit::set_clipboard(f.hwnd, &t);
+                                        }
+                                        crate::textedit::delete_sel(&mut pk.text, &mut pk.caret, &mut pk.sel);
+                                    }
+                                }
+                                0x56 if ctrl => {
+                                    if let Some(t) = unsafe { read_clipboard(f.hwnd) } {
+                                        crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &t);
+                                        pk.hint = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            f.redraw();
+                        }
+                        _ => {}
+                    }
+                    return 0;
+                }
+                // ---- 主文本（日程名/待办内容）编辑 ----
+                // 字段级借用（text_mut 会整体借用 self，与光标字段冲突）
+                let text = match f.kind {
+                    Kind::Todo => &mut f.todo_text,
+                    Kind::Agenda => &mut f.agenda_name,
+                };
                 match wp as i32 {
                     0x0D => {
                         // 回车：日程确认；待办为多行文本，Ctrl+Enter 确认
-                        let ctrl = (GetKeyState(0x11) as u16) & 0x8000 != 0;
-                        if f.kind == Kind::Agenda || ctrl {
+                        let ctrl2 = (GetKeyState(0x11) as u16) & 0x8000 != 0;
+                        if f.kind == Kind::Agenda || ctrl2 {
                             drop(guard);
                             confirm();
                             return 0;
                         }
-                        f.text_mut().push('\n');
+                        crate::textedit::insert(text, &mut f.caret, &mut f.sel, "\n");
                         f.redraw();
                     }
                     0x1B => {
-                        // Esc：先收起下拉，再取消弹窗
-                        if f.drop.is_some() {
-                            f.drop = None;
-                            f.redraw();
-                        } else {
-                            drop(guard);
-                            cancel();
-                            return 0;
-                        }
+                        // Esc：取消弹窗
+                        drop(guard);
+                        cancel();
+                        return 0;
                     }
                     0x08 => {
-                        f.text_mut().pop();
+                        crate::textedit::backspace(text, &mut f.caret, &mut f.sel);
+                        f.redraw();
+                    }
+                    0x2E => {
+                        // Delete：删除光标后一个字符/选区
+                        crate::textedit::delete_fwd(text, &mut f.caret, &mut f.sel);
                         f.redraw();
                     }
                     0x56 => {
-                        // Ctrl+V 粘贴
-                        if (GetKeyState(0x11) as u16) & 0x8000 != 0 {
-                            let t = f.text_mut();
-                            paste_clipboard(t);
+                        // Ctrl+V 粘贴（替换选区，插入光标处）
+                        if ctrl {
+                            if let Some(t) = unsafe { read_clipboard(f.hwnd) } {
+                                crate::textedit::insert(text, &mut f.caret, &mut f.sel, &t);
+                                f.redraw();
+                            }
+                        }
+                    }
+                    0x41 => {
+                        // Ctrl+A 全选
+                        if ctrl {
+                            crate::textedit::select_all(text, &mut f.caret, &mut f.sel);
                             f.redraw();
                         }
+                    }
+                    0x43 => {
+                        // Ctrl+C 复制
+                        if ctrl {
+                            if let Some(t) = crate::textedit::sel_text(text, f.caret, f.sel) {
+                                unsafe {
+                                    crate::textedit::set_clipboard(f.hwnd, &t);
+                                }
+                            }
+                        }
+                    }
+                    0x58 => {
+                        // Ctrl+X 剪切
+                        if ctrl {
+                            if let Some(t) = crate::textedit::sel_text(text, f.caret, f.sel) {
+                                unsafe {
+                                    crate::textedit::set_clipboard(f.hwnd, &t);
+                                }
+                                crate::textedit::delete_sel(text, &mut f.caret, &mut f.sel);
+                                f.redraw();
+                            }
+                        }
+                    }
+                    0x25 | 0x27 | 0x26 | 0x28 => {
+                        // 左右移动（Shift 扩展选区）/ 上下移动一行；Ctrl+左右按词跳
+                        let ext = shift;
+                        match wp as i32 {
+                            0x25 => {
+                                if ctrl {
+                                    crate::textedit::move_word(text, &mut f.caret, &mut f.sel, false, ext)
+                                } else {
+                                    crate::textedit::move_caret(text, &mut f.caret, &mut f.sel, -1, ext)
+                                }
+                            }
+                            0x27 => {
+                                if ctrl {
+                                    crate::textedit::move_word(text, &mut f.caret, &mut f.sel, true, ext)
+                                } else {
+                                    crate::textedit::move_caret(text, &mut f.caret, &mut f.sel, 1, ext)
+                                }
+                            }
+                            0x26 => crate::textedit::move_line(text, &mut f.caret, &mut f.sel, false, ext),
+                            _ => crate::textedit::move_line(text, &mut f.caret, &mut f.sel, true, ext),
+                        }
+                        f.redraw();
+                    }
+                    0x24 | 0x23 => {
+                        // Home/End（多行文本按行首/行尾；Shift 扩展选区）
+                        let text = f.text_mut().clone();
+                        let pos = f.caret.min(text.chars().count());
+                        if shift && f.sel.is_none() {
+                            f.sel = Some(pos);
+                        }
+                        if !shift {
+                            f.sel = None;
+                        }
+                        f.caret = if wp as i32 == 0x24 {
+                            crate::textedit::line_start(&text, pos)
+                        } else {
+                            crate::textedit::line_end(&text, pos)
+                        };
+                        f.redraw();
                     }
                     _ => {}
                 }
@@ -1422,11 +1726,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let f = &mut f.0;
                 if lp as i32 & GCS_RESULTSTR != 0 {
                     if let Some(s) = read_ime(hwnd, GCS_RESULTSTR) {
-                        f.text_mut().push_str(&s);
-                        f.comp.clear();
+                        if f.drop.is_some() {
+                            if let Some(pk) = f.pick.as_mut() {
+                                crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &s);
+                                pk.comp.clear();
+                                pk.hint = None;
+                            }
+                        } else {
+                            let text = match f.kind {
+                                Kind::Todo => &mut f.todo_text,
+                                Kind::Agenda => &mut f.agenda_name,
+                            };
+                            crate::textedit::insert(text, &mut f.caret, &mut f.sel, &s);
+                            f.comp.clear();
+                        }
                     }
                 } else if lp as i32 & GCS_COMPSTR != 0 {
-                    f.comp = read_ime(hwnd, GCS_COMPSTR).unwrap_or_default();
+                    let s = read_ime(hwnd, GCS_COMPSTR).unwrap_or_default();
+                    if f.drop.is_some() {
+                        if let Some(pk) = f.pick.as_mut() {
+                            pk.comp = s;
+                        }
+                    } else {
+                        f.comp = s;
+                    }
                 }
                 f.redraw();
             }
@@ -1505,6 +1828,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let dt = f.row_dt(row);
                     let anchor = y;
                     f.drop = Some(Drop::Date { row, y: dt.year(), m: dt.month(), anchor });
+                    f.pick = Some(PickEdit { text: String::new(), comp: String::new(), caret: 0, sel: None, hint: None });
                     f.redraw();
                 }
                 Some(DlAction::DropRow(list)) => {
@@ -1543,12 +1867,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     f.redraw();
                 }
                 Some(DlAction::PickNext) => {
-                    // 日期选好 → 进入时间选择（全天日程无此按钮）
+                    // 日期选好 → 进入时间选择（全天日程无此按钮）；键入框保留已输入内容
                     if let Some(Drop::Date { row, anchor, .. }) = f.drop.take() {
                         let dt = f.row_dt(row);
                         let h_off = (dt.hour() as i32 - 3).clamp(0, 23 - PICK_VISIBLE + 1);
                         let m_off = (dt.minute() as i32 - 3).clamp(0, 59 - PICK_VISIBLE + 1);
                         f.drop = Some(Drop::Time { row, h_off, m_off, anchor });
+                        if let Some(pk) = f.pick.as_mut() {
+                            pk.hint = None;
+                        }
                     }
                     f.redraw();
                 }
@@ -1579,6 +1906,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 }
                 Some(DlAction::PickDone) => {
                     f.drop = None;
+                    f.pick = None;
+                    f.redraw();
+                }
+                Some(DlAction::PickInput) => {
+                    // 点击“直接键入”框：光标定位到点击处附近
+                    let (px, py, pw, _ph) = f.drop_rect();
+                    let is_time = matches!(f.drop, Some(Drop::Time { .. }));
+                    let iy = if is_time { py + 272.0 } else { py + 260.0 };
+                    if y >= iy && y < iy + 32.0 {
+                        if let Some(pk) = f.pick.as_mut() {
+                            let w = (x - (px + 14.0) - 8.0).max(0.0);
+                            pk.caret = crate::textedit::caret_at_x_approx(&pk.text, w);
+                            pk.sel = None;
+                        }
+                    }
+                    f.redraw();
+                }
+                Some(DlAction::PickApply) => {
+                    let row = match &f.drop {
+                        Some(Drop::Date { row, .. }) | Some(Drop::Time { row, .. }) => *row,
+                        _ => 0,
+                    };
+                    f.pick_apply(row);
                     f.redraw();
                 }
                 Some(DlAction::ListItem(i)) => {

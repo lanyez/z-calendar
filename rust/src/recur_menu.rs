@@ -292,9 +292,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 let agenda = AGENDA_SHARED.lock().unwrap().clone();
                                 if let Some(a) = agenda {
                                     let mut map = a.lock().unwrap();
-                                    crate::events::agenda_remove_at(&mut map, &key, idx);
+                                    let entry = map.get(&key).and_then(|v| v.get(idx)).cloned();
+                                    let removed = crate::events::agenda_remove_at(&mut map, &key, idx);
                                     crate::events::save(&map);
                                     drop(map);
+                                    if removed {
+                                        if let Some(entry) = entry {
+                                            let body = crate::events::display(&entry);
+                                            crate::toast::notify_undo(crate::toast::UndoData::Agenda { key, idx, entry }, &body);
+                                        }
+                                    }
                                     refresh();
                                 }
                             }
@@ -303,7 +310,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 refresh();
                             }
                             (RmAction::Series, RmTarget::Todo { gi, .. }) => {
-                                crate::sidebar::remove_todo_at(gi);
+                                if let Some(td) = crate::sidebar::todo_at(gi) {
+                                    let body = td.text.clone();
+                                    crate::sidebar::remove_todo_at(gi);
+                                    crate::toast::notify_undo(crate::toast::UndoData::Todos { items: vec![(gi, td)] }, &body);
+                                }
                                 refresh();
                             }
                         }

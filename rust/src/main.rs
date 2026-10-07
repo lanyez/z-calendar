@@ -18,9 +18,11 @@ mod overlay;
 mod recur_menu;
 mod reminder;
 mod sidebar;
+mod textedit;
 mod theme;
 mod toast;
 mod tray;
+mod wnotify;
 mod uia_clock;
 mod weather;
 
@@ -106,7 +108,10 @@ fn main() {
     // 必须先于一切窗口/DPI 相关调用
     unsafe { set_dpi_aware() };
 
-    // 单实例：重复启动时通知已有实例弹出日历，然后退出
+    // 通知中心按钮激活参数（zcal: 前缀）：已有实例时经 IPC 文件转发，否则本实例处理
+    let toast_args: Vec<String> = std::env::args().skip(1).filter(|a| a.starts_with("zcal:")).collect();
+
+    // 单实例：重复启动时通知已有实例弹出日历（或处理通知激活），然后退出
     let show_event: usize;
     unsafe {
         let name: Vec<u16> = "z-calendar-show-event\0".encode_utf16().collect();
@@ -114,8 +119,11 @@ fn main() {
         use winapi::um::winnt::EVENT_MODIFY_STATE;
         let existing = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
         if !existing.is_null() {
+            if !toast_args.is_empty() {
+                let _ = std::fs::write(wnotify::ipc_path(), toast_args.join("\n"));
+            }
             SetEvent(existing);
-            return; // 已有实例在运行：唤醒它弹出日历后退出
+            return; // 已有实例在运行：唤醒它后退出
         }
         let ev = CreateEventW(std::ptr::null_mut(), 0, 0, name.as_ptr());
         show_event = ev as usize;
@@ -155,6 +163,8 @@ fn main() {
     let toast_tx = toast::spawn();
 
     let agenda = Arc::new(Mutex::new(flyout::load_agenda()));
+    // 注册共享句柄：提醒卡片撤销恢复等无窗口上下文的模块读写同一份数据
+    events::set_shared_agenda(agenda.clone());
     let tray = Arc::new(Mutex::new(tray::create(&st.config.lock().unwrap())));
     // 托盘图标可见性按配置（默认显示）
     {
@@ -182,6 +192,24 @@ fn main() {
     // 调试：启动即显示设置窗口
     if std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false) {
         flyout::show_settings();
+    }
+    // 调试：验证通知中心就绪链路（AUMID + 开始菜单快捷方式），结果写 wnotify.log
+    if std::env::var("CAL_WNREADY").map(|v| v == "1").unwrap_or(false) {
+        let ok = wnotify::ensure_ready();
+        let lnk = wnotify::lnk_exists();
+        let _ = std::fs::write(
+            config::data_dir().join("wnotify.log"),
+            format!("ensure_ready={} lnk_exists={} fail_step={} hr={}
+", ok, lnk, crate::wnotify::last_fail(), crate::wnotify::last_hr()),
+        );
+    }
+    // 调试：发一条真实系统通知验证端到端链路（屏幕出现一次测试 Toast）
+    if std::env::var("CAL_WNSHOW").map(|v| v == "1").unwrap_or(false) {
+        wnotify::ensure_ready();
+        let act = toast::Act::TodoDone { id: "test".into(), date: "2026-10-7".into(), recur: false };
+        let ok = wnotify::show_reminder("Z日历 · 通知中心测试", "系统 Toast 发送成功（可点按钮激活）", &act, true);
+        let _ = std::fs::write(config::data_dir().join("wnotify.log"), format!("show_reminder={}
+", ok));
     }
 
     // 修剪工作集：启动完成后内存降到最低（按需自动换回）
@@ -212,6 +240,15 @@ fn main() {
                     use winapi::um::winbase::INFINITE;
                     loop {
                         WaitForSingleObject(ev as winapi::um::winnt::HANDLE, INFINITE);
+                        // 通知中心按钮激活：优先处理 IPC 转发的参数，否则弹出日历
+                        let p = wnotify::ipc_path();
+                        if let Ok(args) = std::fs::read_to_string(&p) {
+                            let _ = std::fs::remove_file(&p);
+                            if !args.trim().is_empty() {
+                                wnotify::dispatch(&args);
+                                continue;
+                            }
+                        }
                         flyout::request_show();
                     }
                 }
@@ -224,6 +261,11 @@ fn main() {
 
     // 提醒引擎：扫描日程/待办到期提醒，经 toast 弹窗通知
     reminder::spawn(toast_tx);
+
+    // 本实例即通知激活的启动目标（无其他实例在跑）：处理按钮参数后常驻
+    if !toast_args.is_empty() {
+        wnotify::dispatch(&toast_args.join("\n"));
+    }
 
     // 主线程消息循环
     unsafe {

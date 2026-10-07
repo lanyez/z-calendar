@@ -84,7 +84,12 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
     let mut changed = false;
     for e in list {
         if e.t <= now {
-            let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone() });
+            // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
+            let sys_ok = crate::config::use_system_toast_on()
+                && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
+            if !sys_ok {
+                let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone(), quiet: false });
+            }
             changed = true;
         } else {
             keep.push(e);
@@ -301,7 +306,12 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         }
         done.insert(dk, slot);
         dirty = true;
-        let _ = tx.send(crate::toast::ToastMsg { title: c.title.clone(), body: c.body.clone(), act: c.act.clone() });
+        // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
+        let sys_ok = crate::config::use_system_toast_on()
+            && crate::wnotify::show_reminder(&c.title, &c.body, &c.act, crate::config::remind_sound_on());
+        if !sys_ok {
+            let _ = tx.send(crate::toast::ToastMsg { title: c.title.clone(), body: c.body.clone(), act: c.act.clone(), quiet: false });
+        }
     }
     if dirty {
         save_done(&done);

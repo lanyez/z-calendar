@@ -29,8 +29,9 @@ const WHITE: u32 = gdi::argb(255, 255, 255, 255);
 fn SUB() -> u32 { crate::theme::ov(170) }
 fn ON_BG() -> u32 { crate::theme::pal().on_bg }
 
-/// 卡片附带动作：待办提醒可一键完成（按 id 定位；重复待办按日子记录完成）
-#[derive(Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
+/// 卡片附带动作：待办提醒可一键完成（按 id 定位；重复待办按日子记录完成）；
+/// 删除操作可撤销（快照数据随卡片携带）
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(tag = "k", content = "v")]
 pub enum Act {
     #[default]
@@ -40,19 +41,43 @@ pub enum Act {
         date: String,
         recur: bool,
     },
+    /// 撤销删除：携带被删条目的快照，点「撤销」原位恢复
+    Undo {
+        data: UndoData,
+    },
 }
 
-/// 提醒投递消息
+/// 删除快照：日程（原 key/下标 + 条目）或待办（原全局下标 + 条目，可批量）
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "k", content = "v")]
+pub enum UndoData {
+    Agenda {
+        key: String,
+        idx: usize,
+        entry: crate::events::AgendaEntry,
+    },
+    Todos {
+        items: Vec<(usize, crate::sidebar::Todo)>,
+    },
+}
+
+/// 提醒投递消息（quiet=true 不播提示音，如撤销卡片）
 #[derive(Clone, Default)]
 pub struct ToastMsg {
     pub title: String,
     pub body: String,
     pub act: Act,
+    pub quiet: bool,
 }
 
 impl ToastMsg {
     pub fn plain(title: &str, body: &str) -> Self {
-        ToastMsg { title: title.into(), body: body.into(), act: Act::None }
+        ToastMsg { title: title.into(), body: body.into(), act: Act::None, quiet: false }
+    }
+
+    /// 删除撤销卡片（无提示音）
+    pub fn undo(data: UndoData, body: &str) -> Self {
+        ToastMsg { title: "已删除".into(), body: body.into(), act: Act::Undo { data }, quiet: true }
     }
 }
 
@@ -65,6 +90,18 @@ pub struct SnoozeEntry {
     pub body: String,
     #[serde(default)]
     pub act: Act,
+}
+
+/// 稍后提醒间隔（通知中心激活补提用）
+pub const SNOOZE_MS_PUB: i64 = SNOOZE_MS;
+
+pub fn now_ms_pub() -> i64 {
+    now_ms()
+}
+
+/// 登记一条稍后提醒（通知中心「稍后10分钟」按钮与内置卡片共用）
+pub fn snooze_add_entry(entry: SnoozeEntry) {
+    snooze_add(entry);
 }
 
 fn snooze_path() -> std::path::PathBuf {
@@ -86,6 +123,7 @@ struct Item {
     title: String,
     body: String,
     act: Act,
+    quiet: bool,
     born: i64,
 }
 
@@ -94,6 +132,11 @@ impl Item {
     fn has_done(&self) -> bool {
         matches!(self.act, Act::TodoDone { .. })
     }
+
+    /// 撤销删除按钮（Act::Undo 才有）
+    fn has_undo(&self) -> bool {
+        matches!(self.act, Act::Undo { .. })
+    }
 }
 
 // 按钮几何（与 paint_item 保持一致）
@@ -101,12 +144,16 @@ const BTN_H: f32 = 20.0;
 const BTN_Y: f32 = 56.0;
 const SNOOZE_W: f32 = 78.0;
 const DONE_W: f32 = 48.0;
+const UNDO_W: f32 = 60.0;
 
 fn snooze_rect(item_y: f32) -> (f32, f32, f32, f32) {
     (TOAST_W - 14.0 - SNOOZE_W, item_y + BTN_Y, SNOOZE_W, BTN_H)
 }
 fn done_rect(item_y: f32) -> (f32, f32, f32, f32) {
     (TOAST_W - 14.0 - SNOOZE_W - 8.0 - DONE_W, item_y + BTN_Y, DONE_W, BTN_H)
+}
+fn undo_rect(item_y: f32) -> (f32, f32, f32, f32) {
+    (TOAST_W - 14.0 - UNDO_W, item_y + BTN_Y, UNDO_W, BTN_H)
 }
 
 struct ToastUi {
@@ -136,6 +183,33 @@ pub fn notify(title: &str, body: &str) {
     if let Some(tx) = TOAST_TX.get() {
         let _ = tx.send(ToastMsg::plain(title, body));
     }
+}
+
+/// 发一条删除撤销卡片（10 秒内可点「撤销」恢复）
+pub fn notify_undo(data: UndoData, body: &str) {
+    if let Some(tx) = TOAST_TX.get() {
+        let _ = tx.send(ToastMsg::undo(data, body));
+    }
+}
+
+/// 撤销删除：按快照把日程/待办原位插回并保存、刷新界面
+fn undo_restore(data: &UndoData) {
+    match data {
+        UndoData::Agenda { key, idx, entry } => {
+            if let Some(agenda) = crate::events::shared_agenda() {
+                let mut map = agenda.lock().unwrap();
+                let v = map.entry(key.clone()).or_default();
+                let pos = (*idx).min(v.len());
+                v.insert(pos, entry.clone());
+                crate::events::save(&map);
+            }
+        }
+        UndoData::Todos { items } => {
+            crate::sidebar::restore_todos(items);
+        }
+    }
+    crate::sidebar::sidebar_repaint();
+    crate::flyout::flyout_repaint();
 }
 
 fn now_ms() -> i64 {
@@ -235,18 +309,20 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     loop {
         // 收取提醒引擎投递 + 过期清理，有变化才重摆/重绘
         let mut dirty = false;
-        let mut pushed = 0usize;
+        let mut pushed_loud = 0usize;
         {
             let mut guard = TOAST_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 while let Ok(m) = rx.try_recv() {
-                    f.items.push(Item { title: m.title, body: m.body, act: m.act, born: now_ms() });
+                    if !m.quiet {
+                        pushed_loud += 1;
+                    }
+                    f.items.push(Item { title: m.title, body: m.body, act: m.act, quiet: m.quiet, born: now_ms() });
                     if f.items.len() > MAX_ITEMS {
                         f.items.remove(0);
                     }
                     dirty = true;
-                    pushed += 1;
                 }
                 let n0 = f.items.len();
                 let now = now_ms();
@@ -261,7 +337,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
                         crate::trim_working_set();
                     }
                 } else {
-                    if pushed > 0 && crate::config::remind_sound_on() {
+                    if pushed_loud > 0 && crate::config::remind_sound_on() {
                         play_alert();
                     }
                     position(hwnd as HWND, f.items.len());
@@ -380,38 +456,54 @@ fn paint_item(p: &Painter, y: f32, it: &Item, hover_btn: Option<u8>) {
     // 铃铛图标
     p.fill_circle(28.0, y + ITEM_H / 2.0, 14.0, gdi::argb(60, 62, 135, 250));
     p.text("\u{E7E7}", 14.0, y + ITEM_H / 2.0 - 14.0, 28.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, false, true, BLUE());
-    // 标题 + 正文（最多两行，超出截断加省略号）
+    // 标题 + 正文（最多两行，逐行绘制；第二行放不下以省略号收尾）
     p.text(&it.title, 52.0, y + 8.0, TOAST_W - 66.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, true, false, ON_BG());
     let max_w = TOAST_W - 66.0 - 8.0;
-    let mut cur = String::new();
+    let lines = wrap_two(p, &it.body, max_w);
+    let lh = 15.0;
+    let y0 = y + 25.0 + (36.0 - lh * lines.len() as f32) / 2.0;
+    for (i, line) in lines.iter().enumerate() {
+        p.text(line, 52.0, y0 + i as f32 * lh, TOAST_W - 66.0, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB());
+    }
+    // 操作按钮：撤销卡片 = 撤销；待办 = 完成 + 稍后；其他 = 稍后
+    if it.has_undo() {
+        paint_pill(p, undo_rect(y), "撤销", hover_btn == Some(3));
+    } else if it.has_done() {
+        paint_pill(p, done_rect(y), "完成", hover_btn == Some(2));
+        paint_pill(p, snooze_rect(y), "稍后10分钟", hover_btn == Some(1));
+    } else {
+        paint_pill(p, snooze_rect(y), "稍后10分钟", hover_btn == Some(1));
+    }
+}
+
+/// 正文折行：最多两行，第二行放不下时回退并以省略号收尾（逐行返回，绘制时逐行画）
+fn wrap_two(p: &Painter, body: &str, max_w: f32) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    for ch in it.body.chars() {
+    let mut cur = String::new();
+    for ch in body.chars() {
         cur.push(ch);
         if p.measure(&cur, 11.0, false, false).0 > max_w {
             cur.pop();
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
+            if lines.len() == 1 {
+                // 第二行溢出：截到省略号放得下为止
+                while !cur.is_empty() && p.measure(&format!("{}…", cur), 11.0, false, false).0 > max_w {
+                    cur.pop();
+                }
+                cur.push('…');
+                lines.push(cur);
+                return lines;
             }
+            if cur.is_empty() {
+                cur.push(ch); // 单字符超宽（不可能出现）：原样保留避免死循环
+            }
+            lines.push(std::mem::take(&mut cur));
             cur.push(ch);
-            if lines.len() == 2 {
-                break;
-            }
         }
     }
-    if !cur.is_empty() && lines.len() < 2 {
+    if !cur.is_empty() {
         lines.push(cur);
     }
-    if lines.len() == 2 && it.body.chars().count() > lines[0].chars().count() + lines[1].chars().count() {
-        let mut l2: String = lines[1].chars().take(lines[1].chars().count().saturating_sub(1)).collect();
-        l2.push('…');
-        lines[1] = l2;
-    }
-    p.text(&lines.join(""), 52.0, y + 25.0, TOAST_W - 66.0, 36.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB());
-    // 操作按钮：待办 = 完成 + 稍后；其他 = 稍后
-    if it.has_done() {
-        paint_pill(p, done_rect(y), "完成", hover_btn == Some(2));
-    }
-    paint_pill(p, snooze_rect(y), "稍后10分钟", hover_btn == Some(1));
+    lines
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -436,6 +528,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             let (sx, sy, sw, sh) = snooze_rect(iy);
                             if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
                                 hover_btn = Some((i, 1));
+                            } else if it.has_undo() {
+                                let (ux, uy, uw, uh) = undo_rect(iy);
+                                if x >= ux && x < ux + uw && y >= uy && y < uy + uh {
+                                    hover_btn = Some((i, 3));
+                                }
                             } else if it.has_done() {
                                 let (dx, dy, dw, dh) = done_rect(iy);
                                 if x >= dx && x < dx + dw && y >= dy && y < dy + dh {
@@ -480,7 +577,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let s = gdi::scale();
             let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
             // 命中判定：先按钮，后卡片本体
-            let mut hit: Option<(usize, u8)> = None; // 1=稍后 2=完成 0=本体
+            let mut hit: Option<(usize, u8)> = None; // 1=稍后 2=完成 3=撤销 0=本体
             {
                 let guard = TOAST_UI.lock().unwrap();
                 if let Some(f) = guard.as_ref() {
@@ -491,6 +588,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             let (sx, sy, sw, sh) = snooze_rect(iy);
                             if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
                                 hit = Some((i, 1));
+                            } else if it.has_undo() {
+                                let (ux, uy, uw, uh) = undo_rect(iy);
+                                if x >= ux && x < ux + uw && y >= uy && y < uy + uh {
+                                    hit = Some((i, 3));
+                                }
                             } else if it.has_done() {
                                 let (dx, dy, dw, dh) = done_rect(iy);
                                 if x >= dx && x < dx + dw && y >= dy && y < dy + dh {
@@ -505,8 +607,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 }
             }
             if let Some((i, btn)) = hit {
-                let item = TOAST_UI.lock().unwrap().as_ref().map(|f| (f.0.items[i].title.clone(), f.0.items[i].body.clone(), f.0.items[i].act.clone()));
-                if let Some((title, body, act)) = item {
+                let item = TOAST_UI.lock().unwrap().as_ref().map(|f| {
+                    let it = &f.0.items[i];
+                    (it.title.clone(), it.body.clone(), it.act.clone(), it.quiet)
+                });
+                if let Some((title, body, act, quiet)) = item {
                     match btn {
                         1 => {
                             // 稍后10分钟：登记后由提醒线程到点补发
@@ -519,10 +624,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             }
                             unsafe { remove_item(i) };
                         }
-                        _ => {
-                            // 点击卡片本体：关闭提醒并打开日历
+                        3 => {
+                            // 撤销删除：按快照原位恢复
+                            if let Act::Undo { data } = act {
+                                undo_restore(&data);
+                            }
                             unsafe { remove_item(i) };
-                            crate::flyout::request_show();
+                        }
+                        _ => {
+                            // 点击卡片本体：关闭提醒并打开日历（撤销卡片只关闭）
+                            unsafe { remove_item(i) };
+                            if !quiet {
+                                crate::flyout::request_show();
+                            }
                         }
                     }
                 }

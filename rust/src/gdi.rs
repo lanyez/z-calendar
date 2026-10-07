@@ -23,10 +23,18 @@ pub const HALIGN_FAR: i32 = 2;
 static SCALE: AtomicU32 = AtomicU32::new(0); // ×1000；0 = 未初始化
 static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// 全局缩放系数（逻辑 px → 物理 px）。进程为 Per-Monitor V2 感知；屏幕缩放
-/// 变化时由 flyout 的轮询经 set_scale 更新，所有窗口随后重建/重摆。
-/// 调试钩子 CAL_SF=1.25/1.5/2 可强制覆盖（覆盖时不参与缩放轮询）。
+/// 全局缩放系数（逻辑 px → 物理 px）= 屏幕 DPI 缩放 × 界面字号系数。
+/// 字号并入全局缩放后，切换 110%/125% 时行高/列宽/窗口尺寸随字号一起缩放
+/// （等价一次 DPI 变化，走 rescale_all 重摆全部窗口），不再出现"字大了挤行"。
+/// 进程为 Per-Monitor V2 感知；屏幕缩放变化时由 flyout 的轮询经 set_scale
+/// 更新 DPI 部分，所有窗口随后重建/重摆。
+/// 调试钩子 CAL_SF=1.25/1.5/2 可强制覆盖 DPI 部分（覆盖时不参与缩放轮询）。
 pub fn scale() -> f32 {
+    dpi_scale() * text_scale()
+}
+
+/// 纯 DPI 缩放（不含字号系数）：缩放轮询与原始物理坐标换算用
+pub fn dpi_scale() -> f32 {
     let v = SCALE.load(Ordering::Relaxed);
     if v != 0 {
         return v as f32 / 1000.0;
@@ -183,7 +191,7 @@ pub fn text_hint() -> i32 {
 
 static TEXT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000); // ×1000
 
-/// 界面字号系数（只作用于正文文本，图标字体不受影响）
+/// 界面字号系数（已并入 scale() 全局缩放链）
 pub fn text_scale() -> f32 {
     TEXT_SCALE.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
 }
@@ -505,8 +513,10 @@ impl Painter {
     }
 
     pub fn text(&self, s: &str, x: f32, y: f32, w: f32, h: f32, halign: i32, valign: i32, px: f32, bold: bool, mdl2: bool, color: u32) {
-        // 界面字号系数只作用于正文文本（mdl2 图标字体保持原大）
-        let px = px * text_scale();
+        // 字号取整到整数物理像素：GDI HFONT 只能整数高，而 GdipMeasureString 支持
+        // 分数字号——两侧用同一口径后，fit_text_px/折行等"按测量判定放得下"的结果
+        // 与实际绘制完全一致（此前 11.55px 测量、12px 绘制会判错溢出）
+        let px = self.quant_px(px);
         // 内存位图上 GDI+ 的 ClearType 被静默回退为灰度；正文改走 GDI DrawTextW 保留子像素渲染。
         // CAL_TEXT_HINT 覆盖时走 GDI+（保留调试 A/B 通道），图标字体也保持 GDI+ 灰度。
         if !mdl2 && self.dc != 0 && !self.scan0.is_null() && text_hint() == TEXT_HINT_CLEAR_TYPE
@@ -606,13 +616,19 @@ impl Painter {
         true
     }
 
+    /// 逻辑 px → 取整为整数物理像素再换回逻辑值（测量与绘制共用同一字号口径）
+    fn quant_px(&self, px: f32) -> f32 {
+        let phys = (px * self.sf).round().max(1.0);
+        phys / self.sf
+    }
+
     /// 居中单行文本（快捷）
     pub fn text_c(&self, s: &str, cx: f32, cy: f32, px: f32, bold: bool, mdl2: bool, color: u32) {
         self.text(s, cx - 150.0, cy - 20.0, 300.0, 40.0, HALIGN_CENTER, HALIGN_CENTER, px, bold, mdl2, color);
     }
 
     pub fn measure(&self, s: &str, px: f32, bold: bool, mdl2: bool) -> (f32, f32) {
-        let px = px * text_scale();
+        let px = self.quant_px(px);
         unsafe {
             let layout = RectF { x: 0.0, y: 0.0, w: 10000.0, h: 200.0 };
             let mut out = RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };

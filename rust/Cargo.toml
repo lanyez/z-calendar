@@ -1,6 +1,6 @@
 [package]
 name = "z-calendar"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 description = "Z日历 - 替换 Windows 任务栏时钟点击弹出的日历（法定节假日/农历/节气）"
 
@@ -13,6 +13,11 @@ winapi = { version = "0.3", features = [
     "winuser", "windef", "minwindef", "ntdef", "libloaderapi", "synchapi",
     "errhandlingapi", "winbase", "processthreadsapi", "handleapi", "winnt", "wingdi", "minwinbase",
     "playsoundapi", "combaseapi", "objbase", "oaidl", "oleauto", "wtypes",
+] }
+# Windows 通知中心（Toast）：仅启用通知与 XML 两个特性，静态链接、无运行时依赖
+windows = { version = "0.58", default-features = false, features = [
+    "UI_Notifications",
+    "Data_Xml_Dom",
 ] }
 tray-icon = "0.14"
 ureq = { version = "2", default-features = false, features = ["tls"] }

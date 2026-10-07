@@ -65,6 +65,19 @@ pub enum AgendaEntry {
 
 pub type AgendaMap = HashMap<String, Vec<AgendaEntry>>;
 
+/// 进程内共享的日程表（main 启动时注册一次）；提醒卡片撤销等
+/// 无主窗口上下文的模块通过它读写同一份数据
+static SHARED_AGENDA: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<AgendaMap>>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_shared_agenda(arc: std::sync::Arc<std::sync::Mutex<AgendaMap>>) {
+    *SHARED_AGENDA.lock().unwrap() = Some(arc);
+}
+
+pub fn shared_agenda() -> Option<std::sync::Arc<std::sync::Mutex<AgendaMap>>> {
+    SHARED_AGENDA.lock().unwrap().clone()
+}
+
 pub fn load() -> AgendaMap {
     let path = crate::config::data_dir().join("agenda.json");
     match crate::config::load_json_or_bak::<AgendaMap>(&path) {
@@ -439,6 +452,106 @@ pub fn agenda_skip_day(map: &mut AgendaMap, key: &str, idx: usize, date: NaiveDa
     true
 }
 
+// ---------------- 表单日期/时间直接键入解析 ----------------
+
+/// 解析用户键入的日期/时间片段（新建/编辑弹窗的选择面板直接输入用）。
+/// 日期：2026-10-8 / 2026.10.8 / 2026/10/8 / 10-8 / 10.8 / 10/8 / 10月8日(号) /
+/// 今天/明天/后天/大后天/周X/下周X；时间：9:30 / 9点 / 9点半 / 9点30分 / 0930 / 930。
+/// 日期与时间可只出现其一（用空格、T、t 分隔）；至少解析出其一才成功。
+/// 返回 (日期, 分钟数 0..1439)。
+pub fn parse_dt_input(s: &str, base: NaiveDate) -> Option<(Option<NaiveDate>, Option<u32>)> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mut day: Option<NaiveDate> = None;
+    let mut minute: Option<u32> = None;
+    // 按空白/T 拆成片段，逐片尝试（先日期词，再数字日期，最后时间）
+    let parts: Vec<&str> = t
+        .split(|c: char| c.is_whitespace() || c == 'T' || c == 't')
+        .filter(|p| !p.is_empty())
+        .collect();
+    for part in &parts {
+        if day.is_none() {
+            if let Some((_, d)) = parse_date_word(part, base) {
+                day = Some(d);
+                continue;
+            }
+            if let Some(d) = parse_numeric_date(part, base) {
+                day = Some(d);
+                continue;
+            }
+        }
+        if minute.is_none() {
+            if let Some((_, m)) = parse_time_prefix(part) {
+                minute = Some(m);
+                continue;
+            }
+            if let Some(m) = parse_digit_time(part) {
+                minute = Some(m);
+            }
+        }
+    }
+    if day.is_none() && minute.is_none() {
+        return None;
+    }
+    Some((day, minute))
+}
+
+/// 数字日期：2026-10-8 / 2026.10.8 / 2026/10/8（带年）与 10-8 / 10.8 / 10/8（补当年，
+/// 已过顺延一年）
+fn parse_numeric_date(s: &str, base: NaiveDate) -> Option<NaiveDate> {
+    let seps = ['-', '.', '/'];
+    let mut hit: Option<(Option<i32>, u32, u32)> = None;
+    for sp in seps {
+        let nums: Vec<&str> = s.split(sp).collect();
+        if nums.len() == 2 {
+            let m: u32 = nums[0].parse().ok()?;
+            let d: u32 = nums[1].parse().ok()?;
+            hit = Some((None, m, d));
+            break;
+        } else if nums.len() == 3 {
+            let y: i32 = nums[0].parse().ok()?;
+            let m: u32 = nums[1].parse().ok()?;
+            let d: u32 = nums[2].parse().ok()?;
+            hit = Some((Some(y), m, d));
+            break;
+        }
+    }
+    let (y, m, d) = hit?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let year = match y {
+        Some(y) => y,
+        None => {
+            // 未写年：取当年，已过顺延一年（与“M月D日”一致）
+            match NaiveDate::from_ymd_opt(base.year(), m, d) {
+                Some(cand) if cand < base => base.year() + 1,
+                Some(_) => base.year(),
+                None => return None,
+            }
+        }
+    };
+    NaiveDate::from_ymd_opt(year, m, d)
+}
+
+/// 裸数字时间：0930 / 930（3~4 位数字按 HHM/HMM 解释，杜绝与日期混淆——数字日期必须带分隔符）
+fn parse_digit_time(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = match s.len() {
+        3 => (s[0..1].parse::<u32>().ok()?, s[1..3].parse::<u32>().ok()?),
+        4 => (s[0..2].parse::<u32>().ok()?, s[2..4].parse::<u32>().ok()?),
+        _ => return None,
+    };
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
 // ---------------- 快捷输入时间解析 ----------------
 /// 解析文本开头的时间点，返回 (消耗字节数, 分钟数 0..1439)
 /// 支持 "14:30" / "9:05" / "9点" / "9点半" / "14点30分"。
@@ -700,6 +813,34 @@ mod tests {
         assert_eq!(agenda_on(&map, NaiveDate::from_ymd_opt(2026, 10, 2).unwrap()).len(), 1); // 截止日内
         assert_eq!(agenda_on(&map, NaiveDate::from_ymd_opt(2026, 10, 3).unwrap()).len(), 0); // 仅此次
         assert_eq!(agenda_on(&map, NaiveDate::from_ymd_opt(2026, 10, 4).unwrap()).len(), 0); // 超截止
+    }
+
+    #[test]
+    fn parse_dt_input_cases() {
+        let base = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(); // 周三
+        let d10 = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        // 日期形态
+        assert_eq!(parse_dt_input("2026-10-8", base), Some((Some(d10), None)));
+        assert_eq!(parse_dt_input("10-8", base), Some((Some(d10), None)));
+        assert_eq!(parse_dt_input("10.8", base), Some((Some(d10), None)));
+        assert_eq!(parse_dt_input("10/8", base), Some((Some(d10), None)));
+        assert_eq!(parse_dt_input("10月8日", base), Some((Some(d10), None)));
+        assert_eq!(parse_dt_input("明天", base), Some((Some(base + Duration::days(1)), None)));
+        assert_eq!(parse_dt_input("周五", base), Some((Some(base + Duration::days(2)), None)));
+        // 时间形态
+        assert_eq!(parse_dt_input("9:30", base), Some((None, Some(570))));
+        assert_eq!(parse_dt_input("9点半", base), Some((None, Some(570))));
+        assert_eq!(parse_dt_input("0930", base), Some((None, Some(570))));
+        assert_eq!(parse_dt_input("930", base), Some((None, Some(570))));
+        // 组合（空格 / T 分隔，顺序不限）
+        assert_eq!(parse_dt_input("10-8 9:30", base), Some((Some(d10), Some(570))));
+        assert_eq!(parse_dt_input("9:30 10-8", base), Some((Some(d10), Some(570))));
+        assert_eq!(parse_dt_input("明天 9点", base), Some((Some(base + Duration::days(1)), Some(540))));
+        // 非法
+        assert_eq!(parse_dt_input("买菜", base), None);
+        assert_eq!(parse_dt_input("", base), None);
+        assert_eq!(parse_dt_input("25:00", base), None);
+        assert_eq!(parse_dt_input("9930", base), None);
     }
 
     #[test]

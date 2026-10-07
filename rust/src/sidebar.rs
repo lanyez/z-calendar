@@ -39,6 +39,8 @@ enum SbAction {
     TodoDelete(usize),
     /// 逾期待办顺延到今天（全局下标）
     TodoPostpone(usize),
+    /// 逾期未完成待办一键全部顺延到今天
+    TodoPostponeAll,
     /// 清除所有已完成待办
     TodoClearDone,
     /// 日程行：agenda_rows 的下标（含按天重复展开的行），行体点击/✎ 都打开编辑
@@ -382,14 +384,23 @@ pub fn postpone_todo_to_today(gi: usize) {
     crate::flyout::flyout_repaint();
 }
 
-/// 一键清除所有已完成待办（按天重复的完成记录不受影响）
-pub fn clear_done_todos() {
+/// 一键清除所有已完成待办（按天重复的完成记录不受影响）。
+/// 返回被清除的 (原全局下标, 条目) 列表（供撤销恢复）
+pub fn clear_done_todos() -> Vec<(usize, Todo)> {
     let cached = cached_list();
     let mut g = TODOS.lock().unwrap();
     let list = g.get_or_insert_with(|| cached);
-    let before = list.len();
-    list.retain(|t| !(t.done && t.recur.is_none()));
-    let changed = list.len() != before;
+    let mut removed: Vec<(usize, Todo)> = Vec::new();
+    let mut kept: Vec<Todo> = Vec::new();
+    for (i, t) in list.drain(..).enumerate() {
+        if t.done && t.recur.is_none() {
+            removed.push((i, t));
+        } else {
+            kept.push(t);
+        }
+    }
+    *list = kept;
+    let changed = !removed.is_empty();
     if changed {
         save_todos(list);
     }
@@ -397,6 +408,54 @@ pub fn clear_done_todos() {
     if changed {
         crate::flyout::flyout_repaint();
     }
+    removed
+}
+
+/// 撤销删除：把待办按原全局下标插回（按下标从大到小依次插入，避免位移）。
+/// 不触发窗口重绘（调用方自行刷新）
+pub fn restore_todos(items: &[(usize, Todo)]) {
+    if items.is_empty() {
+        return;
+    }
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let mut sorted: Vec<&(usize, Todo)> = items.iter().collect();
+    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    for (gi, td) in sorted {
+        let mut td = td.clone();
+        if td.id.is_empty() {
+            td.id = crate::events::gen_id();
+        }
+        let pos = (*gi).min(list.len());
+        list.insert(pos, td);
+    }
+    save_todos(list);
+}
+
+/// 逾期待办一键全部顺延到今天（全局下标列表），返回顺延条数。
+/// 不触发窗口重绘（调用方自行刷新）
+pub fn postpone_overdue_all(gis: &[usize]) -> usize {
+    if gis.is_empty() {
+        return 0;
+    }
+    let today = crate::ics::key_of_date(chrono::Local::now().date_naive());
+    let cached = cached_list();
+    let mut g = TODOS.lock().unwrap();
+    let list = g.get_or_insert_with(|| cached);
+    let mut n = 0;
+    for &gi in gis {
+        if let Some(td) = list.get_mut(gi) {
+            if td.recur.is_none() && td.date.as_deref() != Some(today.as_str()) {
+                td.date = Some(today.clone());
+                n += 1;
+            }
+        }
+    }
+    if n > 0 {
+        save_todos(list);
+    }
+    n
 }
 
 /// 是否存在已完成的待办（“清除已完成”按钮显隐）
@@ -691,8 +750,7 @@ pub fn sidebar_show(date: NaiveDate) {
     unsafe {
         // 时间格言：互联网分类每次打开都要换一条
         crate::motto::on_sidebar_show();
-        // 与天气面板互斥：打开日期侧栏时自动收起天气
-        crate::flyout::forecast_close();
+        // 天气面板与侧栏同屏（不再互斥）：侧栏打开时天气面板自动左移让位
         let mut guard = SIDEBAR_UI.lock().unwrap();
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
@@ -983,6 +1041,12 @@ impl SidebarUi {
                     let h = 8.0 + 18.0 + 4.0 + over_h + list_h + more_h + 8.0;
                     p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
                     p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
+                    // 逾期一键全部顺延（存在逾期时显示，位于“清除已完成”左侧）
+                    if !overdue.is_empty() {
+                        let bhov = self.hover == Some(SbAction::TodoPostponeAll);
+                        p.text("全部顺延", cx + cw - 168.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { RED() });
+                        self.regions.push((gdi::RectF { x: cx + cw - 174.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoPostponeAll));
+                    }
                     // 清除已完成（存在已完成条目时显示）
                     if has_done_todos() {
                         let bhov = self.hover == Some(SbAction::TodoClearDone);
@@ -1312,7 +1376,7 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                         f.redraw();
                     }
                     Some(SbAction::TodoDelete(i)) => {
-                        // 重复待办：✕ 弹“仅这一天/整个系列”选择；普通待办直接删
+                        // 重复待办：✕ 弹“仅这一天/整个系列”选择；普通待办直接删（可撤销）
                         let td = crate::sidebar::todo_at(i);
                         if td.as_ref().map(|t| t.recur.is_some()).unwrap_or(false) {
                             let date = f.date.unwrap_or_else(|| chrono::Local::now().date_naive());
@@ -1320,8 +1384,10 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                             let mut pt = POINT { x: 0, y: 0 };
                             unsafe { GetCursorPos(&mut pt) };
                             crate::recur_menu::open(pt.x, pt.y, crate::recur_menu::RmTarget::Todo { gi: i, date });
-                        } else {
+                        } else if let Some(td) = td {
+                            let body = td.text.clone();
                             crate::sidebar::remove_todo_at(i);
+                            crate::toast::notify_undo(crate::toast::UndoData::Todos { items: vec![(i, td)] }, &body);
                             f.redraw();
                         }
                     }
@@ -1329,8 +1395,22 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                         crate::sidebar::postpone_todo_to_today(i);
                         f.redraw();
                     }
+                    Some(SbAction::TodoPostponeAll) => {
+                        // 逾期未完成一键全部顺延到今天
+                        let gis: Vec<usize> = overdue_todos().into_iter().map(|(gi, _)| gi).collect();
+                        let n = postpone_overdue_all(&gis);
+                        if n > 0 {
+                            crate::toast::notify("待办已顺延", &format!("已把 {} 条逾期待办顺延到今天", n));
+                        }
+                        f.redraw();
+                    }
                     Some(SbAction::TodoClearDone) => {
-                        crate::sidebar::clear_done_todos();
+                        // 清除已完成（可撤销）
+                        let removed = clear_done_todos();
+                        if !removed.is_empty() {
+                            let body = format!("{} 条已完成待办", removed.len());
+                            crate::toast::notify_undo(crate::toast::UndoData::Todos { items: removed }, &body);
+                        }
                         f.redraw();
                     }
                     Some(SbAction::TodoEdit(i)) => {
@@ -1394,7 +1474,8 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                             let mut pt = POINT { x: 0, y: 0 };
                             unsafe { GetCursorPos(&mut pt) };
                             crate::recur_menu::open(pt.x, pt.y, crate::recur_menu::RmTarget::Agenda { key, idx, date });
-                        } else if let Some((key, idx, _)) = target {
+                        } else if let Some((key, idx, entry)) = target {
+                            let body = crate::events::display(&entry);
                             let mut map = f.agenda.lock().unwrap();
                             let removed = crate::events::agenda_remove_at(&mut map, &key, idx);
                             drop(map);
@@ -1402,6 +1483,8 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                                 let m = f.agenda.lock().unwrap();
                                 crate::events::save(&m);
                                 drop(m);
+                                // 撤销卡片（快照携带被删条目）
+                                crate::toast::notify_undo(crate::toast::UndoData::Agenda { key, idx, entry }, &body);
                                 f.redraw();
                             }
                         }
