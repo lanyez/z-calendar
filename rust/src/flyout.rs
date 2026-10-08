@@ -126,6 +126,12 @@ enum Action {
     MultiPostpone,
     MultiDelete,
     MultiCancel,
+    /// 日程页日期分组头点击：跳回月历对应日期（并打开侧栏）
+    HeadJump(NaiveDate),
+    /// 日程页窗口平移：‹ 更早 30 天 / 稍后 30 天 / 回到今天
+    AgendaEarlier,
+    AgendaLater,
+    AgendaToday,
 }
 
 /// 多选批量操作结果（锁内收集，锁外执行待办写盘与通知）
@@ -226,6 +232,10 @@ struct Ui {
     idle_timer: bool,
     /// 日程页滚动偏移（超出可视行数时滚轮翻动）
     agenda_scroll: usize,
+    /// 日程页窗口起点（默认今天；‹更早/稍后›平移 30 天窗口）
+    agenda_from: NaiveDate,
+    /// 快捷输入撤销/重做栈
+    draft_undo: crate::textedit::Undo,
     /// 日程页当前解析出的行（含按天重复展开）：(原key, 原下标, 条目)
     agenda_resolved: Vec<(String, usize, crate::events::AgendaEntry)>,
     /// 日程页各分组的待办（与日程合并展示）：(全局待办下标, 待办, 分组日期)
@@ -236,6 +246,8 @@ struct Ui {
     draft_kind: u8,
     /// 快捷输入类型下拉展开中
     kind_menu_open: bool,
+    /// 双击日期格检测：上次单击格子的（时刻, 客户区物理x, y, 日期）
+    last_cell_click: Option<(std::time::Instant, i32, i32, NaiveDate)>,
     dumped: bool,
     dump_path: String,
 }
@@ -279,8 +291,8 @@ struct SbDrag {
 }
 
 /// 侧栏管理卡片行顶边（py=10 固定；motto 行下多一个“格言类型”行）
-fn sb_slot_tops(motto_slot: usize) -> [f32; 7] {
-    let mut tops = [0.0f32; 7];
+fn sb_slot_tops(motto_slot: usize) -> [f32; 8] {
+    let mut tops = [0.0f32; 8];
     for (i, t) in tops.iter_mut().enumerate() {
         *t = 124.0 + 42.0 * i as f32 + if i > motto_slot { 42.0 } else { 0.0 };
     }
@@ -288,7 +300,7 @@ fn sb_slot_tops(motto_slot: usize) -> [f32; 7] {
 }
 
 /// 指针 y → 卡片槽位
-fn sb_slot_at(tops: &[f32; 7], y: f32) -> usize {
+fn sb_slot_at(tops: &[f32; 8], y: f32) -> usize {
     for (i, t) in tops.iter().enumerate() {
         if y >= *t && y < *t + 42.0 {
             return i;
@@ -914,13 +926,13 @@ impl SettingsUi {
             let (drag_from, drag_y, drag_moved) = self.sb_drag.as_ref().map(|d| (d.from, d.y, d.moved)).unwrap_or((0usize, 0.0f32, false));
             let mut display: Vec<&'static str> = order.clone();
             if drag_moved {
-                let tops0 = sb_slot_tops(display.iter().position(|c| *c == "motto").unwrap_or(6));
+                let tops0 = sb_slot_tops(display.iter().position(|c| *c == "motto").unwrap_or(7));
                 let target = sb_slot_at(&tops0, drag_y);
                 let item = display.remove(drag_from.min(display.len() - 1));
                 display.insert(target.min(display.len()), item);
             }
             let drag_id = order.get(drag_from).copied();
-            let tops = sb_slot_tops(display.iter().position(|c| *c == "motto").unwrap_or(6));
+            let tops = sb_slot_tops(display.iter().position(|c| *c == "motto").unwrap_or(7));
             let motto_names = ["名人名言", "文学", "互联网", "科普"];
             let motto_idx = crate::motto::TYPES
                 .iter()
@@ -1094,11 +1106,15 @@ impl SettingsUi {
                             cfg.sidebar_todo = !cfg.sidebar_todo;
                             cfg.sidebar_todo
                         }
+                        19 => {
+                            cfg.sidebar_reminds = !cfg.sidebar_reminds;
+                            cfg.sidebar_reminds
+                        }
                         _ => cfg.show_weather,
                     }
                 };
                 self.st.config.lock().unwrap().save();
-                if (10..=16).contains(idx) {
+                if (10..=16).contains(idx) || *idx == 19 {
                     crate::sidebar::sidebar_repaint();
                 }
                 if *idx == 0 {
@@ -1487,7 +1503,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                         if d.moved {
                             // 拖动提交：按松开位置重排并保存
                             let mut order = ui.st.config.lock().unwrap().sidebar_card_order();
-                            let motto_slot = order.iter().position(|c| *c == "motto").unwrap_or(6);
+                            let motto_slot = order.iter().position(|c| *c == "motto").unwrap_or(7);
                             let tops = sb_slot_tops(motto_slot);
                             let item = order.remove(d.from.min(order.len() - 1));
                             let target = sb_slot_at(&tops, d.y).min(order.len());
@@ -2156,11 +2172,14 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             last_second: 0,
             idle_timer: false,
             agenda_scroll: 0,
+            agenda_from: today,
+            draft_undo: crate::textedit::Undo::new(80),
             agenda_resolved: Vec::new(),
             agenda_todos: Vec::new(),
             agenda_resolved_dates: Vec::new(),
             draft_kind: 0,
             kind_menu_open: false,
+            last_cell_click: None,
             dumped: false,
             dump_path: std::env::var("CAL_DUMP").unwrap_or_default(),
         });
@@ -2963,22 +2982,40 @@ impl Ui {
     fn paint_agenda(&mut self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
         Self::hit_add(regions, 20.0, 16.0, 30.0, 30.0, Action::Back);
         p.text("\u{E72B}", 20.0, 16.0, 30.0, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, true, ICON_COL());
-        p.text("日程 / 待办", 58.0, 16.0, 320.0, 30.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL());
+        p.text("日程 / 待办", 58.0, 16.0, 280.0, 30.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 15.0, true, false, TITLE_COL());
+        // 右上角窗口平移：‹ 更早 / 回到今天（偏离今天时显示）/ 稍后 ›
+        let today0 = Local::now().date_naive();
+        let nav = [(Action::AgendaEarlier, "‹ 更早"), (Action::AgendaToday, "回到今天"), (Action::AgendaLater, "稍后 ›")];
+        let mut nx = WIN_W - 20.0;
+        for (act, label) in nav.iter().rev() {
+            let show = match act {
+                Action::AgendaToday => self.agenda_from != today0,
+                _ => true,
+            };
+            if show {
+                let w = if *act == Action::AgendaToday { 66.0 } else { 54.0 };
+                nx -= w + 6.0;
+                let hov = self.hovered(act);
+                p.fill_round(nx, 18.0, w, 26.0, 7.0, if hov { crate::theme::ov(24) } else { crate::theme::ov(10) });
+                p.text(label, nx, 18.0, w, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, if hov { ON_BG() } else { SUB() });
+                Self::hit_add(regions, nx, 18.0, w, 26.0, *act);
+            }
+        }
 
-        // 以日期分组（今天起 30 天、升序）：每天合并展示日程与待办，今天的分组置顶高亮
+        // 以日期分组（agenda_from 起 30 天、升序）：每天合并展示日程与待办，今天的分组置顶高亮
         let today = Local::now().date_naive();
         self.agenda_resolved.clear();
         self.agenda_resolved_dates.clear();
         self.agenda_todos.clear();
         let mut rows: Vec<AgRow> = Vec::new();
         for off in 0..30i64 {
-            let d = today + Duration::days(off);
+            let d = self.agenda_from + Duration::days(off);
             let items = crate::events::agenda_on(&self.agenda.lock().unwrap(), d);
             let tds = crate::sidebar::todos_for(&crate::ics::key_of_date(d));
             if items.is_empty() && tds.is_empty() {
                 continue;
             }
-            rows.push(AgRow::Head(d, off == 0));
+            rows.push(AgRow::Head(d, d == today));
             let base = self.agenda_resolved.len();
             for i in 0..items.len() {
                 rows.push(AgRow::Agenda(base + i));
@@ -3010,7 +3047,10 @@ impl Ui {
                 AgRow::Head(d, is_today) => {
                     let wd = "日一二三四五六".chars().nth(d.weekday().num_days_from_sunday() as usize).unwrap();
                     let label = format!("{}-{:02}-{:02} 周{}{}", d.year(), d.month(), d.day(), wd, if is_today { " · 今天" } else { "" });
-                    p.text(&label, 22.0, y, 260.0, head_h, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, true, false, if is_today { BLUE() } else { SUB() });
+                    // 分组头可点：跳回月历对应日期（悬停提亮提示）
+                    let hov = self.hovered(&Action::HeadJump(d));
+                    p.text(&label, 22.0, y, 260.0, head_h, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, true, false, if hov { ON_BG() } else if is_today { BLUE() } else { SUB() });
+                    Self::hit_add(regions, 20.0, y, 280.0, head_h, Action::HeadJump(d));
                     y += head_h + 2.0;
                 }
                 AgRow::Agenda(i) => {
@@ -3042,7 +3082,8 @@ impl Ui {
             }
         }
         if rows.is_empty() {
-            p.text("近 30 天没有日程或待办", 10.0, 130.0, WIN_W - 20.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB_DIM());
+            let msg = if self.agenda_from == today { "近 30 天没有日程或待办" } else { "该时段没有日程或待办" };
+            p.text(msg, 10.0, 130.0, WIN_W - 20.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB_DIM());
         } else if clipped {
             p.text("滚轮查看更多", 20.0, input_y - 22.0, WIN_W - 40.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM());
         }
@@ -3986,6 +4027,35 @@ impl Ui {
                 clear_preview(self);
                 self.redraw();
             }
+            Action::HeadJump(d) => {
+                // 分组头点击：跳回月历对应日期，并按点击日期的规则开/切侧栏
+                self.selected = *d;
+                self.view_m = d.month();
+                self.view_y = d.year();
+                self.page = Page::Calendar;
+                clear_preview(self);
+                if crate::sidebar::sidebar_visible() && crate::sidebar::sidebar_date() == Some(*d) {
+                    crate::sidebar::sidebar_hide();
+                } else {
+                    crate::sidebar::sidebar_show(*d);
+                }
+                self.redraw();
+            }
+            Action::AgendaEarlier => {
+                self.agenda_from -= Duration::days(30);
+                self.agenda_scroll = 0;
+                self.redraw();
+            }
+            Action::AgendaLater => {
+                self.agenda_from += Duration::days(30);
+                self.agenda_scroll = 0;
+                self.redraw();
+            }
+            Action::AgendaToday => {
+                self.agenda_from = Local::now().date_naive();
+                self.agenda_scroll = 0;
+                self.redraw();
+            }
             Action::AgendaDel(i) => {
                 // 用解析行的原 key/下标定位（重复日程行也指向主条目）
                 if let Some((key, idx, entry, view_date)) = self.resolved_row(*i) {
@@ -4062,6 +4132,8 @@ impl Ui {
         if text.is_empty() {
             return;
         }
+        // 添加后草稿会被清空：先压撤销快照，误添加可 Ctrl+Z 找回文本
+        self.draft_undo.snapshot(&self.draft, self.draft_caret, self.draft_sel, "");
         // “14:30 项目评审”“明天9点开会”“周五 18:30 团建”这类输入 → 解析日期词/时间/区间；
         // 类型下拉选中“待办”时生成待办（未分类优先级），否则生成日程（无日期词落在今天）
         let base = Local::now().date_naive();
@@ -4453,6 +4525,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         ui.redraw();
                         hit = None;
                     }
+                    // 双击日期格的判定基准只在“连续点中格子”时保持：其他任何点击重置
+                    if !matches!(hit, Some(Action::Cell(_))) {
+                        ui.last_cell_click = None;
+                    }
                 }
             }
             if let Some(a) = hit {
@@ -4463,10 +4539,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let mut edit_todo: Option<(usize, crate::sidebar::Todo, NaiveDate)> = None;
                 let mut toggle_todo: Option<(usize, String)> = None;
                 let mut multi_res: Option<MultiResult> = None;
+                // 双击日期格 → 直达“新增待办”（单击照旧选中日期/开侧栏；弹窗在锁外打开）
+                let mut open_input_todo: Option<NaiveDate> = None;
+                let mut todo_at: (i32, i32) = (0, 0);
                 {
                     let mut guard = UI.lock().unwrap();
                     if let Some(sui) = guard.as_mut() {
                         let ui = &mut sui.0;
+                        // 系统双击判定：间隔 < GetDoubleClickTime 且落在双击矩形内，且是同一格
+                        if let Action::Cell(d) = a {
+                            let now = std::time::Instant::now();
+                            let (px, py) = (x_of(lp), y_of(lp));
+                            let dbl = match ui.last_cell_click {
+                                Some((t, lx, ly, ld)) => {
+                                    now.duration_since(t) < std::time::Duration::from_millis(GetDoubleClickTime() as u64)
+                                        && (px - lx).abs() <= GetSystemMetrics(SM_CXDOUBLECLK) / 2
+                                        && (py - ly).abs() <= GetSystemMetrics(SM_CYDOUBLECLK) / 2
+                                        && ld == d
+                                }
+                                None => false,
+                            };
+                            ui.last_cell_click = Some((now, px, py, d));
+                            if dbl {
+                                open_input_todo = Some(d);
+                                // 弹窗锚点取点击点（换算屏幕坐标，锁外使用；与右键菜单位一致）
+                                let mut r: RECT = std::mem::zeroed();
+                                GetWindowRect(hwnd, &mut r);
+                                todo_at = (r.left + px, r.top + py);
+                            }
+                        }
                         if matches!(a, Action::BottomExit) {
                             exit = true;
                         } else if matches!(a, Action::OpenSettings | Action::BottomSettings) {
@@ -4567,6 +4668,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     GetWindowRect(hwnd, &mut r);
                     crate::inputbox::open(r.left, r.top, date, crate::inputbox::Kind::Agenda);
                 }
+                if let Some(date) = open_input_todo {
+                    // 锁外执行窗口操作（同 open_input 的死锁规避）；锚点取双击的格子位置
+                    crate::inputbox::open(todo_at.0, todo_at.1, date, crate::inputbox::Kind::Todo);
+                }
                 if let Some((key, idx, entry, view_date)) = edit_agenda {
                     // 锁外打开编辑弹窗；条目来自点击时缓存的解析行
                     let mut r: RECT = std::mem::zeroed();
@@ -4618,7 +4723,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if a != ui.hover {
                             ui.hover = a;
                             ui.redraw();
-                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaEdit(_)) | Some(Action::TodoDel(_)) | Some(Action::TodoEdit(_)) | Some(Action::TodoToggle(_)) | Some(Action::AgendaAdd) | Some(Action::KindDropdown) | Some(Action::KindPick(_)) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MonthPickYear(_)) | Some(Action::MonthPickGo(_)) | Some(Action::MonthPickToday) | Some(Action::RowCopyTo(..)) | Some(Action::RowMulti) | Some(Action::MultiAll) | Some(Action::MultiPostpone) | Some(Action::MultiDelete) | Some(Action::MultiCancel));
+                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaEdit(_)) | Some(Action::TodoDel(_)) | Some(Action::TodoEdit(_)) | Some(Action::TodoToggle(_)) | Some(Action::AgendaAdd) | Some(Action::KindDropdown) | Some(Action::KindPick(_)) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MonthPickYear(_)) | Some(Action::MonthPickGo(_)) | Some(Action::MonthPickToday) | Some(Action::RowCopyTo(..)) | Some(Action::RowMulti) | Some(Action::MultiAll) | Some(Action::MultiPostpone) | Some(Action::MultiDelete) | Some(Action::MultiCancel) | Some(Action::HeadJump(_)) | Some(Action::AgendaEarlier) | Some(Action::AgendaLater) | Some(Action::AgendaToday));
                             SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
                         }
                         // 截断文本 tooltip：日程/待办行悬停后浮出完整内容（计时在 WM_TIMER）
@@ -4769,6 +4874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         }
                         0x08 => {
                             if ui.page == Page::Agenda {
+                                ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
                                 crate::textedit::backspace(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel);
                                 ui.clear_hint();
                                 ui.redraw();
@@ -4777,7 +4883,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         0x2E => {
                             // Delete：删除光标后一个字符/选区（快捷输入）
                             if ui.page == Page::Agenda {
+                                ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
                                 crate::textedit::delete_fwd(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel);
+                                ui.clear_hint();
+                                ui.redraw();
+                            }
+                        }
+                        0x5A if ctrl => {
+                            // Ctrl+Z 撤销（快捷输入）
+                            if ui.page == Page::Agenda && ui.draft_undo.undo(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel) {
+                                ui.clear_hint();
+                                ui.redraw();
+                            }
+                        }
+                        0x59 if ctrl => {
+                            // Ctrl+Y 重做
+                            if ui.page == Page::Agenda && ui.draft_undo.redo(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel) {
                                 ui.clear_hint();
                                 ui.redraw();
                             }
@@ -4811,6 +4932,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                     unsafe {
                                         crate::textedit::set_clipboard(ui.hwnd, &t);
                                     }
+                                    ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
                                     crate::textedit::delete_sel(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel);
                                     ui.clear_hint();
                                     ui.redraw();
@@ -4917,6 +5039,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let ui = &mut sui.0;
                 if ui.page == Page::Agenda && (wp as u32) >= 0x20 {
                     if let Some(ch) = char::from_u32(wp as u32) {
+                        ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "ins");
                         crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &ch.to_string());
                         ui.clear_hint();
                         ui.redraw();
@@ -4932,6 +5055,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 if ui.page == Page::Agenda {
                     if lp as u32 & 0x0800 != 0 {
                         if let Some(s) = read_ime_string(hwnd, 0x0800) {
+                            ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "ins");
                             crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &s);
                             ui.comp.clear();
                             ui.clear_hint();
@@ -5084,6 +5208,7 @@ unsafe fn paste_clipboard(ui: &mut Ui) {
             }
             let slice = std::slice::from_raw_parts(ptr, len);
             let text = String::from_utf16_lossy(slice);
+            ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
             crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &text);
             ui.clear_hint();
             GlobalUnlock(h as usize);

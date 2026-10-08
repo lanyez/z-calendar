@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
 use winapi::um::winuser::*;
@@ -33,6 +33,8 @@ unsafe impl Send for SendSb {}
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SbAction {
     CardManage,
+    /// 右上角 ✕：收起侧栏
+    Close,
     /// 全部使用全局列表下标（todos_for/todos() 的 enumerate 序号）
     TodoToggle(usize),
     TodoEdit(usize),
@@ -46,6 +48,8 @@ enum SbAction {
     /// 日程行：agenda_rows 的下标（含按天重复展开的行），行体点击/✎ 都打开编辑
     AgendaEdit(usize),
     AgendaDelete(usize),
+    /// 待办行文本区（悬停出 tooltip；点击无动作）
+    TodoRow(usize),
 }
 
 struct SidebarUi {
@@ -75,6 +79,13 @@ struct SidebarUi {
     todo_scroll: usize,
     todo_count: usize,
     todo_band: (f32, f32),
+    /// 逾期待办区：滚动偏移 / 总数 / 列表区 y 范围
+    over_scroll: usize,
+    over_count: usize,
+    over_band: (f32, f32),
+    /// 整栏滚动：内容超出侧栏高度时的纵向偏移 / 最大偏移
+    page_scroll: usize,
+    page_max: usize,
     /// 本次绘制解析出的日程行（含按天重复展开）：(原key, 原下标, 条目)
     agenda_rows: Vec<(String, usize, crate::events::AgendaEntry)>,
     /// 截断行 tooltip：(行下标, 悬停起点, 全文, 屏幕x, 屏幕y)
@@ -153,7 +164,7 @@ fn save_todos(list: &[Todo]) {
     let path = crate::config::data_dir().join("todo.json");
     if let Ok(text) = serde_json::to_string_pretty(list) {
         crate::config::backup_file(&path);
-        let _ = std::fs::write(path, text);
+        let _ = crate::config::write_file_atomic(&path, &text);
     }
 }
 
@@ -706,13 +717,17 @@ pub fn sidebar_hide() {
             ShowWindow(h as HWND, SW_HIDE);
         }
         // 释放后台位图压缩内存（下次 sidebar_show 重绘时重建）
-        let mut guard = SIDEBAR_UI.lock().unwrap();
-        if let Some(f) = guard.as_mut() {
-            let ui = &mut f.0;
-            unsafe {
-                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+        {
+            let mut guard = SIDEBAR_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                let ui = &mut f.0;
+                unsafe {
+                    gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+                }
             }
         }
+        // 侧栏收起：天气面板（若可见）贴回主日历左缘
+        crate::flyout::forecast_reposition();
         crate::trim_working_set();
     }
 }
@@ -762,31 +777,42 @@ pub fn sidebar_show(date: NaiveDate) {
     unsafe {
         // 时间格言：互联网分类每次打开都要换一条
         crate::motto::on_sidebar_show();
-        // 天气面板与侧栏同屏（不再互斥）：侧栏打开时天气面板自动左移让位
-        let mut guard = SIDEBAR_UI.lock().unwrap();
-        let Some(f) = guard.as_mut() else { return };
-        let f = &mut f.0;
-        f.date = Some(date);
-        // tooltip 悬停计时
-        let th = SIDEBAR_HWND.load(Ordering::Relaxed);
-        if th != 0 {
-            SetTimer(th as HWND, 4, 200, None);
+        {
+            // 天气面板与侧栏同屏（不再互斥）：侧栏打开时天气面板自动左移让位
+            let mut guard = SIDEBAR_UI.lock().unwrap();
+            let Some(f) = guard.as_mut() else { return };
+            let f = &mut f.0;
+            // 切换日期时重置各卡片滚动（同一日期保持原滚动位置）
+            if f.date != Some(date) {
+                f.agenda_scroll = 0;
+                f.todo_scroll = 0;
+                f.over_scroll = 0;
+                f.page_scroll = 0;
+            }
+            f.date = Some(date);
+            // tooltip 悬停计时
+            let th = SIDEBAR_HWND.load(Ordering::Relaxed);
+            if th != 0 {
+                SetTimer(th as HWND, 4, 200, None);
+            }
+            // 位置：紧贴主日历可见左缘、顶部对齐
+            let mh = crate::flyout::hwnd();
+            if mh == 0 {
+                return;
+            }
+            let mut mr: RECT = std::mem::zeroed();
+            GetWindowRect(mh as HWND, &mut mr);
+            // 主窗口矩形为物理像素，偏移与侧栏宽度按 sf 换算
+            let x = mr.left + gdi::phys(10.0) as i32 - gdi::phys(SB_W) as i32;
+            let y = mr.top + gdi::phys(10.0) as i32;
+            // 高度与日历可见高度一致（换回逻辑坐标存入 f.h）
+            f.h = (((mr.bottom - mr.top) as f32 / f.sf) - 20.0).max(300.0);
+            SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(SB_W) as i32, gdi::phys(f.h) as i32, SWP_NOACTIVATE);
+            ShowWindow(f.hwnd as HWND, SW_SHOWNA);
+            f.redraw();
         }
-        // 位置：紧贴主日历可见左缘、顶部对齐
-        let mh = crate::flyout::hwnd();
-        if mh == 0 {
-            return;
-        }
-        let mut mr: RECT = std::mem::zeroed();
-        GetWindowRect(mh as HWND, &mut mr);
-        // 主窗口矩形为物理像素，偏移与侧栏宽度按 sf 换算
-        let x = mr.left + gdi::phys(10.0) as i32 - gdi::phys(SB_W) as i32;
-        let y = mr.top + gdi::phys(10.0) as i32;
-        // 高度与日历可见高度一致（换回逻辑坐标存入 f.h）
-        f.h = (((mr.bottom - mr.top) as f32 / f.sf) - 20.0).max(300.0);
-        SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(SB_W) as i32, gdi::phys(f.h) as i32, SWP_NOACTIVATE);
-        ShowWindow(f.hwnd as HWND, SW_SHOWNA);
-        f.redraw();
+        // 侧栏打开：天气面板（若可见）左移让位，锚定到侧栏左缘
+        crate::flyout::forecast_reposition();
     }
 }
 
@@ -847,6 +873,11 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
             todo_scroll: 0,
             todo_count: 0,
             todo_band: (0.0, 0.0),
+            over_scroll: 0,
+            over_count: 0,
+            over_band: (0.0, 0.0),
+            page_scroll: 0,
+            page_max: 0,
             agenda_rows: Vec::new(),
             tip_hover: None,
         });
@@ -976,29 +1007,42 @@ impl SidebarUi {
         // 页面底
         p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE());
 
-        let mut y = 8.0;
+        // 整栏滚动：y 从内容坐标起画（page_scroll 为纵向偏移），完全滚出视野的卡片跳过绘制
+        let mut y = 8.0 - self.page_scroll as f32;
         let cx = 16.0;
         let cw = SB_W - 32.0;
         for c in &cards {
             match *c {
                 "date" => {
-                    self.paint_date_card(p, cx, y, cw, date, today);
+                    if y + 84.0 >= 0.0 {
+                        self.paint_date_card(p, cx, y, cw, date, today);
+                    }
                     y += 84.0 + 8.0;
                 }
                 "almanac" => {
                     let h = self.almanac_height(p, date);
-                    self.paint_almanac_card(p, cx, y, cw, h, date);
+                    if y + h >= 0.0 {
+                        self.paint_almanac_card(p, cx, y, cw, h, date);
+                    }
                     y += h + 8.0;
                 }
                 "events" => {
-                    p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
-                    let text = self.next_event_text(date, today);
-                    p.text(&text, cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                    if y + 44.0 >= 0.0 {
+                        p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
+                        let text = self.next_event_text(date, today);
+                        p.text(&text, cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                    }
                     y += 44.0 + 8.0;
                 }
                 "agenda" => {
                     let h = self.agenda_height(date);
-                    self.paint_agenda_card(p, cx, y, cw, h, date);
+                    if y + h >= 0.0 {
+                        self.paint_agenda_card(p, cx, y, cw, h, date);
+                    } else {
+                        // 卡片滚出视野：滚动带失效，避免滚轮作用于不可见区域
+                        self.agenda_band = (0.0, 0.0);
+                        self.agenda_count = 0;
+                    }
                     y += h + 8.0;
                 }
                 "history" => {
@@ -1022,85 +1066,132 @@ impl SidebarUi {
                         }
                     };
                     if items.is_empty() {
-                        p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
-                        p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                        if y + 44.0 >= 0.0 {
+                            p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
+                            p.text("暂无记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                        }
                         y += 44.0 + 8.0;
                     } else {
                         let n = items.len().min(3);
                         let h = 8.0 + 18.0 + n as f32 * 18.0 + 8.0;
-                        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
-                        p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
-                        for (i, (y2, t)) in items.iter().take(3).enumerate() {
-                            let ytxt = if *y2 < 0 { format!("公元前{}年", -y2) } else { format!("{}年", y2) };
-                            let line = format!("{}：{}", ytxt, t);
-                            p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT());
+                        if y + h >= 0.0 {
+                            p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
+                            p.text("历史上的今天", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
+                            for (i, (y2, t)) in items.iter().take(3).enumerate() {
+                                let ytxt = if *y2 < 0 { format!("公元前{}年", -y2) } else { format!("{}年", y2) };
+                                let line = format!("{}：{}", ytxt, t);
+                                p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT());
+                            }
                         }
                         y += h + 8.0;
                     }
                 }
                 "motto" => {
                     let h = self.motto_height(p, date);
-                    self.paint_motto_card(p, cx, y, cw, h, date);
+                    if y + h >= 0.0 {
+                        self.paint_motto_card(p, cx, y, cw, h, date);
+                    }
                     y += h + 8.0;
+                }
+                "reminds" => {
+                    // 最近提醒：remind_log.json 倒序前 3 条（相对今天的时间）
+                    let items = crate::reminder::recent_reminds(3);
+                    if items.is_empty() {
+                        if y + 44.0 >= 0.0 {
+                            p.fill_round(cx, y, cw, 44.0, 10.0, POPUP_BG());
+                            p.text("暂无提醒记录", cx, y, cw, 44.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                        }
+                        y += 44.0 + 8.0;
+                    } else {
+                        let n = items.len();
+                        let h = 8.0 + 18.0 + n as f32 * 18.0 + 8.0;
+                        if y + h >= 0.0 {
+                            p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
+                            p.text("最近提醒", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
+                            for (i, e) in items.iter().enumerate() {
+                                let dt = chrono::Local.timestamp_opt(e.t / 1000, 0).single();
+                                let when = match dt {
+                                    Some(d) => format!("{:02}-{:02} {:02}:{:02}", d.month(), d.day(), d.hour(), d.minute()),
+                                    None => String::new(),
+                                };
+                                let line = format!("{}  {}", when, e.body);
+                                p.text(&line, cx + 14.0, y + 28.0 + i as f32 * 18.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.5, false, false, ROW_TXT());
+                            }
+                        }
+                        y += h + 8.0;
+                    }
                 }
                 "todo" => {
                     let key = crate::ics::key_of_date(date);
                     let is_today = date == today;
                     let todos = todos_for(&key);
-                    // 逾期未完成（仅在查看今天时列出，可顺延到今天）
+                    // 逾期未完成（仅在查看今天时列出，可顺延到今天；超过一屏滚轮翻动）
                     let overdue = if is_today { overdue_todos() } else { Vec::new() };
-                    let over_rows = overdue.len().min(3);
+                    let over_n = overdue.len();
+                    let over_show = over_n.min(TODO_VISIBLE);
                     let n = todos.len();
                     self.todo_count = n;
+                    self.over_count = over_n;
                     let more = n > TODO_VISIBLE;
                     let past = date < today; // 查看过去的日期：未完成待办标红
                     let list_h = if todos.is_empty() { 18.0 } else { TODO_VISIBLE as f32 * 20.0 };
-                    let over_h = if over_rows > 0 { over_rows as f32 * 20.0 + 4.0 } else { 0.0 };
+                    let over_h = if over_n > 0 { over_show as f32 * 20.0 + if over_n > TODO_VISIBLE { 16.0 } else { 4.0 } } else { 0.0 };
                     let more_h = if more { 16.0 } else { 0.0 };
                     let h = 8.0 + 18.0 + 4.0 + over_h + list_h + more_h + 8.0;
-                    p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
-                    p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
-                    // 逾期一键全部顺延（存在逾期时显示，位于“清除已完成”左侧）
-                    if !overdue.is_empty() {
-                        let bhov = self.hover == Some(SbAction::TodoPostponeAll);
-                        p.text("全部顺延", cx + cw - 168.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { RED() });
-                        self.regions.push((gdi::RectF { x: cx + cw - 174.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoPostponeAll));
-                    }
-                    // 清除已完成（存在已完成条目时显示）
-                    if has_done_todos() {
-                        let bhov = self.hover == Some(SbAction::TodoClearDone);
-                        p.text("清除已完成", cx + cw - 84.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { SUB_DIM() });
-                        self.regions.push((gdi::RectF { x: cx + cw - 90.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoClearDone));
-                    }
-                    let mut ry = y + 28.0;
-                    if todos.is_empty() && over_rows == 0 {
-                        p.text("暂无待办", cx, ry, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
-                        ry += 18.0;
-                    }
-                    // 逾期区（红字，带原日期前缀；“→”顺延到今天）
-                    for (gi, td) in overdue.iter().take(3) {
-                        let (oy, od) = td
-                            .date
-                            .as_deref()
-                            .map(|d| (d.get(5..7).unwrap_or("").trim_start_matches('0'), d.get(8..10).unwrap_or("").trim_start_matches('0')))
-                            .unwrap_or(("", ""));
-                        let label = format!("{}-{} {}", oy, od, td.text);
-                        self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, true, true);
-                        ry += 20.0;
-                    }
-                    if over_rows > 0 {
-                        ry += 4.0;
-                    }
-                    // 当日待办（可滚动）
-                    self.todo_band = (ry, ry + list_h);
-                    let off = self.todo_scroll.min(n.saturating_sub(TODO_VISIBLE));
-                    for (vi, (gi, td)) in todos.iter().enumerate().skip(off).take(TODO_VISIBLE) {
-                        let label = if td.recur.is_some() { format!("{} ↻", td.text) } else { td.text.clone() };
-                        self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, past, false);
-                        ry += 20.0;
-                    }
-                    if more {
-                        p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, ry, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM());
+                    if y + h >= 0.0 {
+                        p.fill_round(cx, y, cw, h, 10.0, POPUP_BG());
+                        p.text("待办清单", cx + 14.0, y + 8.0, cw - 28.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
+                        // 逾期一键全部顺延（存在逾期时显示，位于“清除已完成”左侧）
+                        if !overdue.is_empty() {
+                            let bhov = self.hover == Some(SbAction::TodoPostponeAll);
+                            p.text("全部顺延", cx + cw - 168.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { RED() });
+                            self.regions.push((gdi::RectF { x: cx + cw - 174.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoPostponeAll));
+                        }
+                        // 清除已完成（存在已完成条目时显示）
+                        if has_done_todos() {
+                            let bhov = self.hover == Some(SbAction::TodoClearDone);
+                            p.text("清除已完成", cx + cw - 84.0, y + 9.0, 70.0, 18.0, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 10.5, false, false, if bhov { BLUE() } else { SUB_DIM() });
+                            self.regions.push((gdi::RectF { x: cx + cw - 90.0, y: y + 6.0, w: 80.0, h: 22.0 }, SbAction::TodoClearDone));
+                        }
+                        let mut ry = y + 28.0;
+                        if todos.is_empty() && over_n == 0 {
+                            p.text("暂无待办", cx, ry, cw, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, SUB());
+                            ry += 18.0;
+                        }
+                        // 逾期区（红字，带原日期前缀；“→”顺延到今天；超过一屏滚轮翻动）
+                        self.over_band = (ry, ry + over_show as f32 * 20.0);
+                        let over_off = self.over_scroll.min(over_n.saturating_sub(TODO_VISIBLE));
+                        for (gi, td) in overdue.iter().skip(over_off).take(TODO_VISIBLE) {
+                            let (oy, od) = td
+                                .date
+                                .as_deref()
+                                .map(|d| (d.get(5..7).unwrap_or("").trim_start_matches('0'), d.get(8..10).unwrap_or("").trim_start_matches('0')))
+                                .unwrap_or(("", ""));
+                            let label = format!("{}-{} {}", oy, od, td.text);
+                            self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, true, true);
+                            ry += 20.0;
+                        }
+                        if over_n > TODO_VISIBLE {
+                            p.text(&format!("共 {} 条逾期 · 滚轮查看", over_n), cx + 14.0, ry, cw - 28.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM());
+                            ry += 16.0;
+                        } else if over_n > 0 {
+                            ry += 4.0;
+                        }
+                        // 当日待办（可滚动）
+                        self.todo_band = (ry, ry + list_h);
+                        let off = self.todo_scroll.min(n.saturating_sub(TODO_VISIBLE));
+                        for (vi, (gi, td)) in todos.iter().enumerate().skip(off).take(TODO_VISIBLE) {
+                            let label = if td.recur.is_some() { format!("{} ↻", td.text) } else { td.text.clone() };
+                            self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, past, false);
+                            ry += 20.0;
+                        }
+                        if more {
+                            p.text(&format!("共 {} 条 · 滚轮查看更多", n), cx + 14.0, ry, cw - 28.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM());
+                        }
+                    } else {
+                        // 卡片滚出视野：滚动带失效，避免滚轮作用于不可见区域
+                        self.todo_band = (0.0, 0.0);
+                        self.over_band = (0.0, 0.0);
                     }
                     y += h + 8.0;
                 }
@@ -1108,9 +1199,24 @@ impl SidebarUi {
             }
         }
 
-        // 卡片管理
-        p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE());
-        self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 24.0 }, SbAction::CardManage));
+        // 整栏滚动上限（内容总高超出侧栏可视高度时启用；下次滚轮生效）
+        let content_bottom = y + 24.0 + 8.0;
+        self.page_max = ((content_bottom - self.h).max(0.0)) as usize;
+        if self.page_scroll > self.page_max {
+            self.page_scroll = self.page_max;
+        }
+
+        // 卡片管理（固定在内容末尾，随整栏滚动）
+        if y < self.h {
+            p.text("卡片管理", cx, y, cw, 24.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE());
+            self.regions.push((gdi::RectF { x: cx, y, w: cw, h: 24.0 }, SbAction::CardManage));
+        }
+
+        // 右上角关闭 ✕（固定在窗口右上，不随整栏滚动；与天气面板一致：默认灰、悬停变红）
+        let cr = gdi::RectF { x: SB_W - 30.0, y: 8.0, w: 24.0, h: 24.0 };
+        self.regions.push((cr, SbAction::Close));
+        let hov = self.hover == Some(SbAction::Close);
+        p.text("✕", cr.x, cr.y, cr.w, cr.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, if hov { RED() } else { SUB_DIM() });
     }
 
     /// 待办单行：勾选圈 + 优先级色点 + 文本（可带前缀）+（逾期的加“→”顺延）+ 编辑/删除
@@ -1126,6 +1232,8 @@ impl SidebarUi {
             tx = cx + 44.0;
         }
         p.text(label, tx, ry, cx + cw - 58.0 - tx, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, col);
+        // 文本区热区：悬停出完整内容 tooltip（点击无动作）
+        self.regions.push((gdi::RectF { x: tx - 2.0, y: ry, w: cx + cw - 58.0 - tx + 4.0, h: 18.0 }, SbAction::TodoRow(gi)));
         if td.done {
             let w = p.measure(label, 12.0, false, false).0;
             p.line(tx, ry + 9.0, tx + w, ry + 9.0, 1.0, SUB_DIM());
@@ -1347,7 +1455,7 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
                 let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
-                let clickable = hit.is_some();
+                let clickable = hit.is_some() && !matches!(hit, Some(SbAction::TodoRow(_)));
                 if hit != f.hover {
                     f.hover = hit;
                     f.redraw();
@@ -1362,29 +1470,48 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                     };
                     TrackMouseEvent(&mut tme);
                 }
-                // 截断文本 tooltip：今日日程行（计时走本窗口 WM_TIMER）
-                let tip_hit = match hit {
-                    Some(SbAction::AgendaEdit(vi)) => Some(vi),
+                // 截断文本 tooltip：今日日程行 / 待办行（计时走本窗口 WM_TIMER）
+                let tip_target: Option<(u64, String, f32)> = match hit {
+                    Some(SbAction::AgendaEdit(vi)) => {
+                        let mut text = String::new();
+                        if let Some((_, _, item)) = f.agenda_rows.get(vi) {
+                            text = match crate::events::note_of_entry(item) {
+                                Some(n) if !n.is_empty() => format!("{}\n{}", crate::events::display(item), n),
+                                _ => crate::events::display(item),
+                            };
+                        }
+                        let avail = f
+                            .regions
+                            .iter()
+                            .rev()
+                            .find(|(_r, a)| matches!(a, SbAction::AgendaEdit(j) if *j == vi))
+                            .map(|(r, _)| r.w)
+                            .unwrap_or(0.0);
+                        Some((vi as u64, text, avail))
+                    }
+                    Some(SbAction::TodoRow(gi)) => {
+                        let mut text = String::new();
+                        if let Some(td) = crate::sidebar::todo_at(gi) {
+                            text = match &td.note {
+                                Some(n) if !n.is_empty() => format!("{}\n{}", td.text, n),
+                                _ => td.text.clone(),
+                            };
+                        }
+                        let avail = f
+                            .regions
+                            .iter()
+                            .rev()
+                            .find(|(_r, a)| matches!(a, SbAction::TodoRow(j) if *j == gi))
+                            .map(|(r, _)| r.w)
+                            .unwrap_or(0.0);
+                        Some((1000 + gi as u64, text, avail))
+                    }
                     _ => None,
                 };
-                match tip_hit {
-                    Some(vi) => {
-                        let same = matches!(&f.tip_hover, Some((k0, ..)) if *k0 == vi as u64);
+                match tip_target {
+                    Some((key, text, avail)) => {
+                        let same = matches!(&f.tip_hover, Some((k0, ..)) if *k0 == key);
                         if !same {
-                            let mut text = String::new();
-                            if let Some((_, _, item)) = f.agenda_rows.get(vi) {
-                                text = match crate::events::note_of_entry(item) {
-                                    Some(n) if !n.is_empty() => format!("{}\n{}", crate::events::display(item), n),
-                                    _ => crate::events::display(item),
-                                };
-                            }
-                            let mut avail = 0.0f32;
-                            for (r, act) in f.regions.iter().rev() {
-                                if matches!(act, SbAction::AgendaEdit(j) if *j == vi) {
-                                    avail = r.w;
-                                    break;
-                                }
-                            }
                             if !text.is_empty() && avail > 0.0 && crate::tooltip::est_width(&text, 12.5) > avail {
                                 let mut wr: RECT = std::mem::zeroed();
                                 unsafe {
@@ -1392,7 +1519,7 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                                 }
                                 let sx = wr.left + (x * f.sf) as i32;
                                 let sy = wr.top + (y * f.sf) as i32;
-                                f.tip_hover = Some((vi as u64, std::time::Instant::now(), text, sx, sy));
+                                f.tip_hover = Some((key, std::time::Instant::now(), text, sx, sy));
                             } else {
                                 f.tip_hover = None;
                                 crate::tooltip::hide();
@@ -1456,6 +1583,10 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                 let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 match hit {
+                    Some(SbAction::Close) => {
+                        drop(guard);
+                        sidebar_hide();
+                    }
                     Some(SbAction::CardManage) => {
                         drop(guard);
                         crate::flyout::show_settings_tab(2);
@@ -1588,7 +1719,7 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
             0
         }
         WM_MOUSEWHEEL => {
-            // 滚轮作用于光标所在的卡片列表（日程/待办），翻动溢出内容
+            // 滚轮优先作用于光标所在卡片列表（日程/待办/逾期），都不在时整栏滚动
             let delta = ((wp as i32) >> 16) as i16 as f32;
             let mut guard = SIDEBAR_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
@@ -1599,26 +1730,51 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                     ScreenToClient(hwnd as HWND, &mut pt);
                 }
                 let cy = pt.y as f32 / f.sf;
-                let (target, count) = if cy >= f.agenda_band.0 && cy < f.agenda_band.1 && f.agenda_count > AGENDA_VISIBLE {
-                    (0, f.agenda_count)
+                let step = ((delta / 120.0) * 2.0).round() as i32; // 每格滚 2 行
+                let page_step = ((delta / 120.0) * 60.0).round() as i32; // 整栏每格滚 60 逻辑 px
+                // 目标：(当前偏移, 总数, 可见行数, 是否整栏)
+                enum Zone {
+                    Agenda,
+                    Todo,
+                    Over,
+                    Page,
+                }
+                let (zone, count) = if cy >= f.agenda_band.0 && cy < f.agenda_band.1 && f.agenda_count > AGENDA_VISIBLE {
+                    (Zone::Agenda, f.agenda_count)
+                } else if cy >= f.over_band.0 && cy < f.over_band.1 && f.over_count > TODO_VISIBLE {
+                    (Zone::Over, f.over_count)
                 } else if cy >= f.todo_band.0 && cy < f.todo_band.1 && f.todo_count > TODO_VISIBLE {
-                    (1, f.todo_count)
+                    (Zone::Todo, f.todo_count)
+                } else if f.page_max > 0 {
+                    (Zone::Page, 0)
                 } else {
-                    (-1, 0)
+                    return 0;
                 };
-                if target >= 0 {
-                    let visible = if target == 0 { AGENDA_VISIBLE } else { TODO_VISIBLE };
-                    let max_off = count.saturating_sub(visible);
-                    let step = ((delta / 120.0) * 2.0).round() as i32; // 每格滚 2 行
-                    let cur = if target == 0 { f.agenda_scroll } else { f.todo_scroll };
-                    let next = (cur as i32 - step).clamp(0, max_off as i32) as usize;
-                    if next != cur {
-                        if target == 0 {
-                            f.agenda_scroll = next;
-                        } else {
-                            f.todo_scroll = next;
+                match zone {
+                    Zone::Page => {
+                        let next = (f.page_scroll as i32 - page_step).clamp(0, f.page_max as i32) as usize;
+                        if next != f.page_scroll {
+                            f.page_scroll = next;
+                            f.redraw();
                         }
-                        f.redraw();
+                    }
+                    _ => {
+                        let visible = TODO_VISIBLE;
+                        let max_off = count.saturating_sub(visible);
+                        let cur = match zone {
+                            Zone::Agenda => f.agenda_scroll,
+                            Zone::Todo => f.todo_scroll,
+                            _ => f.over_scroll,
+                        };
+                        let next = (cur as i32 - step).clamp(0, max_off as i32) as usize;
+                        if next != cur {
+                            match zone {
+                                Zone::Agenda => f.agenda_scroll = next,
+                                Zone::Todo => f.todo_scroll = next,
+                                _ => f.over_scroll = next,
+                            }
+                            f.redraw();
+                        }
                     }
                 }
             }

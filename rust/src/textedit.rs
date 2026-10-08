@@ -1,6 +1,65 @@
 //! 通用文本编辑内核：光标/选区一律按 char 计数，供主面板快捷输入与新建/编辑弹窗
 //! 共用。调用方持有 (String, usize 光标, Option<usize> 选区锚点) 三元组，在此之上
-//! 完成插入、删除、移动、剪贴板等操作。
+//! 完成插入、删除、移动、剪贴板、撤销/重做等操作。
+
+/// 撤销/重做栈：变更前调用 snapshot 压入 (text, caret, sel) 快照；
+/// undo/redo 在新旧栈间搬运并恢复。连续字符输入 500ms 内合并为一步
+/// （整段打字一次撤销），光标移动/删除/粘贴各自独立成步。
+pub struct Undo {
+    cap: usize,
+    past: Vec<(String, usize, Option<usize>)>,
+    future: Vec<(String, usize, Option<usize>)>,
+    /// 上一次快照是否为可合并的字符插入（"ins"）
+    last_ins: bool,
+    last_at: Option<std::time::Instant>,
+}
+
+impl Undo {
+    pub fn new(cap: usize) -> Self {
+        Undo { cap: cap.max(1), past: Vec::new(), future: Vec::new(), last_ins: false, last_at: None }
+    }
+
+    /// 变更前调用。kind = "ins"（字符插入，可合并）或其它（独立一步）。
+    pub fn snapshot(&mut self, text: &str, caret: usize, sel: Option<usize>, kind: &str) {
+        let now = std::time::Instant::now();
+        let ins = kind == "ins";
+        let coalesce = ins
+            && self.last_ins
+            && self.last_at.map(|t| now.duration_since(t).as_millis() < 500).unwrap_or(false);
+        self.last_ins = ins;
+        self.last_at = Some(now);
+        if coalesce {
+            return;
+        }
+        self.past.push((text.to_string(), caret, sel));
+        if self.past.len() > self.cap {
+            self.past.remove(0);
+        }
+        self.future.clear();
+    }
+
+    /// 撤销：恢复到最近一次快照。返回是否发生了恢复。
+    pub fn undo(&mut self, text: &mut String, caret: &mut usize, sel: &mut Option<usize>) -> bool {
+        let Some((t, c, s)) = self.past.pop() else { return false };
+        self.future.push((std::mem::take(text), *caret, *sel));
+        *text = t;
+        *caret = c;
+        *sel = s;
+        self.last_ins = false;
+        true
+    }
+
+    /// 重做：恢复被撤销的状态。返回是否发生了恢复。
+    pub fn redo(&mut self, text: &mut String, caret: &mut usize, sel: &mut Option<usize>) -> bool {
+        let Some((t, c, s)) = self.future.pop() else { return false };
+        self.past.push((std::mem::take(text), *caret, *sel));
+        *text = t;
+        *caret = c;
+        *sel = s;
+        self.last_ins = false;
+        true
+    }
+}
 
 /// 归一化选区范围：(较小 char 下标, 较大 char 下标)；无选区时为 (caret, caret)
 pub fn sel_range(text: &str, caret: usize, sel: Option<usize>) -> (usize, usize) {

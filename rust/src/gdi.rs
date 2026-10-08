@@ -294,23 +294,32 @@ pub fn set_font_family(name: &str) {
     }
 }
 
-unsafe fn gdi_font(px: i32, bold: bool) -> usize {
+// GDI HFONT 的字体面 id（一个缓存池装三套字体）
+pub const FACE_UI: u8 = 0; // 界面字体（设置可选）
+pub const FACE_MDL2: u8 = 1; // Segoe MDL2 Assets 图标
+pub const FACE_EMOJI: u8 = 2; // Segoe UI Emoji（非 BMP 字符回退，GDI 无自动字体回退）
+
+unsafe fn gdi_font(px: i32, bold: bool, face: u8) -> usize {
     use winapi::um::wingdi::{
         CreateFontW, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS,
     };
-    let key = ((px as i64) << 1) | bold as i64;
+    let key = ((px as i64) << 3) | ((bold as i64) << 2) | face as i64;
     let mut map = GFONTS.lock().unwrap();
     if let Some(f) = map.get(&key) {
         return *f;
     }
-    let face_name = font_family();
+    let face_name = match face {
+        FACE_MDL2 => "Segoe MDL2 Assets".to_string(),
+        FACE_EMOJI => "Segoe UI Emoji".to_string(),
+        _ => font_family(),
+    };
     let face = wide(&face_name);
     let hfont = CreateFontW(
         -px,
         0,
         0,
         0,
-        if bold { FW_BOLD as i32 } else { FW_NORMAL as i32 },
+        if bold { FW_BOLD as i32 } else { FW_NORMAL },
         0,
         0,
         0,
@@ -333,6 +342,26 @@ unsafe fn gdi_font(px: i32, bold: bool) -> usize {
         }
     }
     hf
+}
+
+/// 按字体把文本分段：非 BMP 字符（emoji 等）单独成段走 Segoe UI Emoji，
+/// 其余用界面字体（GDI 没有自动字体回退，避免生僻字符变豆腐块）
+fn segment_faces(s: &str) -> Vec<(String, u8)> {
+    let mut out: Vec<(String, u8)> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_face = FACE_UI;
+    for ch in s.chars() {
+        let face = if (ch as u32) > 0xFFFF { FACE_EMOJI } else { FACE_UI };
+        if !cur.is_empty() && face != cur_face {
+            out.push((std::mem::take(&mut cur), cur_face));
+        }
+        cur_face = face;
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        out.push((cur, cur_face));
+    }
+    out
 }
 
 #[repr(C)]
@@ -658,10 +687,10 @@ impl Painter {
         // 分数字号——两侧用同一口径后，fit_text_px/折行等"按测量判定放得下"的结果
         // 与实际绘制完全一致（此前 11.55px 测量、12px 绘制会判错溢出）
         let px = self.quant_px(px);
-        // 内存位图上 GDI+ 的 ClearType 被静默回退为灰度；正文改走 GDI DrawTextW 保留子像素渲染。
-        // CAL_TEXT_HINT 覆盖时走 GDI+（保留调试 A/B 通道），图标字体也保持 GDI+ 灰度。
-        if !mdl2 && self.dc != 0 && !self.scan0.is_null() && text_hint() == TEXT_HINT_CLEAR_TYPE
-            && self.text_gdi(s, x, y, w, h, halign, valign, px, bold, color)
+        // 内存位图上 GDI+ 的 ClearType 被静默回退为灰度；正文（含图标字体）改走
+        // GDI DrawTextW 保留子像素渲染。CAL_TEXT_HINT 覆盖时走 GDI+（保留调试 A/B 通道）。
+        if self.dc != 0 && !self.scan0.is_null() && text_hint() == TEXT_HINT_CLEAR_TYPE
+            && self.text_gdi(s, x, y, w, h, halign, valign, px, bold, mdl2, color)
         {
             return;
         }
@@ -688,8 +717,11 @@ impl Painter {
     /// GDI ClearType 文本路径。成功绘制返回 true。
     /// GDI 写 32bpp DIB 会把字形像素的 alpha 清零：绘制前快照、绘制后按差分把
     /// 被触碰的像素 alpha 置回 255，未触碰像素（含半透明底）原样保留。
-    fn text_gdi(&self, s: &str, x: f32, y: f32, w: f32, h: f32, halign: i32, valign: i32, px: f32, bold: bool, color: u32) -> bool {
-        use winapi::um::wingdi::{GdiFlush, SelectObject, SetBkMode, SetTextColor, TRANSPARENT};
+    /// 含非 BMP 字符（emoji）时按字体分段逐段绘制（emoji 走 Segoe UI Emoji，
+    /// GDI 没有自动字体回退）。
+    fn text_gdi(&self, s: &str, x: f32, y: f32, w: f32, h: f32, halign: i32, valign: i32, px: f32, bold: bool, mdl2: bool, color: u32) -> bool {
+        use winapi::shared::windef::SIZE;
+        use winapi::um::wingdi::{GetTextExtentPoint32W, GdiFlush, SelectObject, SetBkMode, SetTextColor, TextOutW, TRANSPARENT};
         use winapi::um::winuser::{DrawTextW, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER};
         let bw = self.s(self.w) as i32;
         let bh = self.s(self.h) as i32;
@@ -716,33 +748,81 @@ impl Painter {
         let mut snap = vec![0u8; rect_bytes];
         unsafe {
             let hdc = self.dc as winapi::shared::windef::HDC;
-            let hfont = gdi_font(px_i, bold);
-            if hfont == 0 {
-                return false;
-            }
-            // 快照
-            let base = self.scan0.add(cy0 as usize * stride + cx0 as usize * 4);
-            std::ptr::copy_nonoverlapping(base, snap.as_mut_ptr(), rect_bytes);
-            let prev = SelectObject(hdc, hfont as *mut winapi::ctypes::c_void);
             SetBkMode(hdc, TRANSPARENT as i32);
             // COLORREF = 0x00BBGGRR，与 GDI+ 的 0xAARRGGBB 字节序相反
             let cr = ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF);
             SetTextColor(hdc, cr as u32);
-            let mut rc = winapi::shared::windef::RECT { left: rx, top: ry, right: rx + rw, bottom: ry + rh };
-            let mut fmt = DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-            fmt |= match halign {
-                HALIGN_CENTER => DT_CENTER,
-                HALIGN_FAR => DT_RIGHT,
-                _ => 0,
-            };
-            if valign == HALIGN_CENTER {
-                fmt |= DT_VCENTER;
+            // 含 emoji（非 BMP 字符）→ 分段绘制；否则单段 DrawTextW 快速路径
+            let has_emoji = !mdl2 && s.chars().any(|c| c as u32 > 0xFFFF);
+            if has_emoji {
+                let segs = segment_faces(s);
+                // 逐段测宽（与绘制同一字体口径）
+                let mut widths: Vec<i32> = Vec::with_capacity(segs.len());
+                let mut total = 0i32;
+                let mut line_h = 0i32;
+                for (txt, fid) in &segs {
+                    let hf = gdi_font(px_i, bold, *fid);
+                    if hf == 0 {
+                        return false;
+                    }
+                    let prev = SelectObject(hdc, hf as *mut winapi::ctypes::c_void);
+                    let w16: Vec<u16> = txt.encode_utf16().collect();
+                    let mut sz = SIZE { cx: 0, cy: 0 };
+                    GetTextExtentPoint32W(hdc, w16.as_ptr(), w16.len() as i32, &mut sz);
+                    SelectObject(hdc, prev);
+                    widths.push(sz.cx);
+                    total += sz.cx;
+                    line_h = line_h.max(sz.cy);
+                }
+                // 快照（在写入前）
+                let base = self.scan0.add(cy0 as usize * stride + cx0 as usize * 4);
+                std::ptr::copy_nonoverlapping(base, snap.as_mut_ptr(), rect_bytes);
+                // 水平/垂直对齐（放不下的段截掉，GDI 无逐段省略号）
+                let start_x = match halign {
+                    HALIGN_CENTER => rx as f32 + ((rw - total.min(rw)) as f32 / 2.0),
+                    HALIGN_FAR => (rx + rw - total.min(rw)) as f32,
+                    _ => rx as f32,
+                };
+                let y_top = if valign == HALIGN_CENTER { ry as f32 + (rh - line_h) as f32 / 2.0 } else { ry as f32 };
+                let mut cx_pos = start_x;
+                for ((txt, fid), wd) in segs.iter().zip(&widths) {
+                    if cx_pos + *wd as f32 > (rx + rw) as f32 + 0.5 {
+                        break;
+                    }
+                    let hf = gdi_font(px_i, bold, *fid);
+                    let prev = SelectObject(hdc, hf as *mut winapi::ctypes::c_void);
+                    let w16: Vec<u16> = txt.encode_utf16().collect();
+                    TextOutW(hdc, cx_pos.round() as i32, y_top.round() as i32, w16.as_ptr(), w16.len() as i32);
+                    SelectObject(hdc, prev);
+                    cx_pos += *wd as f32;
+                }
+                GdiFlush();
+            } else {
+                let face = if mdl2 { FACE_MDL2 } else { FACE_UI };
+                let hfont = gdi_font(px_i, bold, face);
+                if hfont == 0 {
+                    return false;
+                }
+                // 快照
+                let base = self.scan0.add(cy0 as usize * stride + cx0 as usize * 4);
+                std::ptr::copy_nonoverlapping(base, snap.as_mut_ptr(), rect_bytes);
+                let prev = SelectObject(hdc, hfont as *mut winapi::ctypes::c_void);
+                let mut rc = winapi::shared::windef::RECT { left: rx, top: ry, right: rx + rw, bottom: ry + rh };
+                let mut fmt = DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+                fmt |= match halign {
+                    HALIGN_CENTER => DT_CENTER,
+                    HALIGN_FAR => DT_RIGHT,
+                    _ => 0,
+                };
+                if valign == HALIGN_CENTER {
+                    fmt |= DT_VCENTER;
+                }
+                let mut buf: Vec<u16> = s.encode_utf16().collect();
+                buf.push(0);
+                DrawTextW(hdc, buf.as_mut_ptr(), (buf.len() - 1) as i32, &mut rc, fmt);
+                GdiFlush();
+                SelectObject(hdc, prev);
             }
-            let mut buf: Vec<u16> = s.encode_utf16().collect();
-            buf.push(0);
-            DrawTextW(hdc, buf.as_mut_ptr(), (buf.len() - 1) as i32, &mut rc, fmt);
-            GdiFlush();
-            SelectObject(hdc, prev);
             // 差分修复：字形触碰的像素 alpha 置回 255；未触碰像素原样保留
             for row in 0..rows {
                 let dst = self.scan0.add((cy0 as usize + row) * stride + cx0 as usize * 4) as *mut u32;
@@ -770,6 +850,13 @@ impl Painter {
 
     pub fn measure(&self, s: &str, px: f32, bold: bool, mdl2: bool) -> (f32, f32) {
         let px = self.quant_px(px);
+        // 与绘制同引擎：GDI ClearType 路径激活时用 GetTextExtentPoint32W 测量，
+        // 消除 GDI+ 度量与 GDI 字形宽度的固有差异（fit/折行判定不再误判）
+        if self.dc != 0 && !self.scan0.is_null() && text_hint() == TEXT_HINT_CLEAR_TYPE {
+            if let Some(v) = self.measure_gdi(s, self.s(px), bold, mdl2) {
+                return v;
+            }
+        }
         unsafe {
             let layout = RectF { x: 0.0, y: 0.0, w: 10000.0, h: 200.0 };
             let mut out = RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
@@ -789,6 +876,42 @@ impl Painter {
                 );
             });
             (out.w / self.sf, out.h / self.sf)
+        }
+    }
+
+    /// GDI 测量（GetTextExtentPoint32W，逐字体段累加）；任一段失败回退 GDI+
+    fn measure_gdi(&self, s: &str, px_phys: f32, bold: bool, mdl2: bool) -> Option<(f32, f32)> {
+        use winapi::shared::windef::SIZE;
+        use winapi::um::wingdi::GetTextExtentPoint32W;
+        let px_i = px_phys.round() as i32;
+        if px_i <= 0 || self.dc == 0 {
+            return None;
+        }
+        if s.is_empty() {
+            return Some((0.0, 0.0));
+        }
+        let segs = if mdl2 { vec![(s.to_string(), FACE_MDL2)] } else { segment_faces(s) };
+        unsafe {
+            let hdc = self.dc as winapi::shared::windef::HDC;
+            let mut total = 0.0f32;
+            let mut max_h = 0.0f32;
+            for (txt, fid) in &segs {
+                let hf = gdi_font(px_i, bold, *fid);
+                if hf == 0 {
+                    return None;
+                }
+                let prev = winapi::um::wingdi::SelectObject(hdc, hf as *mut winapi::ctypes::c_void);
+                let w16: Vec<u16> = txt.encode_utf16().collect();
+                let mut sz = SIZE { cx: 0, cy: 0 };
+                let ok = GetTextExtentPoint32W(hdc, w16.as_ptr(), w16.len() as i32, &mut sz);
+                winapi::um::wingdi::SelectObject(hdc, prev);
+                if ok == 0 || sz.cx <= 0 {
+                    return None;
+                }
+                total += sz.cx as f32;
+                max_h = max_h.max(sz.cy as f32);
+            }
+            Some((total / self.sf, max_h / self.sf))
         }
     }
 

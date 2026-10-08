@@ -50,6 +50,13 @@ pub fn spawn(clock: SharedClock) {
         .ok();
 }
 
+/// 任务栏时钟所在显示器的工作区（提醒卡片等跟随弹窗定位用）；尚未定位到时钟时 None
+pub fn clock_work_area() -> Option<(i32, i32, i32, i32)> {
+    let arc = CLOCK.get()?;
+    let ci = arc.lock().unwrap().clone()?;
+    Some(ci.work)
+}
+
 unsafe fn message_loop(clock: SharedClock) {
     let _ = CLOCK.set(clock);
 

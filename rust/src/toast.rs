@@ -17,6 +17,8 @@ const TOAST_W: f32 = 300.0;
 const ITEM_H: f32 = 82.0;
 const GAP: f32 = 10.0;
 const MAX_ITEMS: usize = 3;
+/// 溢出折叠汇总条高度（“还有 N 条较早提醒”）
+const SUMMARY_H: f32 = 30.0;
 const SHOW_MS: i64 = 10_000;
 const MARGIN: i32 = 12;
 /// 稍后提醒的间隔（毫秒）
@@ -113,13 +115,15 @@ fn snooze_path() -> std::path::PathBuf {
 }
 
 fn snooze_add(entry: SnoozeEntry) {
-    let mut list: Vec<SnoozeEntry> = std::fs::read_to_string(snooze_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let (list, healed) = crate::config::load_json_or_bak::<Vec<SnoozeEntry>>(&snooze_path());
+    if healed {
+        crate::log::warn("snooze.json 损坏，已自动从备份恢复");
+    }
+    let mut list = list.unwrap_or_default();
     list.push(entry);
     if let Ok(text) = serde_json::to_string(&list) {
-        let _ = std::fs::write(snooze_path(), text);
+        crate::config::backup_file(&snooze_path());
+        let _ = crate::config::write_file_atomic(&snooze_path(), &text);
     }
 }
 
@@ -169,6 +173,8 @@ struct ToastUi {
     g: gdi::Gp,
     cache: Cache,
     items: Vec<Item>,
+    /// 超出 MAX_ITEMS 被折叠的较早提醒条数（顶部汇总条展示，点击清除）
+    dropped: usize,
     /// 悬停按钮：(条目下标, 1=稍后 2=完成)
     hover_btn: Option<(usize, u8)>,
 }
@@ -248,7 +254,7 @@ pub fn rescale() {
         let f = &mut f.0;
         if !f.items.is_empty() {
             unsafe {
-                position(f.hwnd as HWND, f.items.len());
+                position(f);
             }
             repaint(f);
         }
@@ -265,7 +271,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     wc.lpszClassName = cls.as_ptr();
     RegisterClassW(&wc);
 
-    let max_h = gdi::phys(ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32) as i32;
+    let max_h = gdi::phys(ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 + SUMMARY_H + GAP) as i32;
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
         cls.as_ptr(),
@@ -310,6 +316,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
         g,
         cache: Cache::new(),
         items: Vec::new(),
+        dropped: 0,
         hover_btn: None,
     })));
 
@@ -328,8 +335,10 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
                         pushed_loud += 1;
                     }
                     f.items.push(Item { title: m.title, body: m.body, act: m.act, quiet: m.quiet, born: now_ms() });
-                    if f.items.len() > MAX_ITEMS {
+                    // 超出上限的较早提醒折叠进顶部汇总条（不再静默丢弃，点汇总条可清除）
+                    while f.items.len() > MAX_ITEMS {
                         f.items.remove(0);
+                        f.dropped += 1;
                     }
                     dirty = true;
                 }
@@ -343,13 +352,14 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
                     if shown {
                         ShowWindow(hwnd as HWND, SW_HIDE);
                         shown = false;
+                        f.dropped = 0;
                         crate::trim_working_set();
                     }
                 } else {
                     if pushed_loud > 0 && crate::config::remind_sound_on() {
                         play_alert();
                     }
-                    position(hwnd as HWND, f.items.len());
+                    position(f);
                     ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
                     shown = true;
                     repaint(f);
@@ -363,6 +373,21 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
             DispatchMessageW(&msg);
         }
     }
+}
+
+/// 汇总条底部偏移：有折叠条目时条目列表整体下移
+fn summary_off(f: &ToastUi) -> f32 {
+    if f.dropped > 0 {
+        SUMMARY_H + GAP
+    } else {
+        0.0
+    }
+}
+
+/// 窗口总高（逻辑 px）：汇总条（如有）+ 条目列表
+fn total_h(f: &ToastUi) -> f32 {
+    let n = f.items.len();
+    summary_off(f) + ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32
 }
 
 /// 移除一条卡片（按钮点击后）：空了收起窗口，否则重摆重绘
@@ -379,7 +404,7 @@ unsafe fn remove_item(idx: usize) {
         f.hover_btn = None;
         empty = f.items.is_empty();
         if !empty {
-            position(f.hwnd as HWND, f.items.len());
+            position(f);
             repaint(f);
         }
     }
@@ -407,14 +432,25 @@ fn play_alert() {
     }
 }
 
-/// 摆放到主屏工作区右下角（工作区为物理像素，尺寸/边距按 sf 换算）
-unsafe fn position(hwnd: HWND, n: usize) {
-    let mut wa: RECT = std::mem::zeroed();
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as *mut winapi::ctypes::c_void, 0);
-    let h = gdi::phys(ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
-    let x = wa.right - gdi::phys(TOAST_W) as i32 - gdi::phys(MARGIN as f32) as i32;
-    let y = wa.bottom - h - gdi::phys(MARGIN as f32) as i32;
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, gdi::phys(TOAST_W) as i32, h, SWP_NOACTIVATE);
+/// 提醒卡片锚定的工作区：优先任务栏时钟所在屏（overlay 线程记录，
+/// 与日历弹窗同屏），拿不到再回退主屏工作区
+fn anchor_work_area() -> (i32, i32, i32, i32) {
+    crate::overlay::clock_work_area().unwrap_or_else(|| {
+        let mut wa: RECT = unsafe { std::mem::zeroed() };
+        unsafe {
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as *mut winapi::ctypes::c_void, 0);
+        }
+        (wa.left, wa.top, wa.right, wa.bottom)
+    })
+}
+
+/// 摆放到日历所在屏工作区右下角（工作区为物理像素，尺寸/边距按 sf 换算）
+unsafe fn position(f: &ToastUi) {
+    let (_, _, wa_r, wa_b) = anchor_work_area();
+    let h = gdi::phys(total_h(f)) as i32;
+    let x = wa_r - gdi::phys(TOAST_W) as i32 - gdi::phys(MARGIN as f32) as i32;
+    let y = wa_b - h - gdi::phys(MARGIN as f32) as i32;
+    SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(TOAST_W) as i32, h, SWP_NOACTIVATE);
 }
 
 fn repaint(f: &mut ToastUi) {
@@ -425,15 +461,22 @@ fn repaint(f: &mut ToastUi) {
         let cache_ptr: *const Cache = &f.cache;
         GdipSetSmoothingMode(f.g, gdi::SMOOTH_ANTI_ALIAS);
         GdipSetTextRenderingHint(f.g, gdi::text_hint());
-        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32, dc: f.mem_dc, scan0: f.scan0 };
+        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 + SUMMARY_H + GAP, dc: f.mem_dc, scan0: f.scan0 };
         p.clear();
-        let n = f.items.len();
+        // 溢出折叠汇总条（点击清除）
+        if f.dropped > 0 {
+            let sh = SUMMARY_H;
+            p.fill_round(0.0, 0.0, TOAST_W, sh, 10.0, BG());
+            p.stroke_round(0.5, 0.5, TOAST_W - 1.0, sh - 1.0, 10.0, 1.0, BORDER());
+            p.text(&format!("还有 {} 条较早提醒（点击清除）", f.dropped), 14.0, 0.0, TOAST_W - 28.0, sh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB());
+        }
+        let off = summary_off(f);
         for (i, it) in f.items.iter().enumerate() {
-            paint_item(&p, (ITEM_H + GAP) * i as f32, it, f.hover_btn.filter(|(hi, _)| *hi == i).map(|(_, b)| b));
+            paint_item(&p, off + (ITEM_H + GAP) * i as f32, it, f.hover_btn.filter(|(hi, _)| *hi == i).map(|(_, b)| b));
         }
         let mut r: RECT = std::mem::zeroed();
         GetWindowRect(f.hwnd as HWND, &mut r);
-        let h = gdi::phys(ITEM_H * n as f32 + GAP * n.saturating_sub(1) as f32) as i32;
+        let h = gdi::phys(total_h(f)) as i32;
         let mut ppt = POINT { x: r.left, y: r.top };
         let mut size = SIZE { cx: gdi::phys(TOAST_W) as i32, cy: h };
         let mut src = POINT { x: 0, y: 0 };
@@ -531,8 +574,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let guard = TOAST_UI.lock().unwrap();
                 if let Some(f) = guard.as_ref() {
                     let f = &f.0;
+                    let off = summary_off(f);
                     for (i, it) in f.items.iter().enumerate() {
-                        let iy = (ITEM_H + GAP) * i as f32;
+                        let iy = off + (ITEM_H + GAP) * i as f32;
                         if y >= iy && y < iy + ITEM_H {
                             // 命中顺序与 paint_item 一致：撤销卡只有撤销钮，
                             // 完成卡有完成+稍后，普通卡只有稍后（撤销与稍后矩形重叠，
@@ -595,14 +639,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_LBUTTONDOWN => {
             let s = gdi::scale();
             let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
-            // 命中判定：先按钮，后卡片本体
-            let mut hit: Option<(usize, u8)> = None; // 1=稍后 2=完成 3=撤销 0=本体
+            // 命中判定：先按钮，后卡片本体；4=汇总条（点击清除折叠计数）
+            let mut hit: Option<(usize, u8)> = None;
             {
                 let guard = TOAST_UI.lock().unwrap();
                 if let Some(f) = guard.as_ref() {
                     let f = &f.0;
+                    let off = summary_off(f);
+                    if f.dropped > 0 && y >= 0.0 && y < SUMMARY_H {
+                        hit = Some((usize::MAX, 4));
+                    } else {
                     for (i, it) in f.items.iter().enumerate() {
-                        let iy = (ITEM_H + GAP) * i as f32;
+                        let iy = off + (ITEM_H + GAP) * i as f32;
                         if y >= iy && y < iy + ITEM_H {
                             // 与 paint_item 的按钮布局一致（见上：撤销/稍后矩形重叠）
                             if it.has_undo() {
@@ -633,7 +681,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             break;
                         }
                     }
+                    }
                 }
+            }
+            // 汇总条：清除折叠计数（重摆重绘）
+            if hit == Some((usize::MAX, 4)) {
+                let empty;
+                {
+                    let mut guard = TOAST_UI.lock().unwrap();
+                    let Some(f) = guard.as_mut() else { return 0 };
+                    let f = &mut f.0;
+                    f.dropped = 0;
+                    f.hover_btn = None;
+                    empty = f.items.is_empty();
+                    if !empty {
+                        unsafe {
+                            position(f);
+                        }
+                        repaint(f);
+                    }
+                }
+                if empty {
+                    unsafe {
+                        ShowWindow(hwnd_of(), SW_HIDE);
+                        crate::trim_working_set();
+                    }
+                }
+                return 0;
             }
             if let Some((i, btn)) = hit {
                 let item = TOAST_UI.lock().unwrap().as_ref().map(|f| {

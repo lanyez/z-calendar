@@ -90,13 +90,16 @@ pub struct Config {
     pub motto_type: String,
     #[serde(default = "def_true")]
     pub sidebar_todo: bool,      // 待办清单
+    /// 最近提醒（提醒历史，默认关）
+    #[serde(default)]
+    pub sidebar_reminds: bool,
     /// 侧栏卡片顺序（card id 列表；缺失的按默认顺序补齐）
     #[serde(default)]
     pub sidebar_order: Vec<String>,
 }
 
 /// 侧栏卡片定义：(card id, 名称, 设置开关 idx)
-pub const SIDEBAR_CARDS: [(&str, &str, u8); 7] = [
+pub const SIDEBAR_CARDS: [(&str, &str, u8); 8] = [
     ("date", "日期信息", 10),
     ("almanac", "黄历信息", 11),
     ("events", "最近事件", 12),
@@ -104,6 +107,7 @@ pub const SIDEBAR_CARDS: [(&str, &str, u8); 7] = [
     ("history", "历史上的今天", 14),
     ("motto", "时间格言", 15),
     ("todo", "待办清单", 16),
+    ("reminds", "最近提醒", 19), // 17/18 已被系统通知/动画开关占用
 ];
 
 impl Config {
@@ -117,6 +121,7 @@ impl Config {
             "history" => self.sidebar_history,
             "motto" => self.sidebar_motto,
             "todo" => self.sidebar_todo,
+            "reminds" => self.sidebar_reminds,
             _ => false,
         }
     }
@@ -170,6 +175,7 @@ impl Default for Config {
             sidebar_motto: false,
             motto_type: "d".to_string(),
             sidebar_todo: true,
+            sidebar_reminds: false,
             sidebar_order: Vec::new(),
             ui_font_scale: 1.0,
             ui_font_family: "Microsoft YaHei UI".to_string(),
@@ -187,13 +193,29 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-/// 写入前把现有文件复制为 .bak（数据文件损坏时可手工恢复）
+/// 写入前把现有文件滚动备份为 .bak / .bak1（保留两代；
+/// 连续两次坏写不会同时毁掉两份备份，数据文件损坏时可手工恢复）
 pub fn backup_file(path: &PathBuf) {
     let bak = path.with_extension("bak");
-    let _ = std::fs::copy(path, bak);
+    let bak1 = path.with_extension("bak1");
+    if bak.exists() {
+        let _ = std::fs::rename(&bak, &bak1);
+    }
+    if path.exists() {
+        let _ = std::fs::copy(path, bak);
+    }
 }
 
-/// 读 JSON，主文件损坏时自动从 .bak 恢复。
+/// 原子写文本：先写同目录临时文件再 rename 替换（Windows 的 rename 带
+/// MOVEFILE_REPLACE_EXISTING 语义），写盘中途崩溃或并发读都不会看到半截文件。
+/// 失败不致命（主文件保持上一次完整内容），由调用方忽略/记日志。
+pub fn write_file_atomic(path: &PathBuf, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// 读 JSON，主文件损坏时自动从 .bak（再退 .bak1）恢复。
 /// 返回 (数据, 是否发生了恢复)。损坏文件留档为 .corrupt（即使没有可用备份，
 /// 也先把坏文件改名，避免下次保存把坏内容复制进 .bak）。
 pub fn load_json_or_bak<T: serde::de::DeserializeOwned>(path: &PathBuf) -> (Option<T>, bool) {
@@ -206,10 +228,13 @@ pub fn load_json_or_bak<T: serde::de::DeserializeOwned>(path: &PathBuf) -> (Opti
     }
     let _ = std::fs::rename(path, path.with_extension("corrupt"));
     let bak = path.with_extension("bak");
-    if let Ok(bt) = std::fs::read_to_string(&bak) {
-        if let Ok(v) = serde_json::from_str::<T>(&bt) {
-            let _ = std::fs::copy(&bak, path);
-            return (Some(v), true);
+    let bak1 = path.with_extension("bak1");
+    for cand in [&bak, &bak1] {
+        if let Ok(bt) = std::fs::read_to_string(cand) {
+            if let Ok(v) = serde_json::from_str::<T>(&bt) {
+                let _ = std::fs::copy(cand, path);
+                return (Some(v), true);
+            }
         }
     }
     (None, false)
@@ -281,7 +306,7 @@ impl Config {
 
     pub fn save(&self) {
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(config_path(), text);
+            let _ = write_file_atomic(&config_path(), &text);
         }
     }
 }

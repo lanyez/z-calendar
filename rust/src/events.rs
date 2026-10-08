@@ -129,7 +129,7 @@ pub fn save(map: &AgendaMap) {
     let path = crate::config::data_dir().join("agenda.json");
     if let Ok(text) = serde_json::to_string(map) {
         crate::config::backup_file(&path);
-        let _ = std::fs::write(path, text);
+        let _ = crate::config::write_file_atomic(&path, &text);
     }
 }
 
@@ -173,6 +173,8 @@ pub fn recur_label(rc: &str) -> String {
 
 /// 按天重复是否命中：date 晚于锚点日时判断（锚点日当天由原生条目直接展示）。
 /// l=农历每年：按农历月/日比对（忽略闰月标记，闰月里的日子按普通月处理）。
+/// m/y：锚点日超出目标月天数时 clamp 到当月最后一天（1月31日的"每月"
+/// 在 2 月落到 2-28，2月29日的"每年"在平年落到 2-28），不再静默消失。
 pub fn recur_hits(kind: &str, anchor: NaiveDate, date: NaiveDate) -> bool {
     if date <= anchor {
         return false;
@@ -181,14 +183,27 @@ pub fn recur_hits(kind: &str, anchor: NaiveDate, date: NaiveDate) -> bool {
         "d" => true,
         "w" => anchor.weekday() == date.weekday(),
         "wd" => date.weekday().num_days_from_monday() <= 4,
-        "m" => anchor.day() == date.day(),
-        "y" => anchor.month() == date.month() && anchor.day() == date.day(),
+        "m" => anchor.day() == date.day() || (anchor.day() > days_in_month(date) && date.day() == days_in_month(date)),
+        "y" => {
+            anchor.month() == date.month()
+                && (anchor.day() == date.day()
+                    || (anchor.day() > days_in_month(date) && date.day() == days_in_month(date)))
+        }
         "l" => match (crate::lunar::solar_to_lunar(anchor), crate::lunar::solar_to_lunar(date)) {
             (Some(a), Some(d)) => a.month == d.month && a.day == d.day,
             _ => false,
         },
         _ => false,
     }
+}
+
+/// 当月天数（短月 clamp 用）
+fn days_in_month(d: NaiveDate) -> u32 {
+    let (ny, nm) = if d.month() == 12 { (d.year() + 1, 1) } else { (d.year(), d.month() + 1) };
+    NaiveDate::from_ymd_opt(ny, nm, 1)
+        .and_then(|x| x.pred_opt())
+        .map(|x| x.day())
+        .unwrap_or(31)
 }
 
 /// 重复截止判定：date 是否仍在截止日内（无截止 = 一直有效）
@@ -905,6 +920,25 @@ mod tests {
         assert_eq!(parse_quick_time("明天", base), None);
         assert_eq!(parse_quick_time("14:00", base), None);
         assert_eq!(parse_quick_time("", base), None);
+    }
+
+    #[test]
+    fn recur_hits_monthly_clamps_short_month() {
+        // 1月31日"每月"：2 月落到月末 2-28，3 月照常 31 号
+        let a = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        assert!(recur_hits("m", a, NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()));
+        assert!(!recur_hits("m", a, NaiveDate::from_ymd_opt(2026, 2, 27).unwrap()));
+        assert!(recur_hits("m", a, NaiveDate::from_ymd_opt(2026, 3, 31).unwrap()));
+        assert!(!recur_hits("m", a, NaiveDate::from_ymd_opt(2026, 4, 29).unwrap()));
+        // 4月30日"每月"：31 天月不漂移（30 号命中、31 号不命中）
+        let b = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert!(recur_hits("m", b, NaiveDate::from_ymd_opt(2026, 5, 30).unwrap()));
+        assert!(!recur_hits("m", b, NaiveDate::from_ymd_opt(2026, 5, 31).unwrap()));
+        // 2月29日"每年"：平年 clamp 到 2-28，闰年照常 29 号
+        let c = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        assert!(recur_hits("y", c, NaiveDate::from_ymd_opt(2025, 2, 28).unwrap()));
+        assert!(recur_hits("y", c, NaiveDate::from_ymd_opt(2028, 2, 29).unwrap()));
+        assert!(!recur_hits("y", c, NaiveDate::from_ymd_opt(2025, 3, 28).unwrap()));
     }
 
     #[test]

@@ -114,8 +114,10 @@ enum DlAction {
     /// 直接键入应用（回车/按钮）
     PickApply,
     ListItem(usize),
-    /// 备注卡片点击（聚焦备注编辑）
+    /// 备注卡片点击（聚焦备注编辑，光标定位到点击处）
     NoteInput,
+    /// 主文本卡片点击（光标定位到点击处；备注聚焦时点回主卡取消聚焦）
+    TextInput,
     /// 颜色选择（0=默认 1绿 2橙 3红 4紫 5青）
     ColorPick(u8),
     Noop,
@@ -191,6 +193,10 @@ struct DialogUi {
     /// 主文本（日程名/待办内容）光标（char 下标）与选区锚点
     caret: usize,
     sel: Option<usize>,
+    /// 撤销/重做栈：主文本 / 备注 / 直接键入框各自独立
+    text_undo: crate::textedit::Undo,
+    note_undo: crate::textedit::Undo,
+    pick_undo: crate::textedit::Undo,
     /// 选择面板打开时的“直接键入日期/时间”编辑器
     pick: Option<PickEdit>,
     drop: Option<Drop>,
@@ -248,14 +254,15 @@ fn dialog_h(kind: Kind, time_on: bool, recur_rows: usize) -> f32 {
     let mut y = TOP_Y;
     match kind {
         Kind::Todo => {
-            y += 130.0 + GAP; // 内容
+            y += 54.0 + GAP; // 内容（2 行高）
             y += 52.0 + GAP; // 优先级
-            y += if time_on { 206.0 } else { 50.0 } + GAP; // 时间卡片
+            // 时间卡片：开时间 4 行；全天（关时间）保留 时间/提醒 两行（全天按 09:00 提醒）
+            y += if time_on { 206.0 } else { 96.0 } + GAP;
             y += 54.0 + GAP; // 备注
             y += 44.0 + GAP; // 颜色
         }
         Kind::Agenda => {
-            y += 56.0 + GAP; // 名称
+            y += 54.0 + GAP; // 名称（2 行高）
             y += 54.0 + GAP; // 全天
             y += 164.0 + GAP; // 时间卡片
             y += 54.0 + GAP; // 备注
@@ -336,6 +343,9 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             caret_on: true,
             caret: 0,
             sel: None,
+            text_undo: crate::textedit::Undo::new(80),
+            note_undo: crate::textedit::Undo::new(80),
+            pick_undo: crate::textedit::Undo::new(40),
             pick: None,
             drop: None,
             regions: Vec::new(),
@@ -750,20 +760,21 @@ impl DialogUi {
         let mut y = TOP_Y;
         match self.kind {
             Kind::Todo => {
-                self.paint_text_card(p, y, 130.0, "输入待办内容…");
-                y += 130.0 + GAP;
+                self.paint_text_card(p, y, 54.0, "输入待办内容…");
+                y += 54.0 + GAP;
                 self.paint_priority_row(p, y);
                 y += 52.0 + GAP;
                 self.paint_time_card(p, y, true);
-                y += if self.time_on { 206.0 } else { 50.0 } + GAP;
+                // 与 paint_time_card 的 card_h 一致：全天（关时间）卡内含 时间+提醒 两行 96 高
+                y += if self.time_on { 206.0 } else { 96.0 } + GAP;
                 self.paint_note_card(p, y);
                 y += 54.0 + GAP;
                 self.paint_color_row(p, y);
                 y += 44.0 + GAP;
             }
             Kind::Agenda => {
-                self.paint_text_card(p, y, 56.0, "输入日程名称");
-                y += 56.0 + GAP;
+                self.paint_text_card(p, y, 54.0, "输入日程内容");
+                y += 54.0 + GAP;
                 // 全天（开关点击区与开关图形对齐）
                 p.fill_round(14.0, y, 372.0, 54.0, 8.0, CARD_BG());
                 p.text("全天", 20.0, y, 80.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
@@ -806,31 +817,37 @@ impl DialogUi {
     }
 
     /// 文本输入卡片（待办内容多行 / 日程名称单行）：
-    /// 光标按位置绘制、选区高亮、IME 组合串内联在光标处
+    /// 光标按位置绘制、选区高亮、IME 组合串内联在光标处；点击定位光标。
+    /// 备注是独立字段：备注聚焦时组合串/光标/高亮边框只出现在备注卡，
+    /// 主文本卡不再内联组合串与光标（二者互不干扰）
     fn paint_text_card(&mut self, p: &Painter, y: f32, ch: f32, placeholder: &str) {
+        let focused = !self.note_focus;
         p.fill_round(14.0, y, 372.0, ch, 8.0, FIELD_BG());
-        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
-        Self::hit_add(&mut self.regions, 14.0, y, 372.0, ch, DlAction::Noop);
+        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if focused && self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
+        Self::hit_add(&mut self.regions, 14.0, y, 372.0, ch, DlAction::TextInput);
         let tx = 26.0;
         let tw = 348.0;
+        let lh = 19.0;
         let text = self.text_mut().clone();
-        // 组合串显示在光标处
+        // 组合串显示在光标处（仅主文本聚焦时）
+        let comp: String = if focused { self.comp.clone() } else { String::new() };
         let chars: Vec<char> = text.chars().collect();
         let pos = self.caret.min(chars.len());
-        let shown: String = chars[..pos].iter().copied().chain(self.comp.chars()).chain(chars[pos..].iter().copied()).collect();
+        let shown: String = chars[..pos].iter().copied().chain(comp.chars()).chain(chars[pos..].iter().copied()).collect();
         if shown.is_empty() {
             p.text(placeholder, tx, y + 8.0, tw, ch - 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
-            if self.caret_on {
-                p.line(tx + 1.0, y + 14.0, tx + 1.0, y + ch - 14.0, 1.2, ROW_TXT());
+            if focused && self.caret_on {
+                // 空内容光标 = 首行行框内（与有内容时同几何；此前 y+14..y+ch-14 撑满整卡，
+                // 130 高的待办内容卡里光标高达 102px）
+                p.line(tx + 1.0, y + 8.0 + 3.0, tx + 1.0, y + 8.0 + lh - 3.0, 1.2, ROW_TXT());
             }
             return;
         }
         let layout = layout_lines(p, &shown, tw);
-        let lh = 19.0;
         let max_lines = ((ch - 16.0) / lh).floor().max(1.0) as usize;
         let skip = layout.len().saturating_sub(max_lines);
         // 选区高亮（IME 组合中不显示选区）
-        if self.comp.is_empty() {
+        if comp.is_empty() {
             let (sa, sb) = crate::textedit::sel_range(&text, self.caret, self.sel);
             if sa < sb {
                 for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
@@ -848,11 +865,13 @@ impl DialogUi {
             }
         }
         for (i, (line, _)) in layout.iter().enumerate().skip(skip) {
-            p.text(line, tx, y + 8.0 + i as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+            // 可视行号 = 全局行号 - skip：聚焦滚动后仍从卡顶开始画（否则会画出卡片外）
+            let vi = i - skip;
+            p.text(line, tx, y + 8.0 + vi as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
         }
-        // 光标：组合串之后的位置
-        if self.caret_on {
-            let caret_shown = pos + self.comp.chars().count();
+        // 光标：组合串之后的位置（仅主文本聚焦时）
+        if focused && self.caret_on {
+            let caret_shown = pos + comp.chars().count();
             let mut found: Option<(usize, f32)> = None;
             for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
                 let len = line.chars().count();
@@ -883,28 +902,131 @@ impl DialogUi {
         }
     }
 
-    /// 备注卡片（单行输入，悬停 tooltip 显示全文）
+    /// 当前聚焦缓冲的文本克隆（撤销快照用，避免与 edit_buf 的借用冲突）
+    fn text_snapshot(&self) -> (String, usize, Option<usize>) {
+        if self.note_focus {
+            (self.note.clone(), self.note_caret, self.note_sel)
+        } else {
+            match self.kind {
+                Kind::Todo => (self.todo_text.clone(), self.caret, self.sel),
+                Kind::Agenda => (self.agenda_name.clone(), self.caret, self.sel),
+            }
+        }
+    }
+
+    /// 变更前压撤销快照（按当前聚焦缓冲路由）；tag 同 Undo::snapshot
+    fn snapshot_edit(&mut self, tag: &str) {
+        let (t, c, s) = self.text_snapshot();
+        if self.note_focus {
+            self.note_undo.snapshot(&t, c, s, tag);
+        } else {
+            self.text_undo.snapshot(&t, c, s, tag);
+        }
+    }
+
+    fn edit_undo(&mut self) -> bool {
+        if self.note_focus {
+            self.note_undo.undo(&mut self.note, &mut self.note_caret, &mut self.note_sel)
+        } else {
+            match self.kind {
+                Kind::Todo => self.text_undo.undo(&mut self.todo_text, &mut self.caret, &mut self.sel),
+                Kind::Agenda => self.text_undo.undo(&mut self.agenda_name, &mut self.caret, &mut self.sel),
+            }
+        }
+    }
+
+    fn edit_redo(&mut self) -> bool {
+        if self.note_focus {
+            self.note_undo.redo(&mut self.note, &mut self.note_caret, &mut self.note_sel)
+        } else {
+            match self.kind {
+                Kind::Todo => self.text_undo.redo(&mut self.todo_text, &mut self.caret, &mut self.sel),
+                Kind::Agenda => self.text_undo.redo(&mut self.agenda_name, &mut self.caret, &mut self.sel),
+            }
+        }
+    }
+
+    /// 绘制器（点击定位光标时复用当前后台位图；仅窗口可见时有效）
+    fn painter(&self) -> Painter {
+        Painter { g: self.g, cache: &self.cache, sf: self.sf, w: DL_W, h: self.h, dc: self.mem_dc, scan0: self.scan0 }
+    }
+
+    /// 点击落点 → 光标 char 下标（按折行布局逐行定位）
+    fn caret_at_click(&self, text: &str, card_y: f32, x: f32, y: f32) -> usize {
+        let p = self.painter();
+        let layout = layout_lines(&p, text, 348.0);
+        let row = ((y - (card_y + 8.0)) / 19.0).max(0.0) as usize;
+        let wpx = (x - 26.0).max(0.0);
+        let n = text.chars().count();
+        match layout.get(row) {
+            Some((line, ls)) => (*ls + crate::textedit::caret_at_x_approx(line, wpx)).min(n),
+            None => n,
+        }
+    }
+
+    /// 备注卡片（两行折行输入，Enter 换行 / Ctrl+Enter 保存；列表悬停 tooltip 显示全文）
     fn paint_note_card(&mut self, p: &Painter, y: f32) {
         let active = self.note_focus;
         p.fill_round(14.0, y, 372.0, 54.0, 8.0, FIELD_BG());
         p.stroke_round(14.0, y, 372.0, 54.0, 8.0, 1.0, if active && self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
         Self::hit_add(&mut self.regions, 14.0, y, 372.0, 54.0, DlAction::NoteInput);
-        if self.note.is_empty() && !(active && !self.comp.is_empty()) {
-            p.text("备注（可选，列表悬停可看全文）", 26.0, y, 348.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
+        let tx = 26.0;
+        let tw = 348.0;
+        let lh = 19.0;
+        let chars: Vec<char> = self.note.chars().collect();
+        let pos = self.note_caret.min(chars.len());
+        let comp: String = if active { self.comp.clone() } else { String::new() };
+        let shown: String = chars[..pos].iter().copied().chain(comp.chars()).chain(chars[pos..].iter().copied()).collect();
+        if shown.is_empty() {
+            p.text("备注（可选，可多行；列表悬停可看全文）", tx, y, tw, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
             if active && self.caret_on {
-                p.line(27.0, y + 14.0, 27.0, y + 40.0, 1.2, ROW_TXT());
+                // 空内容光标 = 首行行框内（与有内容时同几何）
+                p.line(tx + 1.0, y + 8.0 + 3.0, tx + 1.0, y + 8.0 + lh - 3.0, 1.2, ROW_TXT());
             }
-        } else {
-            let chars: Vec<char> = self.note.chars().collect();
-            let pos = self.note_caret.min(chars.len());
-            let comp: String = if active { self.comp.clone() } else { String::new() };
-            let pre: String = chars[..pos].iter().collect();
-            let post: String = chars[pos..].iter().collect();
-            let shown = format!("{}{}{}", pre, comp, post);
-            p.text(&shown, 26.0, y, 348.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
-            if active && self.caret_on {
-                let w = p.measure(&format!("{}{}", pre, comp), 12.5, false, false).0;
-                p.line(26.0 + w + 1.0, y + 14.0, 26.0 + w + 1.0, y + 40.0, 1.2, ROW_TXT());
+            return;
+        }
+        let layout = layout_lines(p, &shown, tw);
+        // 非聚焦显示开头两行；聚焦时跟随光标（超出可视行数滚到底部）
+        let max_lines = 2usize;
+        let skip = if active { layout.len().saturating_sub(max_lines) } else { 0 };
+        // 选区高亮（IME 组合中不显示选区）
+        if comp.is_empty() {
+            let (sa, sb) = crate::textedit::sel_range(&self.note, self.note_caret, self.note_sel);
+            if sa < sb {
+                for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
+                    let le = ls + line.chars().count();
+                    let a = sa.max(*ls);
+                    let b = sb.min(le);
+                    if a < b {
+                        let pre_a: String = line.chars().take(a - ls).collect();
+                        let pre_b: String = line.chars().take(b - ls).collect();
+                        let x1 = tx + p.measure(&pre_a, 12.5, false, false).0;
+                        let x2 = tx + p.measure(&pre_b, 12.5, false, false).0;
+                        p.fill_round(x1, y + 8.0 + (li - skip) as f32 * lh, (x2 - x1).max(3.0), lh - 4.0, 3.0, SEL_BG());
+                    }
+                }
+            }
+        }
+        for (i, (line, _)) in layout.iter().enumerate().skip(skip) {
+            // 可视行号 = 全局行号 - skip：聚焦滚动后仍从卡顶开始画（否则会画出卡片外）
+            let vi = i - skip;
+            p.text(line, tx, y + 8.0 + vi as f32 * lh, tw, lh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+        }
+        // 光标：组合串之后的位置
+        if active && self.caret_on {
+            let caret_shown = pos + comp.chars().count();
+            let mut found: Option<(usize, f32)> = None;
+            for (li, (line, ls)) in layout.iter().enumerate().skip(skip) {
+                let len = line.chars().count();
+                if caret_shown >= *ls && caret_shown <= ls + len {
+                    let col = caret_shown - ls;
+                    let pre: String = line.chars().take(col).collect();
+                    found = Some((li - skip, p.measure(&pre, 12.5, false, false).0));
+                }
+            }
+            if let Some((row, w)) = found {
+                let cy = y + 8.0 + row as f32 * lh;
+                p.line(tx + w + 1.0, cy + 3.0, tx + w + 1.0, cy + lh - 3.0, 1.2, ROW_TXT());
             }
         }
     }
@@ -962,10 +1084,11 @@ impl DialogUi {
         p.fill_circle(kx, y + 9.0, 7.0, WHITE);
     }
 
-    /// 时间卡片：待办含“时间”开关行（关时隐藏后续行），日程直接是四行
+    /// 时间卡片：待办含“时间”开关行（关时隐藏开始/结束/重复，保留提醒——
+    /// 全天待办按当天 09:00 提醒，与全天日程一致），日程直接是四行
     fn paint_time_card(&mut self, p: &Painter, y: f32, with_toggle: bool) {
         let card_h = if with_toggle {
-            if self.time_on { 206.0 } else { 50.0 }
+            if self.time_on { 206.0 } else { 96.0 }
         } else {
             164.0
         };
@@ -977,6 +1100,18 @@ impl DialogUi {
             // 点击区与开关图形对齐（348..384）
             Self::hit_add(&mut self.regions, 328.0, ry, 64.0, ROW_H, DlAction::ToggleTime);
             if !self.time_on {
+                // 全天待办：仅保留“提醒”行
+                let rry = ry + ROW_H;
+                p.line(20.0, rry, DL_W - 20.0, rry, 1.0, crate::theme::ov(10));
+                let action = DlAction::DropRow(0);
+                let hov = self.hover == Some(action);
+                if hov {
+                    p.fill_round(16.0, rry, 368.0, ROW_H, 6.0, HOVER_BG());
+                }
+                p.text("提醒", 20.0, rry, 60.0, ROW_H, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+                p.text(&events::remind_label(self.remind), 70.0, rry, DL_W - 118.0, ROW_H, gdi::HALIGN_FAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+                p.text("\u{E70D}", DL_W - 44.0, rry, 24.0, ROW_H, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, SUB());
+                Self::hit_add(&mut self.regions, 16.0, rry, 368.0, ROW_H, action);
                 return;
             }
             ry = y + 46.0;
@@ -1392,7 +1527,9 @@ fn confirm() {
                 has_time: timed,
                 start: if timed { Some(events::fmt_dt_store(f.a_start)) } else { None },
                 end: if timed { Some(events::fmt_dt_store(f.a_end)) } else { None },
-                remind: if timed { f.remind } else { None },
+                // 全天待办同样保留提醒（提醒线程按当天 09:00 计，与全天日程一致）；
+                // 分钟级重复依赖时间，仍随时间开关
+                remind: f.remind,
                 repeat: if timed { f.repeat } else { None },
                 recur: f.recur.clone(),
                 recur_until: until_store.clone(),
@@ -1627,12 +1764,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     if let Some(ch) = char::from_u32(wp as u32) {
                         if f.drop.is_some() {
                             // 选择面板打开：字符进“直接键入”框
+                            if let Some(pk) = f.pick.as_ref() {
+                                f.pick_undo.snapshot(&pk.text, pk.caret, pk.sel, "ins");
+                            }
                             if let Some(pk) = f.pick.as_mut() {
                                 crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &ch.to_string());
                                 pk.hint = None;
-                                f.redraw();
                             }
+                            f.redraw();
                         } else {
+                            f.snapshot_edit("ins");
                             let (text, caret, sel) = f.edit_buf();
                             crate::textedit::insert(text, caret, sel, &ch.to_string());
                             f.redraw();
@@ -1670,7 +1811,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             }
                             f.redraw();
                         }
+                        0x5A if ctrl => {
+                            // Ctrl+Z 撤销（直接键入框；take 避免同时借用）
+                            if f.pick.is_some() {
+                                let mut pk = f.pick.take().unwrap();
+                                f.pick_undo.undo(&mut pk.text, &mut pk.caret, &mut pk.sel);
+                                f.pick = Some(pk);
+                            }
+                            f.redraw();
+                        }
+                        0x59 if ctrl => {
+                            // Ctrl+Y 重做（直接键入框）
+                            if f.pick.is_some() {
+                                let mut pk = f.pick.take().unwrap();
+                                f.pick_undo.redo(&mut pk.text, &mut pk.caret, &mut pk.sel);
+                                f.pick = Some(pk);
+                            }
+                            f.redraw();
+                        }
                         _ if f.pick.is_some() => {
+                            // 编辑键（退格/删除/剪切/粘贴）先压撤销快照
+                            if matches!(wp as i32, 0x08 | 0x2E | 0x58 | 0x56) {
+                                if let Some(pk) = f.pick.as_ref() {
+                                    f.pick_undo.snapshot(&pk.text, pk.caret, pk.sel, "");
+                                }
+                            }
                             let Some(pk) = f.pick.as_mut() else { return 0 };
                             match wp as i32 {
                                 0x08 => crate::textedit::backspace(&mut pk.text, &mut pk.caret, &mut pk.sel),
@@ -1714,12 +1879,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let note_focus = f.note_focus;
                 let kind = f.kind;
                 let hwnd_id = f.hwnd;
+                // 会修改文本的按键先压撤销快照（保存/撤销/重做/导航除外）
+                let save_now = ctrl || (kind == Kind::Agenda && !note_focus);
+                let mutating = match wp as i32 {
+                    0x08 | 0x2E | 0x58 => true,
+                    0x56 if ctrl => true,
+                    0x0D if !save_now => true,
+                    _ => false,
+                };
+                if mutating {
+                    f.snapshot_edit("");
+                }
                 let (text, caret, sel) = f.edit_buf();
                 match wp as i32 {
                     0x0D => {
-                        // 回车：日程/备注确认；待办为多行文本，Ctrl+Enter 确认
-                        let ctrl2 = (GetKeyState(0x11) as u16) & 0x8000 != 0;
-                        if kind == Kind::Agenda || ctrl2 || note_focus {
+                        // 回车：日程主文本保存；待办内容与备注中换行；Ctrl+Enter 保存
+                        if save_now {
                             drop(guard);
                             confirm();
                             return 0;
@@ -1732,6 +1907,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         drop(guard);
                         cancel();
                         return 0;
+                    }
+                    0x5A if ctrl => {
+                        // Ctrl+Z 撤销（已在上面豁免快照；text/caret/sel 借用在本臂未再使用，NLL 放行）
+                        if f.edit_undo() {
+                            f.redraw();
+                        }
+                    }
+                    0x59 if ctrl => {
+                        // Ctrl+Y 重做
+                        if f.edit_redo() {
+                            f.redraw();
+                        }
                     }
                     0x08 => {
                         crate::textedit::backspace(text, caret, sel);
@@ -1832,12 +2019,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 if lp as i32 & GCS_RESULTSTR != 0 {
                     if let Some(s) = read_ime(hwnd, GCS_RESULTSTR) {
                         if f.drop.is_some() {
+                            if let Some(pk) = f.pick.as_ref() {
+                                f.pick_undo.snapshot(&pk.text, pk.caret, pk.sel, "ins");
+                            }
                             if let Some(pk) = f.pick.as_mut() {
                                 crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &s);
                                 pk.comp.clear();
                                 pk.hint = None;
                             }
                         } else {
+                            f.snapshot_edit("ins");
                             let (text, caret, sel) = f.edit_buf();
                             crate::textedit::insert(text, caret, sel, &s);
                             f.comp.clear();
@@ -1933,10 +2124,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     f.pick = Some(PickEdit { text: String::new(), comp: String::new(), caret: 0, sel: None, hint: None });
                     f.redraw();
                 }
+                Some(DlAction::TextInput) => {
+                    // 点击主文本卡：光标定位到点击处（备注聚焦时顺带取消聚焦）
+                    if f.note_focus {
+                        f.note_focus = false;
+                    }
+                    let hit_y = f
+                        .regions
+                        .iter()
+                        .rev()
+                        .find(|(r, a)| matches!(a, DlAction::TextInput) && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+                        .map(|(r, _)| r.y);
+                    if let Some(cy0) = hit_y {
+                        let text = match f.kind {
+                            Kind::Todo => f.todo_text.clone(),
+                            Kind::Agenda => f.agenda_name.clone(),
+                        };
+                        let caret = f.caret_at_click(&text, cy0, x, y);
+                        f.caret = caret;
+                        f.sel = None;
+                    }
+                    f.redraw();
+                }
                 Some(DlAction::NoteInput) => {
+                    // 点击备注卡：聚焦并定位光标到点击处
                     f.note_focus = true;
-                    f.note_caret = f.note.chars().count();
-                    f.note_sel = None;
+                    let hit_y = f
+                        .regions
+                        .iter()
+                        .rev()
+                        .find(|(r, a)| matches!(a, DlAction::NoteInput) && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+                        .map(|(r, _)| r.y);
+                    if let Some(cy0) = hit_y {
+                        let note = f.note.clone();
+                        let caret = f.caret_at_click(&note, cy0, x, y);
+                        f.note_caret = caret;
+                        f.note_sel = None;
+                    }
                     f.redraw();
                 }
                 Some(DlAction::ColorPick(i)) => {

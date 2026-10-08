@@ -55,6 +55,50 @@ fn done_path() -> std::path::PathBuf {
     crate::config::data_dir().join("remind_done.json")
 }
 
+// ---------------- 提醒历史（remind_log.json，侧栏"最近提醒"卡片读取） ----------------
+
+/// 提醒历史条目
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemindLogEntry {
+    /// 触发时点（epoch 毫秒）
+    pub t: i64,
+    pub title: String,
+    pub body: String,
+}
+
+fn log_path() -> std::path::PathBuf {
+    crate::config::data_dir().join("remind_log.json")
+}
+
+/// 追加一条提醒历史（上限 200 条 / 7 天过期，原子写盘）。任意线程可调用。
+pub fn log_remind(title: &str, body: &str) {
+    let now = now_ms();
+    let (list, healed) = crate::config::load_json_or_bak::<Vec<RemindLogEntry>>(&log_path());
+    if healed {
+        crate::log::warn("remind_log.json 损坏，已自动从备份恢复");
+    }
+    let mut list = list.unwrap_or_default();
+    list.push(RemindLogEntry { t: now, title: title.to_string(), body: body.to_string() });
+    list.retain(|e| now - e.t < 7 * 24 * 3600 * 1000);
+    if list.len() > 200 {
+        let drop = list.len() - 200;
+        list.drain(..drop);
+    }
+    if let Ok(text) = serde_json::to_string(&list) {
+        crate::config::backup_file(&log_path());
+        let _ = crate::config::write_file_atomic(&log_path(), &text);
+    }
+}
+
+/// 最近的提醒历史（按时间倒序，最多 n 条）：侧栏"最近提醒"卡片用
+pub fn recent_reminds(n: usize) -> Vec<RemindLogEntry> {
+    let (list, _) = crate::config::load_json_or_bak::<Vec<RemindLogEntry>>(&log_path());
+    let mut list = list.unwrap_or_default();
+    list.sort_by(|a, b| b.t.cmp(&a.t));
+    list.truncate(n);
+    list
+}
+
 /// 已提醒登记：档期 key → 提醒时点毫秒（加载时清理 7 天前的旧记录）
 fn load_done(now: i64) -> HashMap<String, i64> {
     let (map, healed) = crate::config::load_json_or_bak::<HashMap<String, i64>>(&done_path());
@@ -67,7 +111,7 @@ fn load_done(now: i64) -> HashMap<String, i64> {
 fn save_done(map: &HashMap<String, i64>) {
     if let Ok(text) = serde_json::to_string(map) {
         crate::config::backup_file(&done_path());
-        let _ = std::fs::write(done_path(), text);
+        let _ = crate::config::write_file_atomic(&done_path(), &text);
     }
 }
 
@@ -84,6 +128,7 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
     let mut changed = false;
     for e in list {
         if e.t <= now {
+            log_remind(&e.title, &e.body);
             // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
             let sys_ok = crate::config::use_system_toast_on()
                 && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
@@ -99,9 +144,8 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
         }
     }
     if changed {
-        let path = crate::config::data_dir().join("snooze.json");
         if let Ok(text) = serde_json::to_string(&keep) {
-            let _ = std::fs::write(path, text);
+            let _ = crate::config::write_file_atomic(&crate::config::data_dir().join("snooze.json"), &text);
         }
     }
 }
@@ -188,7 +232,8 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         }
     }
 
-    // 待办：带时间且未完成的（重复的同样展开；无时间不提醒）
+    // 待办：带提醒且未完成的（全天待办按当天 09:00 计，与全天日程一致；
+    // 重复的同样展开）
     let (todos, healed) = crate::config::load_json_or_bak::<Vec<crate::sidebar::Todo>>(&std::path::PathBuf::from(
         crate::config::data_dir().join("todo.json"),
     ));
@@ -197,13 +242,24 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
     }
     let todos = todos.unwrap_or_default();
     for (idx, td) in todos.iter().enumerate() {
-        if (td.done && td.recur.is_none()) || !td.has_time {
+        if td.done && td.recur.is_none() {
             continue;
         }
         let Some(remind_min) = td.remind else { continue };
-        let Some(ref s) = td.start else { continue };
-        let Some(start) = crate::events::parse_start(s) else { continue };
-        let dedup = item_dedup("t", &td.date.clone().unwrap_or_default(), idx, &td.id, &td.text, s, td.remind, td.repeat);
+        // 开始时间：带时间用存储值；全天待办取归属日 09:00
+        let start = match td.start.as_deref().and_then(crate::events::parse_start) {
+            Some(s) if td.has_time => Some(s),
+            _ => td
+                .date
+                .as_deref()
+                .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .and_then(|d| d.and_hms_opt(9, 0, 0)),
+        };
+        let Some(start) = start else { continue };
+        let all_day = !td.has_time;
+        // 去重键用实际生效的开始时间（全天待办无存储 start，取合成的 09:00）
+        let start_store = td.start.clone().unwrap_or_else(|| crate::events::fmt_dt_store(start));
+        let dedup = item_dedup("t", &td.date.clone().unwrap_or_default(), idx, &td.id, &td.text, &start_store, td.remind, td.repeat);
         match td.recur.as_deref() {
             None => {
                 let start_ms = local_ms(start);
@@ -217,7 +273,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
                 cands.push(Cand {
                     dedup: dedup.clone(),
                     title: "待办提醒".into(),
-                    body: body_text(&td.text, s, false),
+                    body: body_text(&td.text, &start_store, all_day),
                     fire0: start_ms - remind_min * 60_000,
                     step: td.repeat.map(|m| m.max(1) * 60_000),
                     boundary: if td.repeat.is_some() { end_ms } else { start_ms },
@@ -261,7 +317,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
                     cands.push(Cand {
                         dedup: dedup.clone(),
                         title: "待办提醒".into(),
-                        body: body_text(&td.text, s, false),
+                        body: body_text(&td.text, &start_store, all_day),
                         fire0: ostart_ms - remind_min * 60_000,
                         step: None,
                         boundary: oend_ms,
@@ -278,6 +334,8 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
 
     let mut done = load_done(now);
     let mut dirty = false;
+    /// 24 小时内错过的提醒（按条目去重）：统一汇总一条卡片，每自然日至多一次
+    let mut missed: HashMap<String, (String, String)> = HashMap::new();
     for c in &cands {
         // 当前应处的提醒档期：最后一个 ≤ now 的时点
         let slot = match c.step {
@@ -299,8 +357,13 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
             }
         };
         let Some(slot) = slot else { continue };
-        // 错过太久的档期不再补提（重启/睡眠恢复场景）
-        if now - slot > GRACE_MS || slot > c.boundary {
+        let age = now - slot;
+        // 错过太久的档期不再补提（重启/睡眠恢复场景）；24 小时内的错过
+        // 进汇总（避免逐条轰炸），过时不追
+        if age > GRACE_MS || slot > c.boundary {
+            if age > GRACE_MS && age <= 24 * 3600 * 1000 && slot <= c.boundary {
+                missed.entry(c.dedup.clone()).or_insert((c.title.clone(), c.body.clone()));
+            }
             continue;
         }
         let dk = format!("{}|{}", c.dedup, slot);
@@ -309,6 +372,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         }
         done.insert(dk, slot);
         dirty = true;
+        log_remind(&c.title, &c.body);
         // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
         let sys_ok = crate::config::use_system_toast_on()
             && crate::wnotify::show_reminder(&c.title, &c.body, &c.act, crate::config::remind_sound_on());
@@ -317,6 +381,25 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
                 crate::log::warn("系统通知中心发送失败（稍后提醒），已回退内置提醒卡片");
             }
             let _ = tx.send(crate::toast::ToastMsg { title: c.title.clone(), body: c.body.clone(), act: c.act.clone(), quiet: false });
+        }
+    }
+    // 错过提醒汇总：一天只弹一次（登记在 remind_done，重启/重扫不重发）
+    if !missed.is_empty() {
+        let mk = format!("missed|{}", today.format("%Y-%m-%d"));
+        if !done.contains_key(&mk) {
+            done.insert(mk, now);
+            dirty = true;
+            let n = missed.len();
+            let mut body = missed.values().take(3).map(|(_, b)| b.clone()).collect::<Vec<_>>().join("；");
+            if n > 3 {
+                body = format!("{} 等 {} 条", body, n);
+            }
+            log_remind("错过提醒汇总", &body);
+            let sys_ok = crate::config::use_system_toast_on()
+                && crate::wnotify::show_reminder("错过了提醒", &body, &crate::toast::Act::None, crate::config::remind_sound_on());
+            if !sys_ok {
+                let _ = tx.send(crate::toast::ToastMsg { title: "错过了提醒".into(), body, act: crate::toast::Act::None, quiet: false });
+            }
         }
     }
     if dirty {
