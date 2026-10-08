@@ -77,6 +77,8 @@ struct SidebarUi {
     todo_band: (f32, f32),
     /// 本次绘制解析出的日程行（含按天重复展开）：(原key, 原下标, 条目)
     agenda_rows: Vec<(String, usize, crate::events::AgendaEntry)>,
+    /// 截断行 tooltip：(行下标, 悬停起点, 全文, 屏幕x, 屏幕y)
+    tip_hover: Option<(u64, std::time::Instant, String, i32, i32)>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -119,6 +121,12 @@ pub struct Todo {
     /// 按天重复待办的完成记录（已完成日子的 Y-M-D key；主条目 done 恒为 false）
     #[serde(default)]
     pub done_dates: Vec<String>,
+    /// 备注（可选；悬停 tooltip 显示全文）
+    #[serde(default)]
+    pub note: Option<String>,
+    /// 自定义颜色：None=默认（日程页标签仍用待办橙）
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 static TODOS: Mutex<Option<Vec<Todo>>> = Mutex::new(None);
@@ -691,6 +699,10 @@ pub fn sidebar_hide() {
     let h = SIDEBAR_HWND.load(Ordering::Relaxed);
     if h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 } {
         unsafe {
+            KillTimer(h as HWND, 4);
+        }
+        crate::tooltip::hide();
+        unsafe {
             ShowWindow(h as HWND, SW_HIDE);
         }
         // 释放后台位图压缩内存（下次 sidebar_show 重绘时重建）
@@ -755,6 +767,11 @@ pub fn sidebar_show(date: NaiveDate) {
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
         f.date = Some(date);
+        // tooltip 悬停计时
+        let th = SIDEBAR_HWND.load(Ordering::Relaxed);
+        if th != 0 {
+            SetTimer(th as HWND, 4, 200, None);
+        }
         // 位置：紧贴主日历可见左缘、顶部对齐
         let mh = crate::flyout::hwnd();
         if mh == 0 {
@@ -831,6 +848,7 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
             todo_count: 0,
             todo_band: (0.0, 0.0),
             agenda_rows: Vec::new(),
+            tip_hover: None,
         });
         // 后台位图不在创建时分配：sidebar_show→redraw 惰性分配，隐藏即释放
         SIDEBAR_UI.lock().unwrap().replace(SendSb(sui));
@@ -953,6 +971,7 @@ impl SidebarUi {
         let cards = self.enabled_cards();
         self.regions.clear();
         self.agenda_rows.clear();
+        self.tip_hover = None;
 
         // 页面底
         p.fill_round(0.0, 0.0, SB_W, self.h, 12.0, BG_PAGE());
@@ -1185,8 +1204,8 @@ impl SidebarUi {
         let bx = cx + cw - 14.0 - 26.0;
         let by = y + 10.0;
         let bh = h - 20.0;
-        p.fill_round(bx, by, 26.0, bh, 6.0, gdi::argb(30, 62, 135, 250));
-        p.stroke_round(bx, by, 26.0, bh, 6.0, 1.0, gdi::argb(110, 62, 135, 250));
+        p.fill_round(bx, by, 26.0, bh, 6.0, gdi::argb_a(30, crate::theme::pal().blue));
+        p.stroke_round(bx, by, 26.0, bh, 6.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
         let chars: Vec<char> = name.chars().collect();
         let total = chars.len() as f32 * 17.0;
         let start = by + (bh - total) / 2.0;
@@ -1343,6 +1362,49 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                     };
                     TrackMouseEvent(&mut tme);
                 }
+                // 截断文本 tooltip：今日日程行（计时走本窗口 WM_TIMER）
+                let tip_hit = match hit {
+                    Some(SbAction::AgendaEdit(vi)) => Some(vi),
+                    _ => None,
+                };
+                match tip_hit {
+                    Some(vi) => {
+                        let same = matches!(&f.tip_hover, Some((k0, ..)) if *k0 == vi as u64);
+                        if !same {
+                            let mut text = String::new();
+                            if let Some((_, _, item)) = f.agenda_rows.get(vi) {
+                                text = match crate::events::note_of_entry(item) {
+                                    Some(n) if !n.is_empty() => format!("{}\n{}", crate::events::display(item), n),
+                                    _ => crate::events::display(item),
+                                };
+                            }
+                            let mut avail = 0.0f32;
+                            for (r, act) in f.regions.iter().rev() {
+                                if matches!(act, SbAction::AgendaEdit(j) if *j == vi) {
+                                    avail = r.w;
+                                    break;
+                                }
+                            }
+                            if !text.is_empty() && avail > 0.0 && crate::tooltip::est_width(&text, 12.5) > avail {
+                                let mut wr: RECT = std::mem::zeroed();
+                                unsafe {
+                                    GetWindowRect(hwnd, &mut wr);
+                                }
+                                let sx = wr.left + (x * f.sf) as i32;
+                                let sy = wr.top + (y * f.sf) as i32;
+                                f.tip_hover = Some((vi as u64, std::time::Instant::now(), text, sx, sy));
+                            } else {
+                                f.tip_hover = None;
+                                crate::tooltip::hide();
+                            }
+                        }
+                    }
+                    None => {
+                        if f.tip_hover.take().is_some() {
+                            crate::tooltip::hide();
+                        }
+                    }
+                }
             }
             0
         }
@@ -1354,10 +1416,39 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                     f.hover = None;
                     f.redraw();
                 }
+                if f.tip_hover.take().is_some() {
+                    crate::tooltip::hide();
+                }
+            }
+            0
+        }
+        WM_TIMER => {
+            // tooltip 悬停计时到点 → 浮出完整内容
+            let mut show_tip = None;
+            {
+                let mut guard = SIDEBAR_UI.lock().unwrap();
+                if let Some(f) = guard.as_mut() {
+                    let f = &mut f.0;
+                    if let Some((_, since, text, sx, sy)) = f.tip_hover.clone() {
+                        if !crate::tooltip::visible() && since.elapsed() >= std::time::Duration::from_millis(500) {
+                            show_tip = Some((text, sx, sy));
+                        }
+                    }
+                }
+            }
+            if let Some((text, sx, sy)) = show_tip {
+                crate::tooltip::show(&text, sx, sy);
             }
             0
         }
         WM_LBUTTONDOWN => {
+            {
+                let mut guard = SIDEBAR_UI.lock().unwrap();
+                if let Some(f) = guard.as_mut() {
+                    f.0.tip_hover = None;
+                }
+            }
+            crate::tooltip::hide();
             let mut guard = SIDEBAR_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
@@ -1451,6 +1542,8 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                                         recur: None,
                                         recur_until: None,
                                         skip_dates: Vec::new(),
+                                        note: None,
+                                        color: None,
                                     }
                                 }
                             };

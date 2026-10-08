@@ -15,7 +15,7 @@ use crate::events::{self, AgendaEntry, AgendaMap, RichEvent};
 use crate::gdi::{self, Cache, Painter};
 
 const DL_W: f32 = 400.0;
-const H_MAX: f32 = 620.0; // 位图按最大高度分配（待办开时间 + 修改范围/重复至两行附加卡时最高）
+const H_MAX: f32 = 760.0; // 位图按最大高度分配（待办开时间 + 备注/颜色 + 修改范围/重复至两行附加卡时最高）
 
 // 布局
 const TITLE_H: f32 = 44.0;
@@ -114,6 +114,10 @@ enum DlAction {
     /// 直接键入应用（回车/按钮）
     PickApply,
     ListItem(usize),
+    /// 备注卡片点击（聚焦备注编辑）
+    NoteInput,
+    /// 颜色选择（0=默认 1绿 2橙 3红 4紫 5青）
+    ColorPick(u8),
     Noop,
 }
 
@@ -159,6 +163,13 @@ struct DialogUi {
     date: NaiveDate,
     todo_text: String,
     agenda_name: String,
+    /// 备注卡片（可选；聚焦时编辑键路由到这里）
+    note: String,
+    note_caret: usize,
+    note_sel: Option<usize>,
+    note_focus: bool,
+    /// 自定义颜色（None=默认）
+    color: Option<u8>,
     priority: u8,
     time_on: bool,
     all_day: bool,
@@ -240,11 +251,15 @@ fn dialog_h(kind: Kind, time_on: bool, recur_rows: usize) -> f32 {
             y += 130.0 + GAP; // 内容
             y += 52.0 + GAP; // 优先级
             y += if time_on { 206.0 } else { 50.0 } + GAP; // 时间卡片
+            y += 54.0 + GAP; // 备注
+            y += 44.0 + GAP; // 颜色
         }
         Kind::Agenda => {
             y += 56.0 + GAP; // 名称
             y += 54.0 + GAP; // 全天
             y += 164.0 + GAP; // 时间卡片
+            y += 54.0 + GAP; // 备注
+            y += 44.0 + GAP; // 颜色
         }
     }
     if recur_rows > 0 {
@@ -300,6 +315,11 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             date: chrono::Local::now().date_naive(),
             todo_text: String::new(),
             agenda_name: String::new(),
+            note: String::new(),
+            note_caret: 0,
+            note_sel: None,
+            note_focus: false,
+            color: None,
             priority: 0,
             time_on: false,
             all_day: false,
@@ -376,6 +396,8 @@ pub fn open_agenda_edit(at_x: i32, at_y: i32, key: &str, idx: usize, ev: &RichEv
             until: ev.recur_until.clone(),
             skips: ev.skip_dates.clone(),
             occ: if ev.recur.is_some() { Some(view_date) } else { None },
+            note: ev.note.clone().unwrap_or_default(),
+            color: ev.color,
         },
     );
 }
@@ -420,14 +442,16 @@ pub fn open_todo_edit(at_x: i32, at_y: i32, gi: usize, td: &crate::sidebar::Todo
             skips: td.skip_dates.clone(),
             done_dates: td.done_dates.clone(),
             occ: if td.recur.is_some() { Some(date) } else { None },
+            note: td.note.clone().unwrap_or_default(),
+            color: td.color,
         },
     );
 }
 
 enum Prefill {
     New,
-    Agenda { key: String, idx: usize, id: String, name: String, all_day: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, occ: Option<NaiveDate> },
-    Todo { gi: usize, done: bool, id: String, text: String, priority: u8, time_on: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, done_dates: Vec<String>, occ: Option<NaiveDate> },
+    Agenda { key: String, idx: usize, id: String, name: String, all_day: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, occ: Option<NaiveDate>, note: String, color: Option<u8> },
+    Todo { gi: usize, done: bool, id: String, text: String, priority: u8, time_on: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, done_dates: Vec<String>, occ: Option<NaiveDate>, note: String, color: Option<u8> },
 }
 
 fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
@@ -445,6 +469,11 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
                 f.date = date;
                 f.todo_text.clear();
                 f.agenda_name.clear();
+                f.note.clear();
+                f.note_caret = 0;
+                f.note_sel = None;
+                f.note_focus = false;
+                f.color = None;
                 f.comp.clear();
                 f.priority = 0;
                 f.time_on = false;
@@ -468,9 +497,11 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
                 f.edit_todo = None;
                 match pre {
                     Prefill::New => {}
-                    Prefill::Agenda { key, idx, id, name, all_day, start, end, remind, repeat, recur, until, skips, occ } => {
+                    Prefill::Agenda { key, idx, id, name, all_day, start, end, remind, repeat, recur, until, skips, occ, note, color } => {
                         f.edit_agenda = Some((key, idx, id, skips));
                         f.agenda_name = name;
+                        f.note = note;
+                        f.color = color;
                         f.all_day = all_day;
                         f.a_start = start;
                         f.a_end = end;
@@ -484,9 +515,11 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
                             .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
                         f.scope_date = occ;
                     }
-                    Prefill::Todo { gi, done, id, text, priority, time_on, start, end, remind, repeat, recur, until, skips, done_dates, occ } => {
+                    Prefill::Todo { gi, done, id, text, priority, time_on, start, end, remind, repeat, recur, until, skips, done_dates, occ, note, color } => {
                         f.edit_todo = Some((gi, done, id, done_dates, skips));
                         f.todo_text = text;
+                        f.note = note;
+                        f.color = color;
                         f.priority = priority;
                         f.time_on = time_on;
                         f.a_start = start;
@@ -687,7 +720,7 @@ impl DialogUi {
     fn paint(&mut self, p: &Painter) {
         p.clear();
         p.fill_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, BG_PAGE());
-        p.stroke_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, 1.0, gdi::argb(120, 62, 135, 250));
+        p.stroke_round(0.5, 0.5, DL_W - 1.0, self.h - 1.0, 12.0, 1.0, gdi::argb_a(120, crate::theme::pal().blue));
         self.regions.clear();
 
         // 标题栏
@@ -723,6 +756,10 @@ impl DialogUi {
                 y += 52.0 + GAP;
                 self.paint_time_card(p, y, true);
                 y += if self.time_on { 206.0 } else { 50.0 } + GAP;
+                self.paint_note_card(p, y);
+                y += 54.0 + GAP;
+                self.paint_color_row(p, y);
+                y += 44.0 + GAP;
             }
             Kind::Agenda => {
                 self.paint_text_card(p, y, 56.0, "输入日程名称");
@@ -735,6 +772,10 @@ impl DialogUi {
                 y += 54.0 + GAP;
                 self.paint_time_card(p, y, false);
                 y += 164.0 + GAP;
+                self.paint_note_card(p, y);
+                y += 54.0 + GAP;
+                self.paint_color_row(p, y);
+                y += 44.0 + GAP;
             }
         }
         // 重复附加卡：修改范围（编辑重复条目）/ 重复至（选了按天重复）
@@ -768,7 +809,7 @@ impl DialogUi {
     /// 光标按位置绘制、选区高亮、IME 组合串内联在光标处
     fn paint_text_card(&mut self, p: &Painter, y: f32, ch: f32, placeholder: &str) {
         p.fill_round(14.0, y, 372.0, ch, 8.0, FIELD_BG());
-        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB() });
+        p.stroke_round(14.0, y, 372.0, ch, 8.0, 1.0, if self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
         Self::hit_add(&mut self.regions, 14.0, y, 372.0, ch, DlAction::Noop);
         let tx = 26.0;
         let tw = 348.0;
@@ -829,6 +870,63 @@ impl DialogUi {
     }
 
     /// 优先级行（下拉选择，默认不选）
+    /// 当前编辑目标：备注卡片聚焦时路由到备注缓冲，否则主文本（日程名/待办内容）
+    fn edit_buf(&mut self) -> (&mut String, &mut usize, &mut Option<usize>) {
+        if self.note_focus {
+            (&mut self.note, &mut self.note_caret, &mut self.note_sel)
+        } else {
+            let t = match self.kind {
+                Kind::Todo => &mut self.todo_text,
+                Kind::Agenda => &mut self.agenda_name,
+            };
+            (t, &mut self.caret, &mut self.sel)
+        }
+    }
+
+    /// 备注卡片（单行输入，悬停 tooltip 显示全文）
+    fn paint_note_card(&mut self, p: &Painter, y: f32) {
+        let active = self.note_focus;
+        p.fill_round(14.0, y, 372.0, 54.0, 8.0, FIELD_BG());
+        p.stroke_round(14.0, y, 372.0, 54.0, 8.0, 1.0, if active && self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
+        Self::hit_add(&mut self.regions, 14.0, y, 372.0, 54.0, DlAction::NoteInput);
+        if self.note.is_empty() && !(active && !self.comp.is_empty()) {
+            p.text("备注（可选，列表悬停可看全文）", 26.0, y, 348.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, SUB_DIM());
+            if active && self.caret_on {
+                p.line(27.0, y + 14.0, 27.0, y + 40.0, 1.2, ROW_TXT());
+            }
+        } else {
+            let chars: Vec<char> = self.note.chars().collect();
+            let pos = self.note_caret.min(chars.len());
+            let comp: String = if active { self.comp.clone() } else { String::new() };
+            let pre: String = chars[..pos].iter().collect();
+            let post: String = chars[pos..].iter().collect();
+            let shown = format!("{}{}{}", pre, comp, post);
+            p.text(&shown, 26.0, y, 348.0, 54.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+            if active && self.caret_on {
+                let w = p.measure(&format!("{}{}", pre, comp), 12.5, false, false).0;
+                p.line(26.0 + w + 1.0, y + 14.0, 26.0 + w + 1.0, y + 40.0, 1.2, ROW_TXT());
+            }
+        }
+    }
+
+    /// 颜色行（默认/绿/橙/红/紫/青）
+    fn paint_color_row(&mut self, p: &Painter, y: f32) {
+        p.fill_round(14.0, y, 372.0, 44.0, 8.0, CARD_BG());
+        p.text("颜色", 20.0, y, 60.0, 44.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, false, false, ROW_TXT());
+        let opts: [Option<u8>; 6] = [None, Some(1), Some(2), Some(3), Some(4), Some(5)];
+        let mut sx = 104.0;
+        for (i, c) in opts.iter().enumerate() {
+            let sel_c = self.color == *c;
+            let col = crate::events::entry_color(*c);
+            Self::hit_add(&mut self.regions, sx - 7.0, y + 5.0, 30.0, 34.0, DlAction::ColorPick(i as u8));
+            p.fill_circle(sx + 8.0, y + 22.0, 8.0, col);
+            if sel_c {
+                p.stroke_circle(sx + 8.0, y + 22.0, 11.5, 1.5, crate::theme::pal().txt);
+            }
+            sx += 42.0;
+        }
+    }
+
     fn paint_priority_row(&mut self, p: &Painter, y: f32) {
         p.fill_round(14.0, y, 372.0, 52.0, 8.0, CARD_BG());
         let action = DlAction::DropRow(2);
@@ -975,7 +1073,7 @@ impl DialogUi {
         // 重复至只选日期（无时间步）
         let timed = row != 2 && (self.kind == Kind::Todo || !self.all_day);
         p.fill_round(px, py, pw, ph, 10.0, DROP_BG());
-        p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
+        p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb_a(90, crate::theme::pal().blue));
 
         // 月份切换
         let prev_hov = self.hover == Some(DlAction::PickMonthPrev);
@@ -1036,7 +1134,7 @@ impl DialogUi {
         let (row, h_off, m_off) = (*row, *h_off, *m_off);
         let (px, py, pw, _ph) = self.drop_rect();
         p.fill_round(px, py, pw, 312.0, 10.0, DROP_BG());
-        p.stroke_round(px, py, pw, 312.0, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
+        p.stroke_round(px, py, pw, 312.0, 10.0, 1.0, gdi::argb_a(90, crate::theme::pal().blue));
 
         // 当前时间
         let dt = self.row_dt(row);
@@ -1079,7 +1177,7 @@ impl DialogUi {
         let Some(pk) = self.pick.clone() else { return };
         let ih = 32.0;
         p.fill_round(px + 14.0, iy, pw - 106.0, ih, 6.0, FIELD_BG());
-        p.stroke_round(px + 14.0, iy, pw - 106.0, ih, 6.0, 1.0, if self.caret_on { gdi::argb(140, 62, 135, 250) } else { BORDER_SUB() });
+        p.stroke_round(px + 14.0, iy, pw - 106.0, ih, 6.0, 1.0, if self.caret_on { gdi::argb_a(140, crate::theme::pal().blue) } else { BORDER_SUB() });
         Self::hit_add(&mut self.regions, px + 14.0, iy, pw - 106.0, ih, DlAction::PickInput);
         let tx = px + 22.0;
         let tw = pw - 122.0;
@@ -1176,7 +1274,7 @@ impl DialogUi {
         let list = *list;
         let (px, py, pw, ph) = self.drop_rect();
         p.fill_round(px, py, pw, ph, 10.0, DROP_BG());
-        p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb(90, 62, 135, 250));
+        p.stroke_round(px, py, pw, ph, 10.0, 1.0, gdi::argb_a(90, crate::theme::pal().blue));
         let n = match list {
             0 => events::REMIND_VALUES.len(),
             1 => events::REPEAT_MENU_LEN,
@@ -1277,6 +1375,9 @@ fn confirm() {
             if text.is_empty() {
                 return;
             }
+            let note_trim = f.note.trim().to_string();
+            let note = if note_trim.is_empty() { None } else { Some(note_trim) };
+            let color = f.color;
             let key = crate::ics::key_of_date(f.date);
             let timed = f.time_on;
             let edit = f.edit_todo.take();
@@ -1297,6 +1398,8 @@ fn confirm() {
                 recur_until: until_store.clone(),
                 skip_dates: edit.as_ref().map(|(_, _, _, _, sk)| sk.clone()).unwrap_or_default(),
                 done_dates: edit.as_ref().map(|(_, _, _, dd, _)| dd.clone()).unwrap_or_default(),
+                note,
+                color,
             };
             drop(guard);
             if scope_only {
@@ -1323,6 +1426,9 @@ fn confirm() {
             if name.is_empty() {
                 return;
             }
+            let note_trim = f.note.trim().to_string();
+            let note = if note_trim.is_empty() { None } else { Some(note_trim) };
+            let color = f.color;
             let key = crate::ics::key_of_date(f.date);
             let edit = f.edit_agenda.take();
             let scope_only = f.recur.is_some() && !f.scope_series && edit.is_some();
@@ -1337,6 +1443,8 @@ fn confirm() {
                 recur: f.recur.clone(),
                 recur_until: until_store.clone(),
                 skip_dates: edit.as_ref().map(|(_, _, _, sk)| sk.clone()).unwrap_or_default(),
+                note,
+                color,
             });
             if let Some(agenda) = IB_AGENDA.lock().unwrap().as_ref() {
                 let mut map = agenda.lock().unwrap();
@@ -1525,11 +1633,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 f.redraw();
                             }
                         } else {
-                            let text = match f.kind {
-                                Kind::Todo => &mut f.todo_text,
-                                Kind::Agenda => &mut f.agenda_name,
-                            };
-                            crate::textedit::insert(text, &mut f.caret, &mut f.sel, &ch.to_string());
+                            let (text, caret, sel) = f.edit_buf();
+                            crate::textedit::insert(text, caret, sel, &ch.to_string());
                             f.redraw();
                         }
                     }
@@ -1604,22 +1709,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     }
                     return 0;
                 }
-                // ---- 主文本（日程名/待办内容）编辑 ----
-                // 字段级借用（text_mut 会整体借用 self，与光标字段冲突）
-                let text = match f.kind {
-                    Kind::Todo => &mut f.todo_text,
-                    Kind::Agenda => &mut f.agenda_name,
-                };
+                // ---- 主文本/备注编辑（备注卡片聚焦时路由到备注）----
+                // 字段级借用（整体借用会与光标字段冲突）
+                let note_focus = f.note_focus;
+                let kind = f.kind;
+                let hwnd_id = f.hwnd;
+                let (text, caret, sel) = f.edit_buf();
                 match wp as i32 {
                     0x0D => {
-                        // 回车：日程确认；待办为多行文本，Ctrl+Enter 确认
+                        // 回车：日程/备注确认；待办为多行文本，Ctrl+Enter 确认
                         let ctrl2 = (GetKeyState(0x11) as u16) & 0x8000 != 0;
-                        if f.kind == Kind::Agenda || ctrl2 {
+                        if kind == Kind::Agenda || ctrl2 || note_focus {
                             drop(guard);
                             confirm();
                             return 0;
                         }
-                        crate::textedit::insert(text, &mut f.caret, &mut f.sel, "\n");
+                        crate::textedit::insert(text, caret, sel, "\n");
                         f.redraw();
                     }
                     0x1B => {
@@ -1629,19 +1734,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         return 0;
                     }
                     0x08 => {
-                        crate::textedit::backspace(text, &mut f.caret, &mut f.sel);
+                        crate::textedit::backspace(text, caret, sel);
                         f.redraw();
                     }
                     0x2E => {
                         // Delete：删除光标后一个字符/选区
-                        crate::textedit::delete_fwd(text, &mut f.caret, &mut f.sel);
+                        crate::textedit::delete_fwd(text, caret, sel);
                         f.redraw();
                     }
                     0x56 => {
                         // Ctrl+V 粘贴（替换选区，插入光标处）
                         if ctrl {
-                            if let Some(t) = unsafe { read_clipboard(f.hwnd) } {
-                                crate::textedit::insert(text, &mut f.caret, &mut f.sel, &t);
+                            if let Some(t) = unsafe { read_clipboard(hwnd_id) } {
+                                crate::textedit::insert(text, caret, sel, &t);
                                 f.redraw();
                             }
                         }
@@ -1649,16 +1754,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     0x41 => {
                         // Ctrl+A 全选
                         if ctrl {
-                            crate::textedit::select_all(text, &mut f.caret, &mut f.sel);
+                            crate::textedit::select_all(text, caret, sel);
                             f.redraw();
                         }
                     }
                     0x43 => {
                         // Ctrl+C 复制
                         if ctrl {
-                            if let Some(t) = crate::textedit::sel_text(text, f.caret, f.sel) {
+                            if let Some(t) = crate::textedit::sel_text(text, *caret, *sel) {
                                 unsafe {
-                                    crate::textedit::set_clipboard(f.hwnd, &t);
+                                    crate::textedit::set_clipboard(hwnd_id, &t);
                                 }
                             }
                         }
@@ -1666,11 +1771,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     0x58 => {
                         // Ctrl+X 剪切
                         if ctrl {
-                            if let Some(t) = crate::textedit::sel_text(text, f.caret, f.sel) {
+                            if let Some(t) = crate::textedit::sel_text(text, *caret, *sel) {
                                 unsafe {
-                                    crate::textedit::set_clipboard(f.hwnd, &t);
+                                    crate::textedit::set_clipboard(hwnd_id, &t);
                                 }
-                                crate::textedit::delete_sel(text, &mut f.caret, &mut f.sel);
+                                crate::textedit::delete_sel(text, caret, sel);
                                 f.redraw();
                             }
                         }
@@ -1681,37 +1786,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         match wp as i32 {
                             0x25 => {
                                 if ctrl {
-                                    crate::textedit::move_word(text, &mut f.caret, &mut f.sel, false, ext)
+                                    crate::textedit::move_word(text, caret, sel, false, ext)
                                 } else {
-                                    crate::textedit::move_caret(text, &mut f.caret, &mut f.sel, -1, ext)
+                                    crate::textedit::move_caret(text, caret, sel, -1, ext)
                                 }
                             }
                             0x27 => {
                                 if ctrl {
-                                    crate::textedit::move_word(text, &mut f.caret, &mut f.sel, true, ext)
+                                    crate::textedit::move_word(text, caret, sel, true, ext)
                                 } else {
-                                    crate::textedit::move_caret(text, &mut f.caret, &mut f.sel, 1, ext)
+                                    crate::textedit::move_caret(text, caret, sel, 1, ext)
                                 }
                             }
-                            0x26 => crate::textedit::move_line(text, &mut f.caret, &mut f.sel, false, ext),
-                            _ => crate::textedit::move_line(text, &mut f.caret, &mut f.sel, true, ext),
+                            0x26 => crate::textedit::move_line(text, caret, sel, false, ext),
+                            _ => crate::textedit::move_line(text, caret, sel, true, ext),
                         }
                         f.redraw();
                     }
                     0x24 | 0x23 => {
                         // Home/End（多行文本按行首/行尾；Shift 扩展选区）
-                        let text = f.text_mut().clone();
-                        let pos = f.caret.min(text.chars().count());
-                        if shift && f.sel.is_none() {
-                            f.sel = Some(pos);
+                        let text_c = text.clone();
+                        let pos = (*caret).min(text_c.chars().count());
+                        if shift && sel.is_none() {
+                            *sel = Some(pos);
                         }
                         if !shift {
-                            f.sel = None;
+                            *sel = None;
                         }
-                        f.caret = if wp as i32 == 0x24 {
-                            crate::textedit::line_start(&text, pos)
+                        *caret = if wp as i32 == 0x24 {
+                            crate::textedit::line_start(&text_c, pos)
                         } else {
-                            crate::textedit::line_end(&text, pos)
+                            crate::textedit::line_end(&text_c, pos)
                         };
                         f.redraw();
                     }
@@ -1733,11 +1838,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 pk.hint = None;
                             }
                         } else {
-                            let text = match f.kind {
-                                Kind::Todo => &mut f.todo_text,
-                                Kind::Agenda => &mut f.agenda_name,
-                            };
-                            crate::textedit::insert(text, &mut f.caret, &mut f.sel, &s);
+                            let (text, caret, sel) = f.edit_buf();
+                            crate::textedit::insert(text, caret, sel, &s);
                             f.comp.clear();
                         }
                     }
@@ -1830,6 +1932,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     f.drop = Some(Drop::Date { row, y: dt.year(), m: dt.month(), anchor });
                     f.pick = Some(PickEdit { text: String::new(), comp: String::new(), caret: 0, sel: None, hint: None });
                     f.redraw();
+                }
+                Some(DlAction::NoteInput) => {
+                    f.note_focus = true;
+                    f.note_caret = f.note.chars().count();
+                    f.note_sel = None;
+                    f.redraw();
+                }
+                Some(DlAction::ColorPick(i)) => {
+                    f.color = if i == 0 { None } else { Some(i) };
+                    f.redraw();
+                }
+                Some(DlAction::Noop) => {
+                    // 主文本卡片：备注聚焦时点回主卡取消聚焦
+                    if f.note_focus {
+                        f.note_focus = false;
+                        f.redraw();
+                    }
                 }
                 Some(DlAction::DropRow(list)) => {
                     f.drop = Some(Drop::List { list, anchor: y });

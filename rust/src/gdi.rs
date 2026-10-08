@@ -103,6 +103,64 @@ pub fn phys(v: f32) -> f32 {
     v * scale()
 }
 
+/// 指定物理坐标点所在显示器的有效 DPI（多屏缩放独立；回退主屏值）
+pub fn monitor_dpi_at(x: i32, y: i32) -> f32 {
+    unsafe {
+        use winapi::shared::windef::POINT;
+        use winapi::um::winuser::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if !mon.is_null() {
+            if let Some(v) = monitor_dpi(mon) {
+                return v;
+            }
+        }
+        detect_scale()
+    }
+}
+
+unsafe fn monitor_dpi(mon: winapi::shared::windef::HMONITOR) -> Option<f32> {
+    #[link(name = "shcore")]
+    extern "system" {
+        fn GetDpiForMonitor(
+            hmonitor: winapi::shared::windef::HMONITOR,
+            dpi_type: u32,
+            dpi_x: *mut u32,
+            dpi_y: *mut u32,
+        ) -> i32;
+    }
+    let (mut dx, mut dy) = (0u32, 0u32);
+    if GetDpiForMonitor(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mut dx, &mut dy) == 0 && dx > 0 {
+        Some(dx as f32 / 96.0)
+    } else {
+        None
+    }
+}
+
+/// 指定物理坐标点所在显示器的工作区 (l, t, r, b)；回退主屏工作区
+pub fn work_area_of_point(x: i32, y: i32) -> (i32, i32, i32, i32) {
+    unsafe {
+        use winapi::shared::windef::POINT;
+        use winapi::um::winuser::{GetMonitorInfoW, MonitorFromPoint, MONITOR_DEFAULTTONEAREST, MONITORINFO};
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if !mon.is_null() {
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(mon, &mut mi) != 0 {
+                return (mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom);
+            }
+        }
+        let mut wa: winapi::shared::windef::RECT = std::mem::zeroed();
+        SystemParametersInfoW_gdi(0x0030, 0, &mut wa as *mut _ as *mut winapi::ctypes::c_void, 0);
+        (wa.left, wa.top, wa.right, wa.bottom)
+    }
+}
+
+#[link(name = "user32")]
+extern "system" {
+    #[link_name = "SystemParametersInfoW"]
+    fn SystemParametersInfoW_gdi(action: u32, param: u32, data: *mut winapi::ctypes::c_void, init: u32) -> i32;
+}
+
 // ---------- 后台位图生命周期（隐藏时释放以压缩提交内存，显示时重建） ----------
 
 /// 为分层窗口分配后台位图（物理尺寸 = 逻辑 × sf）：
@@ -205,6 +263,37 @@ pub fn set_text_scale(v: f32) {
 static GFONTS: std::sync::LazyLock<Mutex<HashMap<i64, usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+// ---------- 界面字体族（设置里可选；空串 = 默认微软雅黑 UI） ----------
+
+static FONT_FAMILY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+/// 字体族代数：切换字体后 +1，两套字体缓存据此失效重建
+static FONT_GEN: AtomicU32 = AtomicU32::new(1);
+pub const DEFAULT_FONT_FAMILY: &str = "Microsoft YaHei UI";
+
+pub fn font_family() -> String {
+    FONT_FAMILY.read().unwrap().clone()
+}
+
+/// 切换界面字体族：失效 GDI HFONT 缓存与 GDI+ 字体缓存（Cache 按代数重建）
+pub fn set_font_family(name: &str) {
+    let name = name.trim();
+    let name: &str = if name.is_empty() { DEFAULT_FONT_FAMILY } else { name };
+    {
+        let mut w = FONT_FAMILY.write().unwrap();
+        if w.as_str() == name {
+            return;
+        }
+        *w = name.to_string();
+    }
+    FONT_GEN.fetch_add(1, Ordering::Relaxed);
+    let mut map = GFONTS.lock().unwrap();
+    for (_, f) in map.drain() {
+        unsafe {
+            winapi::um::wingdi::DeleteObject(f as winapi::shared::windef::HGDIOBJ);
+        }
+    }
+}
+
 unsafe fn gdi_font(px: i32, bold: bool) -> usize {
     use winapi::um::wingdi::{
         CreateFontW, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS,
@@ -214,7 +303,8 @@ unsafe fn gdi_font(px: i32, bold: bool) -> usize {
     if let Some(f) = map.get(&key) {
         return *f;
     }
-    let face = wide("Microsoft YaHei UI");
+    let face_name = font_family();
+    let face = wide(&face_name);
     let hfont = CreateFontW(
         -px,
         0,
@@ -233,6 +323,15 @@ unsafe fn gdi_font(px: i32, bold: bool) -> usize {
     );
     let hf = hfont as usize;
     map.insert(key, hf);
+    // 缓存上限：跨 DPI/字号档位切换会累积，超限清理（保留当前字号，避免抖动）
+    if map.len() > 96 {
+        let stale: Vec<i64> = map.iter().filter(|(_, &f)| f != hf).map(|(k, _)| *k).collect();
+        for k in stale {
+            if let Some(f) = map.remove(&k) {
+                winapi::um::wingdi::DeleteObject(f as winapi::shared::windef::HGDIOBJ);
+            }
+        }
+    }
     hf
 }
 
@@ -285,6 +384,7 @@ extern "system" {
     fn GdipDrawEllipse(graphics: Gp, pen: Gp, x: f32, y: f32, w: f32, h: f32) -> i32;
     fn GdipFillPolygon(graphics: Gp, brush: Gp, points: *const PointF, count: i32, fill_mode: i32) -> i32;
     fn GdipCreateFontFamilyFromName(name: *const u16, placeholder: Gp, family: *mut Gp) -> i32;
+    fn GdipDeleteFontFamily(family: Gp) -> i32;
     fn GdipCreateFont(family: Gp, em_size: f32, style: i32, unit: i32, font: *mut Gp) -> i32;
     fn GdipDeleteFont(font: Gp) -> i32;
     fn GdipCreateStringFormat(attrs: i32, lang: u16, format: *mut Gp) -> i32;
@@ -298,6 +398,15 @@ extern "system" {
     fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: Gp, graphics: *mut Gp) -> i32;
     fn GdipDisposeImage(image: Gp) -> i32;
+}
+
+/// 由位图取 Graphics（tooltip 等独立小窗复用）
+pub fn graphics_from_image(bmp: Gp) -> Gp {
+    let mut g: Gp = std::ptr::null_mut();
+    unsafe {
+        GdipGetImageGraphicsContext(bmp, &mut g);
+    }
+    g
 }
 
 pub fn startup() {
@@ -315,6 +424,11 @@ pub fn startup() {
 
 pub const fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
     ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+/// alpha + 0xRRGGBB 合成 ARGB（强调色统一走 theme::ACCENT）
+pub const fn argb_a(a: u8, rgb: u32) -> u32 {
+    argb(a, (rgb >> 16) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -337,7 +451,9 @@ pub struct Cache {
     brushes: Mutex<HashMap<u32, Gp>>,
     pens: Mutex<HashMap<(u32, u32), Gp>>,
     fonts: Mutex<HashMap<u64, Gp>>,
-    family_yahei: Gp,
+    /// 雅黑/自选字体族（可随设置重建，AtomicUsize 存 Gp）
+    family_yahei: std::sync::atomic::AtomicUsize,
+    family_gen: AtomicU32,
     family_mdl2: Gp,
     format: Gp,
 }
@@ -348,7 +464,7 @@ unsafe impl Sync for Cache {}
 impl Cache {
     pub fn new() -> Cache {
         unsafe {
-            let n1 = wide("Microsoft YaHei UI");
+            let n1 = wide(&font_family());
             let mut family_yahei: Gp = std::ptr::null_mut();
             if GdipCreateFontFamilyFromName(n1.as_ptr(), std::ptr::null_mut(), &mut family_yahei) != 0 {
                 let n2 = wide("Microsoft YaHei");
@@ -365,10 +481,31 @@ impl Cache {
                 brushes: Mutex::new(HashMap::new()),
                 pens: Mutex::new(HashMap::new()),
                 fonts: Mutex::new(HashMap::new()),
-                family_yahei,
+                family_yahei: std::sync::atomic::AtomicUsize::new(family_yahei as usize),
+                family_gen: AtomicU32::new(0),
                 family_mdl2,
                 format,
             }
+        }
+    }
+
+    /// 字体族设置变化后重建 GDI+ 字体族并作废旧字体（单 UI 线程调用）
+    unsafe fn rebuild_family(&self) {
+        let name = font_family();
+        let n = wide(&name);
+        let mut fam: Gp = std::ptr::null_mut();
+        if GdipCreateFontFamilyFromName(n.as_ptr(), std::ptr::null_mut(), &mut fam) != 0 {
+            let n2 = wide("Microsoft YaHei");
+            GdipCreateFontFamilyFromName(n2.as_ptr(), std::ptr::null_mut(), &mut fam);
+        }
+        let old = self.family_yahei.swap(fam as usize, Ordering::Relaxed);
+        self.family_gen.store(FONT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
+        let mut map = self.fonts.lock().unwrap();
+        for (_, f) in map.drain() {
+            GdipDeleteFont(f);
+        }
+        if old != 0 && old != fam as usize {
+            GdipDeleteFontFamily(old as Gp);
         }
     }
 
@@ -396,12 +533,16 @@ impl Cache {
     }
 
     unsafe fn font(&self, px: f32, bold: bool, mdl2: bool) -> Gp {
+        if !mdl2 && self.family_gen.load(Ordering::Relaxed) != FONT_GEN.load(Ordering::Relaxed) {
+            // 字体族设置变化：先重建（内部会清空 fonts），再继续
+            self.rebuild_family();
+        }
         let key = ((px * 8.0) as u64) << 8 | (bold as u64) << 4 | (mdl2 as u64);
         let mut map = self.fonts.lock().unwrap();
         if let Some(f) = map.get(&key) {
             return *f;
         }
-        let family = if mdl2 { self.family_mdl2 } else { self.family_yahei };
+        let family = if mdl2 { self.family_mdl2 } else { self.family_yahei.load(Ordering::Relaxed) as Gp };
         let mut f: Gp = std::ptr::null_mut();
         GdipCreateFont(
             family,

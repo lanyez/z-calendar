@@ -48,7 +48,7 @@ fn BORDER() -> u32 { crate::theme::ov(22) }
 fn DIVIDER() -> u32 { crate::theme::ov(20) }
 fn POPUP_BG() -> u32 { crate::theme::pal().card }
 /// 文本选区高亮（快捷输入/编辑框选中段）
-fn SEL_BLUE() -> u32 { gdi::argb(70, 62, 135, 250) }
+fn SEL_BLUE() -> u32 { gdi::argb_a(70, crate::theme::pal().blue) }
 
 pub const WIN_W: f32 = 510.0;
 pub const WIN_H: f32 = 640.0;
@@ -114,6 +114,49 @@ enum Action {
     OpenSettings,
     /// 头部左侧天气热区（悬停弹出近一周天气面板）
     Weather,
+    /// 年月跳转面板：切年（±1）/ 跳到某月 / 回到今天
+    MonthPickYear(i32),
+    MonthPickGo(u32),
+    MonthPickToday,
+    /// 日程页行右键菜单：复制（when=None 进入点选目标日期模式）/ 多选
+    RowCopyTo(u8, usize, Option<NaiveDate>),
+    RowMulti,
+    /// 多选工具条：全选切换 / 顺延1天 / 删除 / 取消
+    MultiAll,
+    MultiPostpone,
+    MultiDelete,
+    MultiCancel,
+}
+
+/// 多选批量操作结果（锁内收集，锁外执行待办写盘与通知）
+struct MultiResult {
+    todo_deletes: Vec<(usize, crate::sidebar::Todo)>,
+    todo_updates: Vec<(usize, crate::sidebar::Todo)>,
+    undo: Option<crate::toast::UndoData>,
+    hint: String,
+}
+
+/// 平移存储时间到目标日（保留时分；全天日期串只换日期）
+fn shift_to_date(s: &str, nd: NaiveDate) -> String {
+    match crate::events::parse_start(s) {
+        Some(dt) => {
+            if s.len() <= 10 {
+                crate::events::fmt_d_store(nd)
+            } else {
+                match nd.and_hms_opt(dt.hour(), dt.minute(), 0) {
+                    Some(v) => crate::events::fmt_dt_store(v),
+                    None => s.to_string(),
+                }
+            }
+        }
+        None => s.to_string(),
+    }
+}
+
+/// 年月快速跳转面板状态（点击月份标题弹出）
+#[derive(Clone, Copy)]
+struct MonthPick {
+    year: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -168,6 +211,16 @@ struct Ui {
     hover_cell: Option<NaiveDate>,
     hover_since: Option<std::time::Instant>,
     preview: Option<NaiveDate>,
+    /// 截断行 tooltip：(命中键, 悬停起点, 全文, 屏幕x, 屏幕y)
+    tip_hover: Option<(u64, std::time::Instant, String, i32, i32)>,
+    /// 日程页行右键菜单：(0=日程 i / 1=待办 i, 逻辑x, 逻辑y)
+    row_menu: Option<(u8, usize, f32, f32)>,
+    /// 复制待粘贴源：Some((0=日程 i, 1=待办 i))——切到日历页点选目标日期
+    copy_src: Option<(u8, usize)>,
+    /// 日程页多选模式：Some((日程行选中, 待办行选中))
+    multi: Option<(Vec<bool>, Vec<bool>)>,
+    /// 年月快速跳转面板（None=收起）
+    month_pick: Option<MonthPick>,
     tick: u32,
     last_second: u32,
     idle_timer: bool,
@@ -203,6 +256,9 @@ enum SAction {
     /// 界面字号下拉（软件设置页）
     FontScaleDropdown,
     FontScalePick(usize),
+    /// 界面字体族下拉（软件设置页）
+    FontFamilyDropdown,
+    FontFamilyPick(usize),
     /// 主题下拉（跟随系统/深色/浅色）
     ThemeDropdown,
     ThemePick(usize),
@@ -264,6 +320,8 @@ struct SettingsUi {
     week_menu_open: bool,
     /// 界面字号下拉展开中
     font_menu_open: bool,
+    /// 界面字体族下拉展开中
+    family_menu_open: bool,
     /// 主题下拉展开中
     theme_menu_open: bool,
     motto_menu_open: bool,
@@ -331,6 +389,7 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             hover: None,
             week_menu_open: false,
             font_menu_open: false,
+            family_menu_open: false,
             theme_menu_open: false,
             motto_menu_open: false,
             sb_drag: None,
@@ -345,20 +404,30 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
 }
 
 pub const SETTINGS_W: f32 = 490.0;
-pub const SETTINGS_H: f32 = 600.0;
+pub const SETTINGS_H: f32 = 640.0;
 
 fn settings_position() -> (i32, i32) {
     if let Some((x, y)) = *SETTINGS_POS.lock().unwrap() {
         return (x, y);
     }
-    // 首次：出现在工作区中央
-    unsafe {
-        let mut wa: RECT = std::mem::zeroed();
-        SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
-        let x = wa.left + ((wa.right - wa.left) - gdi::phys(SETTINGS_W) as i32) / 2;
-        let y = wa.top + ((wa.bottom - wa.top) - gdi::phys(SETTINGS_H) as i32) / 2;
-        (x, y)
-    }
+    // 首次：居中于日历所在屏（多屏；取不到回退主屏工作区）
+    let fh = FLYOUT_HWND.load(Ordering::Relaxed);
+    let (wl, wt, wr, wb) = if fh != 0 {
+        let mut r: RECT = unsafe { std::mem::zeroed() };
+        unsafe {
+            GetWindowRect(fh as HWND, &mut r);
+        }
+        gdi::work_area_of_point((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+    } else {
+        unsafe {
+            let mut wa: RECT = std::mem::zeroed();
+            SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
+            (wa.left, wa.top, wa.right, wa.bottom)
+        }
+    };
+    let x = wl + ((wr - wl) - gdi::phys(SETTINGS_W) as i32) / 2;
+    let y = wt + ((wb - wt) - gdi::phys(SETTINGS_H) as i32) / 2;
+    (x, y)
 }
 
 type c_void_ty2 = winapi::ctypes::c_void;
@@ -389,6 +458,7 @@ pub fn show_settings_tab(tab: usize) {
             sui.0.tab = tab;
             sui.0.week_menu_open = false;
             sui.0.font_menu_open = false;
+            sui.0.family_menu_open = false;
             sui.0.theme_menu_open = false;
             sui.0.motto_menu_open = false;
         }
@@ -413,6 +483,7 @@ pub fn show_settings() {
         if let Some(sui) = guard.as_mut() {
             sui.0.week_menu_open = false; // 重开时收起上次遗留的下拉
             sui.0.font_menu_open = false;
+            sui.0.family_menu_open = false;
             sui.0.theme_menu_open = false;
             sui.0.motto_menu_open = false;
             sui.0.redraw();
@@ -596,7 +667,7 @@ impl SettingsUi {
             Self::hit_add(regions, px + 12.0, ty, 120.0, 42.0, act);
             let hov = self.hovered(&act);
             if sel {
-                p.fill_round(px + 12.0, ty, 120.0, 42.0, 8.0, gdi::argb(40, 62, 135, 250));
+                p.fill_round(px + 12.0, ty, 120.0, 42.0, 8.0, gdi::argb_a(40, crate::theme::pal().blue));
                 p.fill_rect(px + 12.0, ty + 8.0, 3.0, 26.0, BLUE());
             } else if hov {
                 p.fill_round(px + 12.0, ty, 120.0, 42.0, 8.0, crate::theme::ov(14));
@@ -613,11 +684,12 @@ impl SettingsUi {
         let last_ics = cfg.last_ics_update;
 
         if self.tab == 0 {
-            let rows: [(u8, &str, bool); 4] = [
+            let rows: [(u8, &str, bool); 5] = [
                 (0, "开机自启", cfg.autostart),
                 (1, "自动更新假期数据（每天检查）", cfg.auto_update),
                 (8, "显示系统托盘图标", cfg.show_tray),
                 (17, "提醒走系统通知中心（失败自动回退）", cfg.use_system_toast),
+                (18, "弹窗淡入淡出动画", cfg.fade_anim),
             ];
             let mut y = py + 54.0;
             for (idx, name, on) in rows {
@@ -638,8 +710,8 @@ impl SettingsUi {
             let tpill_x = cx + cw - tpill_w - 4.0;
             let tpill_top = y + 5.0;
             let thov = self.hovered(&SAction::ThemeDropdown);
-            p.fill_round(tpill_x, tpill_top, tpill_w, 30.0, 8.0, if thov { gdi::argb(50, 62, 135, 250) } else { gdi::argb(28, 62, 135, 250) });
-            p.stroke_round(tpill_x, tpill_top, tpill_w, 30.0, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+            p.fill_round(tpill_x, tpill_top, tpill_w, 30.0, 8.0, if thov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+            p.stroke_round(tpill_x, tpill_top, tpill_w, 30.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
             p.text(&format!("{} ▾", theme_names[cur_t]), tpill_x, tpill_top, tpill_w, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
             let tpill = (tpill_x, tpill_top, tpill_w);
             y += 52.0;
@@ -653,11 +725,49 @@ impl SettingsUi {
             let fpill_x = cx + cw - fpill_w - 4.0;
             let fpill_top = y + 5.0;
             let fhov = self.hovered(&SAction::FontScaleDropdown);
-            p.fill_round(fpill_x, fpill_top, fpill_w, 30.0, 8.0, if fhov { gdi::argb(50, 62, 135, 250) } else { gdi::argb(28, 62, 135, 250) });
-            p.stroke_round(fpill_x, fpill_top, fpill_w, 30.0, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+            p.fill_round(fpill_x, fpill_top, fpill_w, 30.0, 8.0, if fhov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+            p.stroke_round(fpill_x, fpill_top, fpill_w, 30.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
             p.text(&format!("{} ▾", scale_names[cur_i]), fpill_x, fpill_top, fpill_w, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
             let fpill = (fpill_x, fpill_top, fpill_w);
             y += 52.0;
+            // 界面字体（微软雅黑/等线/宋体/黑体/Segoe UI）
+            let family_labels = ["微软雅黑", "等线", "宋体", "黑体", "Segoe UI"];
+            let family_names = ["Microsoft YaHei UI", "DengXian", "SimSun", "SimHei", "Segoe UI"];
+            let cur_f = family_names.iter().position(|n| *n == cfg.ui_font_family).unwrap_or(0);
+            Self::hit_add(regions, cx, y, cw, 40.0, SAction::FontFamilyDropdown);
+            p.text("界面字体", cx + 2.0, y, cw - 120.0, 40.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, false, false, ROW_TXT());
+            let gpill_w = 110.0;
+            let gpill_x = cx + cw - gpill_w - 4.0;
+            let gpill_top = y + 5.0;
+            let ghov = self.hovered(&SAction::FontFamilyDropdown);
+            p.fill_round(gpill_x, gpill_top, gpill_w, 30.0, 8.0, if ghov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+            p.stroke_round(gpill_x, gpill_top, gpill_w, 30.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
+            p.text(&format!("{} \u{25BE}", family_labels[cur_f]), gpill_x, gpill_top, gpill_w, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
+            let gpill = (gpill_x, gpill_top, gpill_w);
+            y += 52.0;
+            // 字体族下拉展开
+            if self.family_menu_open {
+                let (gpill_x, gpill_top, gpill_w) = gpill;
+                let opt_h = 26.0;
+                let list_h = opt_h * family_labels.len() as f32 + 8.0;
+                let list_top = if gpill_top + 30.0 + list_h > py + ph - 50.0 {
+                    gpill_top - list_h
+                } else {
+                    gpill_top + 32.0
+                };
+                p.fill_round(gpill_x - 1.0, list_top, gpill_w + 2.0, list_h, 8.0, POPUP_BG());
+                p.stroke_round(gpill_x - 1.0, list_top, gpill_w + 2.0, list_h, 8.0, 1.0, BORDER());
+                for (i, name) in family_labels.iter().enumerate() {
+                    let oy = list_top + 4.0 + opt_h * i as f32;
+                    Self::hit_add(regions, gpill_x + 1.0, oy, gpill_w - 2.0, opt_h, SAction::FontFamilyPick(i));
+                    let h = self.hovered(&SAction::FontFamilyPick(i));
+                    if h {
+                        p.fill_round(gpill_x + 2.0, oy, gpill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
+                    }
+                    let sel = i == cur_f;
+                    p.text(name, gpill_x + 1.0, oy, gpill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE() } else { ROW_TXT() });
+                }
+            }
             // 下拉展开：选项列表（下方放不下则向上弹出）
             if self.font_menu_open {
                 let (fpill_x, fpill_top, fpill_w) = fpill;
@@ -675,7 +785,7 @@ impl SettingsUi {
                     Self::hit_add(regions, fpill_x + 1.0, oy, fpill_w - 2.0, opt_h, SAction::FontScalePick(i));
                     let h = self.hovered(&SAction::FontScalePick(i));
                     if h {
-                        p.fill_round(fpill_x + 2.0, oy, fpill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb(50, 62, 135, 250));
+                        p.fill_round(fpill_x + 2.0, oy, fpill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
                     }
                     let sel = i == cur_i;
                     p.text(name, fpill_x + 1.0, oy, fpill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE() } else { ROW_TXT() });
@@ -698,7 +808,7 @@ impl SettingsUi {
                     Self::hit_add(regions, tpill_x + 1.0, oy, tpill_w - 2.0, opt_h, SAction::ThemePick(i));
                     let h = self.hovered(&SAction::ThemePick(i));
                     if h {
-                        p.fill_round(tpill_x + 2.0, oy, tpill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb(50, 62, 135, 250));
+                        p.fill_round(tpill_x + 2.0, oy, tpill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
                     }
                     let sel = i == cur_t;
                     p.text(name, tpill_x + 1.0, oy, tpill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE() } else { ROW_TXT() });
@@ -708,8 +818,8 @@ impl SettingsUi {
             let btn_w = if self.refreshing { 190.0 } else { 160.0 };
             Self::hit_add(regions, cx, y, btn_w, 32.0, SAction::Refresh);
             let hov = self.hovered(&SAction::Refresh) && !self.refreshing;
-            p.fill_round(cx, y, btn_w, 32.0, 8.0, gdi::argb(38, 62, 135, 250));
-            p.stroke_round(cx, y, btn_w, 32.0, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+            p.fill_round(cx, y, btn_w, 32.0, 8.0, gdi::argb_a(38, crate::theme::pal().blue));
+            p.stroke_round(cx, y, btn_w, 32.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
             let label = if self.refreshing { "正在更新节假日数据…" } else { "立即更新节假日数据" };
             p.text(label, cx, y, btn_w, 32.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
             y += 44.0;
@@ -767,8 +877,8 @@ impl SettingsUi {
             let pill_x = cx + cw - pill_w - 4.0;
             let pill_top = y + 5.0;
             let hov = self.hovered(&SAction::WeekDropdown);
-            p.fill_round(pill_x, pill_top, pill_w, 30.0, 8.0, if hov { gdi::argb(50, 62, 135, 250) } else { gdi::argb(28, 62, 135, 250) });
-            p.stroke_round(pill_x, pill_top, pill_w, 30.0, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+            p.fill_round(pill_x, pill_top, pill_w, 30.0, 8.0, if hov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+            p.stroke_round(pill_x, pill_top, pill_w, 30.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
             p.text(&format!("{} ▾", vn), pill_x, pill_top, pill_w, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
             y += 52.0;
             p.text("更改设置后立即生效，无需保存。", cx, y, cw, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, SUB_DIM());
@@ -788,7 +898,7 @@ impl SettingsUi {
                     Self::hit_add(regions, pill_x + 1.0, oy, pill_w - 2.0, opt_h, SAction::WeekPick(i));
                     let h = self.hovered(&SAction::WeekPick(i));
                     if h {
-                        p.fill_round(pill_x + 2.0, oy, pill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb(50, 62, 135, 250));
+                        p.fill_round(pill_x + 2.0, oy, pill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
                     }
                     let sel = (cfg.week_start as usize) % 7 == i;
                     p.text(name, pill_x + 1.0, oy, pill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE() } else { ROW_TXT() });
@@ -848,8 +958,8 @@ impl SettingsUi {
                     let pill_x = cx + cw - pill_w - 8.0;
                     let pill_top = y + 42.0 + 4.0;
                     let hov = self.hovered(&SAction::MottoDropdown);
-                    p.fill_round(pill_x, pill_top, pill_w, 30.0, 8.0, if hov { gdi::argb(50, 62, 135, 250) } else { gdi::argb(28, 62, 135, 250) });
-                    p.stroke_round(pill_x, pill_top, pill_w, 30.0, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+                    p.fill_round(pill_x, pill_top, pill_w, 30.0, 8.0, if hov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+                    p.stroke_round(pill_x, pill_top, pill_w, 30.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
                     p.text(&format!("{} ▾", motto_names[motto_idx]), pill_x, pill_top, pill_w, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, BLUE());
                     motto_pill = (pill_x, pill_top);
                 }
@@ -874,7 +984,7 @@ impl SettingsUi {
                     Self::hit_add(regions, pill_x + 1.0, oy, pill_w - 2.0, opt_h, SAction::MottoPick(i));
                     let h = self.hovered(&SAction::MottoPick(i));
                     if h {
-                        p.fill_round(pill_x + 2.0, oy, pill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb(50, 62, 135, 250));
+                        p.fill_round(pill_x + 2.0, oy, pill_w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
                     }
                     let sel = i == motto_idx;
                     p.text(name, pill_x + 1.0, oy, pill_w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { BLUE() } else { ROW_TXT() });
@@ -950,6 +1060,12 @@ impl SettingsUi {
                             crate::config::set_use_system_toast(cfg.use_system_toast);
                             cfg.use_system_toast
                         }
+                        18 => {
+                            // 弹窗淡入淡出动画开关
+                            cfg.fade_anim = !cfg.fade_anim;
+                            crate::config::set_fade_anim(cfg.fade_anim);
+                            cfg.fade_anim
+                        }
                         10 => {
                             cfg.sidebar_date = !cfg.sidebar_date;
                             cfg.sidebar_date
@@ -1013,6 +1129,7 @@ impl SettingsUi {
             SAction::WeekDropdown => {
                 self.week_menu_open = !self.week_menu_open;
                 self.motto_menu_open = false;
+                self.family_menu_open = false;
                 self.hover = None;
                 self.redraw();
             }
@@ -1029,6 +1146,7 @@ impl SettingsUi {
                 self.font_menu_open = !self.font_menu_open;
                 self.week_menu_open = false;
                 self.motto_menu_open = false;
+                self.family_menu_open = false;
                 self.hover = None;
                 self.redraw();
             }
@@ -1036,9 +1154,22 @@ impl SettingsUi {
                 // 字号切换需走 rescale_all（内部拿 SETTINGS_UI 锁），在 WM_LBUTTONDOWN
                 // 锁外处理；此处仅兜底（正常路径到不了）
             }
+            SAction::FontFamilyDropdown => {
+                self.family_menu_open = !self.family_menu_open;
+                self.font_menu_open = false;
+                self.week_menu_open = false;
+                self.motto_menu_open = false;
+                self.hover = None;
+                self.redraw();
+            }
+            SAction::FontFamilyPick(_) => {
+                // 字体族切换需走 rescale_all（内部拿 SETTINGS_UI 锁），在 WM_LBUTTONDOWN
+                // 锁外处理；此处仅兜底（正常路径到不了）
+            }
             SAction::ThemeDropdown => {
                 self.theme_menu_open = !self.theme_menu_open;
                 self.font_menu_open = false;
+                self.family_menu_open = false;
                 self.week_menu_open = false;
                 self.motto_menu_open = false;
                 self.hover = None;
@@ -1126,6 +1257,24 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
+        WM_DPICHANGED => {
+            // 跨屏拖动设置窗口：按新屏 DPI 全局重缩放（副屏缩放独立）
+            let xdpi = (wp as u32) & 0xFFFF;
+            let dpi = xdpi as f32 / 96.0;
+            if !gdi::scale_overridden() && dpi > 0.0 && (gdi::dpi_scale() - dpi).abs() > 0.001 {
+                gdi::set_scale(dpi * gdi::text_scale());
+                rescale_all(gdi::scale());
+                // 重摆后再按系统建议矩形贴齐（保持视高不跳）
+                let sr = lp as *const RECT;
+                if !sr.is_null() {
+                    let h = SETTINGS_HWND.load(Ordering::Relaxed) as HWND;
+                    unsafe {
+                        SetWindowPos(h, std::ptr::null_mut(), (*sr).left, (*sr).top, (*sr).right - (*sr).left, (*sr).bottom - (*sr).top, SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+            }
+            0
+        }
         WM_LBUTTONDOWN => {
             // 拖动开始前先在锁外处理鼠标捕获：SetCapture 可能同步派发 WM_CAPTURECHANGED
             // （上次拖动后捕获仍在本窗口时同样会触发），其处理需要 SETTINGS_UI 锁，
@@ -1159,6 +1308,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             }
             let mut request_close = false;
             let mut font_pick: Option<usize> = None;
+            let mut family_pick: Option<usize> = None;
             {
                 let mut guard = SETTINGS_UI.lock().unwrap();
                 if let Some(sui) = guard.as_mut() {
@@ -1186,11 +1336,31 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                             }
                         }
                     } else if ui.font_menu_open {
-                        // 下拉展开中：仅选项/控件本身响应，点其他位置只收起
+                        // 下拉展开中：仅选项/控件本身响应，点其他位置只收起。
+                        // 字号/字体切换要走 rescale_all（内部拿 SETTINGS_UI 锁），记下来锁外执行
                         match a {
-                            Some(SAction::FontScalePick(i)) => ui.handle_action(&SAction::FontScalePick(i)),
+                            Some(SAction::FontScalePick(i)) => {
+                                font_pick = Some(i);
+                                ui.font_menu_open = false;
+                                ui.hover = None;
+                                ui.redraw();
+                            }
                             _ => {
                                 ui.font_menu_open = false;
+                                ui.hover = None;
+                                ui.redraw();
+                            }
+                        }
+                    } else if ui.family_menu_open {
+                        match a {
+                            Some(SAction::FontFamilyPick(i)) => {
+                                family_pick = Some(i);
+                                ui.family_menu_open = false;
+                                ui.hover = None;
+                                ui.redraw();
+                            }
+                            _ => {
+                                ui.family_menu_open = false;
                                 ui.hover = None;
                                 ui.redraw();
                             }
@@ -1207,13 +1377,16 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                         }
                     } else if let Some(a) = a {
                         match a {
-                            SAction::Toggle(_) | SAction::WeekDropdown | SAction::MottoDropdown | SAction::FontScaleDropdown | SAction::ThemeDropdown | SAction::Refresh | SAction::Tab(_) => {
+                            SAction::Toggle(_) | SAction::WeekDropdown | SAction::MottoDropdown | SAction::FontScaleDropdown | SAction::FontFamilyDropdown | SAction::ThemeDropdown | SAction::Refresh | SAction::Tab(_) => {
                                 ui.handle_action(&a);
                             }
                             // 字号切换要走 rescale_all（其内部需拿 SETTINGS_UI 锁），
                             // 延后到锁外执行；确认/关闭同理（hide_settings/free 不能持锁重入）
                             SAction::FontScalePick(i) => {
                                 font_pick = Some(i);
+                            }
+                            SAction::FontFamilyPick(i) => {
+                                family_pick = Some(i);
                             }
                             SAction::Confirm | SAction::Close => {
                                 request_close = true;
@@ -1236,6 +1409,21 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 }
                 // 字号并入全局缩放链：切换等价一次 DPI 变化，全部窗口重摆重绘
                 gdi::set_text_scale(v);
+                rescale_all(gdi::scale());
+            }
+            if let Some(i) = family_pick {
+                let names = ["Microsoft YaHei UI", "DengXian", "SimSun", "SimHei", "Segoe UI"];
+                let name = names[i.min(names.len() - 1)];
+                {
+                    let mut guard = SETTINGS_UI.lock().unwrap();
+                    if let Some(sui) = guard.as_mut() {
+                        let mut cfg = sui.0.st.config.lock().unwrap();
+                        cfg.ui_font_family = name.to_string();
+                        cfg.save();
+                    }
+                }
+                // 换字体族等价一次全局重绘：失效字体缓存后全部窗口重摆重绘
+                gdi::set_font_family(name);
                 rescale_all(gdi::scale());
             }
             if request_close {
@@ -1505,8 +1693,9 @@ pub fn forecast_open(main_hwnd: usize) {
         // 天气面板与日期侧栏同屏：侧栏开着时锚定其左缘（向左串联），二者不再互斥
         let mut mr: RECT = std::mem::zeroed();
         GetWindowRect(main_hwnd as HWND, &mut mr);
-        let mut wa: RECT = std::mem::zeroed();
-        SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
+        // 工作区取日历所在屏（多屏：不再固定主屏）
+        let (fcl, fct, fcr, fcb) = gdi::work_area_of_point((mr.left + mr.right) / 2, (mr.top + mr.bottom) / 2);
+        let mut wa: RECT = RECT { left: fcl, top: fct, right: fcr, bottom: fcb };
         // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐；
         // 日期侧栏打开时锚定到侧栏左缘（向左串联）。anchor/工作区均为物理像素，
         // 偏移与面板尺寸按 sf 放大
@@ -1958,6 +2147,11 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             hover_cell: None,
             hover_since: None,
             preview: None,
+            tip_hover: None,
+            row_menu: None,
+            copy_src: None,
+            multi: None,
+            month_pick: None,
             tick: 0,
             last_second: 0,
             idle_timer: false,
@@ -1970,6 +2164,9 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             dumped: false,
             dump_path: std::env::var("CAL_DUMP").unwrap_or_default(),
         });
+        if std::env::var("CAL_PAGE").as_deref() == Ok("monthpick") {
+            ui.month_pick = Some(MonthPick { year: view_y });
+        }
         // 后台位图不再启动时常驻：显示时 perform_show→redraw 惰性分配，隐藏即释放。
         // 初始绘制仅服务于 CAL_DUMP 首帧转储（转储完成立即释放）
         UI.lock().unwrap().replace(SendUi(ui));
@@ -2082,7 +2279,48 @@ fn set_shown(ui: &mut Ui, show: bool) {
 }
 
 /// 显示弹窗：窗口操作在 UI 锁之外执行（避免消息重入死锁）
+/// 整窗 alpha 缩放（分层窗口为预乘 alpha：BGRA 4 通道同乘）
+unsafe fn alpha_mul(scan0: *mut u8, w: i32, h: i32, t: f32) {
+    if scan0.is_null() || t >= 1.0 {
+        return;
+    }
+    let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
+    if n == 0 {
+        return;
+    }
+    let f = (t.clamp(0.0, 1.0) * 256.0) as u32;
+    let px = std::slice::from_raw_parts_mut(scan0, n);
+    for b in px.iter_mut() {
+        *b = (((*b as u32) * f) >> 8) as u8;
+    }
+}
+
+static RESCALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn perform_show(hwnd: HWND) {
+    // 多屏 DPI：以时钟（任务栏）所在屏的有效 DPI 修正全局缩放——
+    // 副屏缩放不同或系统缩放改动后首次弹出，先全局重摆再定位
+    if !gdi::scale_overridden() && !RESCALING.load(Ordering::Relaxed) {
+        let clock: Option<crate::overlay::ClockInfo> = {
+            let guard = UI.lock().unwrap();
+            let c = guard.as_ref().unwrap().0.st.clock.lock().unwrap().clone();
+            c
+        };
+        if let Some(cr) = clock.as_ref() {
+            // ClockInfo 自带所在屏信息：优先用 mon 矩形中心（时钟矩形即在该屏）
+            let (ml, mt, mr2, mb2) = cr.mon;
+            let cx = (ml + mr2) / 2;
+            let cy = (mt + mb2) / 2;
+            let want = gdi::monitor_dpi_at(cx, cy) * gdi::text_scale();
+            if want > 0.0 && (want - gdi::scale()).abs() > 0.01 {
+                RESCALING.store(true, Ordering::Relaxed);
+                gdi::set_scale(want);
+                // 显示中会自行重摆（重入本函数，受 RESCALING 保护不再重复检测）
+                rescale_all(gdi::scale());
+                RESCALING.store(false, Ordering::Relaxed);
+            }
+        }
+    }
     let p = {
         let guard = UI.lock().unwrap();
         let ui = &guard.as_ref().unwrap().0;
@@ -2092,9 +2330,8 @@ fn perform_show(hwnd: HWND) {
     let (w, h) = (gdi::phys(WIN_W) as i32, gdi::phys(WIN_H) as i32);
     unsafe {
         SetWindowPos(hwnd, HWND_TOPMOST, gdi::phys(p.x as f32) as i32, gdi::phys(p.y as f32) as i32, w, h, SWP_NOACTIVATE);
-        ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
     }
+    let fade = crate::config::fade_anim_on();
     let mut guard = UI.lock().unwrap();
     if let Some(sui) = guard.as_mut() {
         let ui = &mut sui.0;
@@ -2102,7 +2339,17 @@ fn perform_show(hwnd: HWND) {
         ui.flush_bottom = p.flush_bottom;
         ui.shown = true;
         SHOWN_FLAG.store(1, Ordering::Relaxed);
-        ui.redraw();
+        if fade {
+            // 先合成全亮表面并压暗，显示后分步渐亮（避免先闪一帧全亮）
+            ui.redraw();
+            ui.fade_in();
+        } else {
+            unsafe {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+            ui.redraw();
+        }
         // 调试：CAL_SIDEBAR=1 弹出日历时自动打开日期侧边栏
         if std::env::var("CAL_SIDEBAR").map(|v| v == "1").unwrap_or(false) {
             crate::sidebar::sidebar_show(ui.selected);
@@ -2118,13 +2365,18 @@ fn perform_hide(hwnd: HWND) {
             Some(sui) => {
                 was_shown = sui.0.shown;
                 sui.0.shown = false;
+                sui.0.tip_hover = None;
                 if was_shown {
+                    if crate::config::fade_anim_on() {
+                        sui.0.fade_out();
+                    }
                     free_surface(&mut sui.0);
                 }
             }
             None => was_shown = false,
         }
     }
+    crate::tooltip::hide();
     if was_shown {
         unsafe {
             ShowWindow(hwnd, SW_HIDE);
@@ -2163,7 +2415,20 @@ fn poll_scale_change() {
     if gdi::scale_overridden() {
         return;
     }
-    let now = gdi::primary_scale();
+    // 可见时以弹窗所在屏为准（副屏缩放独立变化也能跟随），隐藏时以主屏为准
+    let now = {
+        let guard = UI.lock().unwrap();
+        match guard.as_ref() {
+            Some(sui) if sui.0.shown => {
+                let mut r: RECT = unsafe { std::mem::zeroed() };
+                unsafe {
+                    GetWindowRect(sui.0.hwnd as HWND, &mut r);
+                }
+                gdi::monitor_dpi_at((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+            }
+            _ => gdi::primary_scale(),
+        }
+    };
     // 与纯 DPI 缩放比较（全局 scale 含字号系数，不能作对比基准）
     if now > 0.0 && (now - gdi::dpi_scale()).abs() > 0.001 {
         gdi::set_scale(now);
@@ -2303,6 +2568,98 @@ impl Ui {
         }
     }
 
+    /// 每秒局部重绘：时钟文字区域 bg 擦写 + 重画后整窗 ULW，
+    /// 省掉日历网格等上百个元素的整窗重绘（头部以外像素不变）
+    fn redraw_clock(&mut self) {
+        if self.bmp.is_null() || self.g.is_null() {
+            self.redraw();
+            return;
+        }
+        let cache_ptr: *const Cache = &self.cache;
+        let g = self.g;
+        unsafe {
+            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
+        }
+        let p = unsafe {
+            Painter {
+                g,
+                cache: cache_ptr,
+                sf: self.sf,
+                w: self.w,
+                h: self.h,
+                dc: self.mem_dc,
+                scan0: self.scan0,
+            }
+        };
+        let cfg = self.st.config.lock().unwrap().clone();
+        let now = Local::now();
+        let left = 24.0; // panel_x0(10) + pad(14)
+        p.fill_rect(left - 6.0, 18.0, 344.0, 60.0, BG());
+        let clock_str = if cfg.hour12 {
+            let (pm, h12) = now.hour12();
+            format!(
+                "{} {:02}:{:02}:{:02}",
+                if pm { "下午" } else { "上午" },
+                h12,
+                now.minute(),
+                now.second()
+            )
+        } else {
+            format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
+        };
+        p.text(&clock_str, left, 22.0, 320.0, 52.0, gdi::HALIGN_NEAR, gdi::HALIGN_NEAR, 40.0, true, false, TXT());
+        self.ulw();
+    }
+
+    /// 淡入：拷贝当前全亮表面→压暗→显示窗口→分步渐亮恢复（约 90ms）
+    fn fade_in(&mut self) {
+        let (w, h) = ((self.w * self.sf) as i32, (self.h * self.sf) as i32);
+        let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
+        if self.scan0.is_null() || n == 0 {
+            unsafe {
+                ShowWindow(self.hwnd as HWND, SW_SHOW);
+                SetForegroundWindow(self.hwnd as HWND);
+            }
+            return;
+        }
+        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(self.scan0, n) }.to_vec();
+        unsafe {
+            alpha_mul(self.scan0, w, h, 0.25);
+        }
+        self.ulw();
+        unsafe {
+            ShowWindow(self.hwnd as HWND, SW_SHOW);
+            SetForegroundWindow(self.hwnd as HWND);
+        }
+        for t in [0.55f32, 0.85, 1.0] {
+            std::thread::sleep(std::time::Duration::from_millis(28));
+            unsafe {
+                std::ptr::copy_nonoverlapping(pristine.as_ptr(), self.scan0, n);
+                alpha_mul(self.scan0, w, h, t);
+            }
+            self.ulw();
+        }
+    }
+
+    /// 淡出：分步压暗到全透明（调用方随后隐藏窗口并释放表面，约 80ms）
+    fn fade_out(&mut self) {
+        let (w, h) = ((self.w * self.sf) as i32, (self.h * self.sf) as i32);
+        let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
+        if self.scan0.is_null() || n == 0 {
+            return;
+        }
+        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(self.scan0, n) }.to_vec();
+        for t in [0.55f32, 0.25, 0.0] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(pristine.as_ptr(), self.scan0, n);
+                alpha_mul(self.scan0, w, h, t);
+            }
+            self.ulw();
+            std::thread::sleep(std::time::Duration::from_millis(26));
+        }
+    }
+
     fn paint_frame(&self, p: &Painter) {
         let (x, y) = (PANEL_INSET, PANEL_INSET);
         let (w, h) = (WIN_W - PANEL_INSET * 2.0, WIN_H - PANEL_INSET * 2.0);
@@ -2412,6 +2769,12 @@ impl Ui {
             p.text(week_names[wd], cx - 30.0, gy, 60.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, WEEK_HEAD());
         }
 
+        // 复制待粘贴：横幅提示（瞬态模式，覆盖星期表头）
+        if self.copy_src.is_some() {
+            p.fill_round(left, 128.0, right - left, 20.0, 6.0, gdi::argb_a(40, crate::theme::pal().blue));
+            p.text("点击目标日期完成复制，Esc 取消", left, 128.0, right - left, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, BLUE());
+        }
+
         // 月网格：显示非当前月日期时固定 6 行（含与当前月相邻的上一周/下一周）；
         // 关闭时只保留包含当前月日期的行，行高变大补满日历（窗口高度不变）
         let grid_y = 150.0;
@@ -2453,7 +2816,7 @@ impl Ui {
                     14.0,
                     gdi::HALIGN_FAR,
                     gdi::HALIGN_CENTER,
-                    9.0,
+                    10.0,
                     false,
                     false,
                     WEEK_NUM(),
@@ -2473,8 +2836,13 @@ impl Ui {
                     || recur_rules.iter().any(|rule| rule.hits(date))
                     || span_keys.contains(&key);
                 let has_todo = todo_keys.contains(&key);
+                // 数量角标：日程（含重复/跨天展开）+ 未完成待办；日程点色取当天首个自定义色
+                let day_items = crate::events::agenda_on(&agenda, date);
+                let n_items = day_items.len()
+                    + crate::sidebar::todos_for(&key).iter().filter(|(_, t)| !t.done).count();
+                let agenda_col = day_items.iter().find_map(|(_, _, e)| crate::events::color_of_entry(e)).map(|c| crate::events::entry_color(Some(c)));
                 Self::hit_add(regions, cx, row_top, col_w, row_h, Action::Cell(date));
-                paint_day_cell(p, self, &rect, date, today, self.selected, in_month, hol, has_agenda, has_todo, &cfg);
+                paint_day_cell(p, self, &rect, date, today, self.selected, in_month, hol, has_agenda, has_todo, n_items, agenda_col, &cfg);
             }
         }
 
@@ -2498,6 +2866,60 @@ impl Ui {
                     let tds = crate::sidebar::todos_for(&crate::ics::key_of_date(pv));
                     paint_day_preview(p, &cell, pv, &items, &tds);
                 }
+            }
+        }
+
+        // 年月快速跳转面板（点击月份标题弹出；后绘制 → 命中最优先）
+        if let Some(mp) = &self.month_pick {
+            let pw = right - left;
+            let px0 = left;
+            let py0 = 126.0;
+            let ph0 = 236.0;
+            p.fill_round(px0, py0, pw, ph0, 10.0, POPUP_BG());
+            p.stroke_round(px0, py0, pw, ph0, 10.0, 1.0, BORDER());
+            // 年份导航：‹ 年 ›
+            Self::hit_add(regions, px0 + 10.0, py0 + 10.0, 30.0, 28.0, Action::MonthPickYear(-1));
+            let hov = self.hovered(&Action::MonthPickYear(-1));
+            if hov {
+                p.fill_round(px0 + 10.0, py0 + 10.0, 30.0, 28.0, 6.0, HOVER_BG());
+            }
+            p.text("‹", px0 + 10.0, py0 + 10.0, 30.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 16.0, false, false, if hov { ON_BG() } else { ICON_COL() });
+            p.text(&format!("{}年", mp.year), px0 + 46.0, py0 + 10.0, 110.0, 28.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 16.0, true, false, TITLE_COL());
+            Self::hit_add(regions, px0 + 156.0, py0 + 10.0, 30.0, 28.0, Action::MonthPickYear(1));
+            let hov = self.hovered(&Action::MonthPickYear(1));
+            if hov {
+                p.fill_round(px0 + 156.0, py0 + 10.0, 30.0, 28.0, 6.0, HOVER_BG());
+            }
+            p.text("›", px0 + 156.0, py0 + 10.0, 30.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 16.0, false, false, if hov { ON_BG() } else { ICON_COL() });
+            // 回到今天（右上角）
+            Self::hit_add(regions, px0 + pw - 86.0, py0 + 11.0, 76.0, 26.0, Action::MonthPickToday);
+            let hov = self.hovered(&Action::MonthPickToday);
+            if hov {
+                p.fill_round(px0 + pw - 86.0, py0 + 11.0, 76.0, 26.0, 6.0, HOVER_BG());
+            }
+            p.text("回到今天", px0 + pw - 86.0, py0 + 11.0, 76.0, 26.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if hov { ON_BG() } else { BLUE() });
+            // 12 个月格（4 列 × 3 行）
+            let gw = (pw - 20.0) / 4.0;
+            let gh = 54.0;
+            let gy0 = py0 + 48.0;
+            for i in 0..12u32 {
+                let mx = px0 + 10.0 + gw * (i % 4) as f32 + 3.0;
+                let my = gy0 + (gh + 6.0) * (i / 4) as f32;
+                let mw = gw - 6.0;
+                let act = Action::MonthPickGo(i + 1);
+                Self::hit_add(regions, mx, my, mw, gh, act);
+                let hov = self.hovered(&act);
+                let cur = self.view_y == mp.year && self.view_m == i + 1;
+                let is_now = today.year() == mp.year && today.month() == i + 1;
+                if cur {
+                    p.fill_round(mx, my, mw, gh, 8.0, BLUE());
+                } else if hov {
+                    p.fill_round(mx, my, mw, gh, 8.0, HOVER_BG());
+                } else {
+                    p.fill_round(mx, my, mw, gh, 8.0, CELL_HOVER());
+                }
+                let label = if is_now { format!("{}月 · 今", i + 1) } else { format!("{}月", i + 1) };
+                p.text(&label, mx, my, mw, gh, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.5, false, false, if cur { WHITE } else if is_now { BLUE() } else { ROW_TXT() });
             }
         }
     }
@@ -2596,8 +3018,11 @@ impl Ui {
                         clipped = true;
                         break;
                     }
-                    let text = crate::events::display(&self.agenda_resolved[i].2);
-                    self.draw_item_row(p, regions, y, row_h, "日程", BLUE(), &text, Action::AgendaEdit(i), Action::AgendaDel(i), None);
+                    let e = &self.agenda_resolved[i].2;
+                    let text = crate::events::display(e);
+                    let tag_col = crate::events::entry_color(crate::events::color_of_entry(e));
+                    let sel = self.multi.as_ref().and_then(|(a, _)| a.get(i).copied());
+                    self.draw_item_row(p, regions, y, row_h, "日程", tag_col, &text, Action::AgendaEdit(i), Action::AgendaDel(i), None, sel);
                     y += row_h + gap;
                 }
                 AgRow::Todo(i) => {
@@ -2608,7 +3033,9 @@ impl Ui {
                     let (gi, t, _) = self.agenda_todos[i].clone();
                     let tm = if t.has_time { crate::events::fmt_time_str(t.start.as_deref().unwrap_or("")) } else { String::new() };
                     let text = if tm.is_empty() { t.text.clone() } else { format!("{} {}", tm, t.text) };
-                    self.draw_item_row(p, regions, y, row_h, "待办", TODO_ORANGE(), &text, Action::TodoEdit(i), Action::TodoDel(i), Some((t.done, i)));
+                    let tag_col = t.color.map(|c| crate::events::entry_color(Some(c))).unwrap_or_else(|| TODO_ORANGE());
+                    let sel = self.multi.as_ref().and_then(|(_, t)| t.get(i).copied());
+                    self.draw_item_row(p, regions, y, row_h, "待办", tag_col, &text, Action::TodoEdit(i), Action::TodoDel(i), Some((t.done, i)), sel);
                     let _ = gi;
                     y += row_h + gap;
                 }
@@ -2620,12 +3047,16 @@ impl Ui {
             p.text("滚轮查看更多", 20.0, input_y - 22.0, WIN_W - 40.0, 18.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM());
         }
 
-        // 底部：类型下拉（日程/待办）+ 输入 + 添加
+        // 底部：多选工具条 / 类型下拉（日程/待办）+ 输入 + 添加
+        if self.multi.is_some() {
+            self.paint_multi_bar(p, regions);
+            return;
+        }
         let pill = gdi::RectF { x: 28.0, y: WIN_H - 66.0, w: 78.0, h: 30.0 };
         Self::hit_add(regions, pill.x, pill.y, pill.w, pill.h, Action::KindDropdown);
         let hov = self.hovered(&Action::KindDropdown);
-        p.fill_round(pill.x, pill.y, pill.w, pill.h, 8.0, if hov { gdi::argb(50, 62, 135, 250) } else { gdi::argb(28, 62, 135, 250) });
-        p.stroke_round(pill.x, pill.y, pill.w, pill.h, 8.0, 1.0, gdi::argb(110, 62, 135, 250));
+        p.fill_round(pill.x, pill.y, pill.w, pill.h, 8.0, if hov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) });
+        p.stroke_round(pill.x, pill.y, pill.w, pill.h, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
         let (kind_name, kind_col) = if self.draft_kind == 0 { ("日程", BLUE()) } else { ("待办", TODO_ORANGE()) };
         p.text(&format!("{} ▾", kind_name), pill.x, pill.y, pill.w, pill.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, kind_col);
         let input = gdi::RectF { x: pill.x + pill.w + 8.0, y: WIN_H - 66.0, w: WIN_W - 20.0 - 92.0 - (pill.x + pill.w + 8.0), h: 30.0 };
@@ -2683,24 +3114,270 @@ impl Ui {
                 Self::hit_add(regions, pill.x + 1.0, oy, pill.w - 2.0, opt_h, Action::KindPick(i));
                 let hov2 = self.hovered(&Action::KindPick(i));
                 if hov2 {
-                    p.fill_round(pill.x + 2.0, oy, pill.w - 4.0, opt_h - 1.0, 6.0, gdi::argb(50, 62, 135, 250));
+                    p.fill_round(pill.x + 2.0, oy, pill.w - 4.0, opt_h - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
                 }
                 let sel = (i == 0) == (self.draft_kind == 0);
                 let col = if i == 0 { BLUE() } else { TODO_ORANGE() };
                 p.text(name, pill.x + 1.0, oy, pill.w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { col } else { ROW_TXT() });
             }
         }
+
+        // 行右键菜单（最后绘制 → 命中最优先）
+        if let Some((kind, idx, mx, my)) = self.row_menu {
+            let mw = 158.0;
+            let ih = 30.0;
+            let mh = ih * 3.0 + 8.0;
+            let x = mx.min(WIN_W - 20.0 - mw);
+            let y = my.min(WIN_H - 66.0 - mh);
+            p.fill_round(x, y, mw, mh, 8.0, POPUP_BG());
+            p.stroke_round(x, y, mw, mh, 8.0, 1.0, BORDER());
+            let tomorrow = Local::now().date_naive() + chrono::Duration::days(1);
+            let items: [(Action, &str); 3] = [
+                (Action::RowCopyTo(kind, idx, Some(tomorrow)), "复制到明天"),
+                (Action::RowCopyTo(kind, idx, None), "复制到指定日期…"),
+                (Action::RowMulti, "多选"),
+            ];
+            for (i, (act, label)) in items.iter().enumerate() {
+                let oy = y + 4.0 + ih * i as f32;
+                Self::hit_add(regions, x + 1.0, oy, mw - 2.0, ih, *act);
+                let hov = self.hovered(act);
+                if hov {
+                    p.fill_round(x + 2.0, oy, mw - 4.0, ih - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
+                }
+                p.text(label, x + 10.0, oy, mw - 16.0, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
+            }
+        }
+    }
+
+    /// 复制条目到目标日期：日程复制为单次（重复属性不带走）；待办平移归属日
+    fn do_copy(&mut self, kind: u8, idx: usize, target: NaiveDate) {
+        let mut done = false;
+        if kind == 0 {
+            if let Some((_, _, entry, _)) = self.resolved_row(idx) {
+                let ne = match entry {
+                    crate::events::AgendaEntry::Rich(mut ev) => {
+                        ev.id = crate::events::gen_id();
+                        ev.start = shift_to_date(&ev.start, target);
+                        ev.end = shift_to_date(&ev.end, target);
+                        ev.recur = None;
+                        ev.recur_until = None;
+                        ev.skip_dates = Vec::new();
+                        crate::events::AgendaEntry::Rich(ev)
+                    }
+                    crate::events::AgendaEntry::Legacy(text) => {
+                        crate::events::AgendaEntry::Rich(crate::events::RichEvent {
+                            id: crate::events::gen_id(),
+                            name: text,
+                            all_day: true,
+                            start: crate::events::fmt_d_store(target),
+                            end: crate::events::fmt_d_store(target),
+                            remind: None,
+                            repeat: None,
+                            recur: None,
+                            recur_until: None,
+                            skip_dates: Vec::new(),
+                            note: None,
+                            color: None,
+                        })
+                    }
+                };
+                let key = crate::ics::key_of_date(target);
+                self.agenda.lock().unwrap().entry(key).or_default().push(ne);
+                save_agenda(&self.agenda.lock().unwrap());
+                done = true;
+            }
+        } else if let Some((_, td, _)) = self.todo_row(idx) {
+            let mut nt = td;
+            nt.id = crate::events::gen_id();
+            nt.date = Some(crate::ics::key_of_date(target));
+            nt.done = false;
+            nt.done_dates = Vec::new();
+            nt.skip_dates = Vec::new();
+            if nt.has_time {
+                nt.start = nt.start.as_deref().map(|s| shift_to_date(s, target));
+                nt.end = nt.end.as_deref().map(|s| shift_to_date(s, target));
+            }
+            crate::sidebar::add_todo_quiet(nt);
+            done = true;
+        }
+        if done {
+            crate::sidebar::sidebar_repaint();
+        }
+    }
+
+    /// 多选批量：顺延1天 / 删除（delete=true）。日程部分锁内直接改，
+    /// 待办部分返回给调用方在锁外执行（写盘辅助会触发重绘重入）
+    fn multi_apply(&mut self, delete: bool) -> MultiResult {
+        let mut res = MultiResult { todo_deletes: Vec::new(), todo_updates: Vec::new(), undo: None, hint: String::new() };
+        let mut ag_del: Vec<(String, usize, crate::events::AgendaEntry)> = Vec::new();
+        let mut ag_moves: Vec<(String, usize, NaiveDate)> = Vec::new();
+        let mut skipped = 0usize;
+        if let Some((sa, st)) = self.multi.as_ref() {
+            for (i, on) in sa.iter().enumerate() {
+                if !*on {
+                    continue;
+                }
+                if let Some((key, idx, entry, _)) = self.resolved_row(i) {
+                    let is_recur = matches!(&entry, crate::events::AgendaEntry::Rich(r) if r.recur.is_some());
+                    if is_recur || matches!(entry, crate::events::AgendaEntry::Legacy(_)) {
+                        skipped += 1;
+                        continue;
+                    }
+                    if delete {
+                        ag_del.push((key, idx, entry));
+                    } else if let crate::events::AgendaEntry::Rich(r) = &entry {
+                        if let Some(d) = crate::events::parse_start(&r.start).map(|dt| dt.date()) {
+                            ag_moves.push((key, idx, d + chrono::Duration::days(1)));
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                }
+            }
+            for (i, on) in st.iter().enumerate() {
+                if !*on {
+                    continue;
+                }
+                if let Some((gi, td, _)) = self.todo_row(i) {
+                    if td.recur.is_some() {
+                        skipped += 1;
+                        continue;
+                    }
+                    if delete {
+                        res.todo_deletes.push((gi, td));
+                    } else {
+                        let nd = td
+                            .date
+                            .as_deref()
+                            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                            .map(|d| d + chrono::Duration::days(1));
+                        let mut nt = td;
+                        if let Some(nd) = nd {
+                            nt.date = Some(crate::ics::key_of_date(nd));
+                            if nt.has_time {
+                                nt.start = nt.start.as_deref().map(|s| shift_to_date(s, nd));
+                                nt.end = nt.end.as_deref().map(|s| shift_to_date(s, nd));
+                            }
+                            res.todo_updates.push((gi, nt));
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if delete {
+            // 日程：同 key 按下标降序删（避免位移），保留原快照用于一次撤销
+            ag_del.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let mut removed = 0usize;
+            {
+                let mut m = self.agenda.lock().unwrap();
+                for (key, idx, _) in &ag_del {
+                    if crate::events::agenda_remove_at(&mut m, key, *idx) {
+                        removed += 1;
+                    }
+                }
+            }
+            if removed > 0 {
+                save_agenda(&self.agenda.lock().unwrap());
+            }
+            res.todo_deletes.sort_by_key(|(gi, _)| std::cmp::Reverse(*gi));
+            let mut items: Vec<crate::toast::UndoData> = ag_del
+                .iter()
+                .map(|(key, idx, entry)| crate::toast::UndoData::Agenda { key: key.clone(), idx: *idx, entry: entry.clone() })
+                .collect();
+            if !res.todo_deletes.is_empty() {
+                items.push(crate::toast::UndoData::Todos { items: res.todo_deletes.clone() });
+            }
+            let n = removed + res.todo_deletes.len();
+            res.hint = format!("已删除 {} 项", n);
+            if n > 0 {
+                res.undo = Some(crate::toast::UndoData::Multi { items });
+            }
+        } else {
+            ag_moves.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let mut moved = 0usize;
+            {
+                let mut m = self.agenda.lock().unwrap();
+                for (key, idx, nd) in &ag_moves {
+                    if let Some(v) = m.get_mut(key.as_str()) {
+                        if *idx < v.len() {
+                            let mut e = v.remove(*idx);
+                            if let crate::events::AgendaEntry::Rich(r) = &mut e {
+                                r.start = shift_to_date(&r.start, *nd);
+                                r.end = shift_to_date(&r.end, *nd);
+                            }
+                            let nk = crate::ics::key_of_date(*nd);
+                            m.entry(nk).or_default().push(e);
+                            moved += 1;
+                        }
+                    }
+                }
+            }
+            if moved > 0 {
+                save_agenda(&self.agenda.lock().unwrap());
+            }
+            let n = moved + res.todo_updates.len();
+            res.hint = if skipped > 0 {
+                format!("已顺延 {} 项，{} 项重复条目已跳过", n, skipped)
+            } else {
+                format!("已顺延 {} 项", n)
+            };
+        }
+        res
+    }
+
+    /// 多选模式底部工具条：全选 / 顺延1天 / 删除 / 取消
+    fn paint_multi_bar(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
+        let (sa, st) = match &self.multi {
+            Some(v) => v,
+            None => return,
+        };
+        let n = sa.iter().filter(|x| **x).count() + st.iter().filter(|x| **x).count();
+        let y = WIN_H - 66.0;
+        let bw = (WIN_W - 20.0 - 24.0 - 3.0 * 10.0) / 4.0;
+        let defs: [(Action, &str, bool); 4] = [
+            (Action::MultiAll, "全选", false),
+            (Action::MultiPostpone, "顺延1天", false),
+            (Action::MultiDelete, "删除", true),
+            (Action::MultiCancel, "取消", false),
+        ];
+        for (i, (act, label, danger)) in defs.iter().enumerate() {
+            let bx = 10.0 + (bw + 10.0) * i as f32;
+            Self::hit_add(regions, bx, y, bw, 30.0, *act);
+            let hov = self.hovered(act);
+            let (bg, fg) = if *danger {
+                (gdi::argb(if hov { 70 } else { 36 }, 229, 75, 75), gdi::argb(255, 0xE8, 0x6B, 0x6E))
+            } else {
+                (
+                    if hov { gdi::argb_a(50, crate::theme::pal().blue) } else { gdi::argb_a(28, crate::theme::pal().blue) },
+                    BLUE(),
+                )
+            };
+            p.fill_round(bx, y, bw, 30.0, 8.0, bg);
+            p.text(label, bx, y, bw, 30.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, fg);
+        }
+        p.text(&format!("已选 {} 项", n), 10.0, y - 20.0, 140.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB_DIM());
     }
 
     /// 日程页条目行：行体热区 + 勾选圈（待办）+ tag 胶囊 + 文本 + ✕ 删除热区
     /// （勾选/删除区域后绘制，命中优先）
-    fn draw_item_row(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>, y: f32, row_h: f32, tag: &str, tag_col: u32, text: &str, edit_act: Action, del_act: Action, check: Option<(bool, usize)>) {
+    fn draw_item_row(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>, y: f32, row_h: f32, tag: &str, tag_col: u32, text: &str, edit_act: Action, del_act: Action, check: Option<(bool, usize)>, sel: Option<bool>) {
         let rx = 20.0;
         let rw = WIN_W - 20.0 - 40.0;
         let row_hov = self.hovered(&edit_act);
         p.fill_round(rx, y, rw, row_h, 8.0, gdi::argb(if row_hov { 24 } else { 11 }, 255, 255, 255));
         Self::hit_add(regions, rx, y, rw, row_h, edit_act);
         let mut cx_off = 8.0;
+        if let Some(on) = sel {
+            // 多选模式：行首选择圈（点击行切换）
+            let ccx = rx + 14.0;
+            p.stroke_circle(ccx, y + row_h / 2.0, 6.0, 1.2, if on { BLUE() } else { SUB() });
+            if on {
+                p.fill_circle(ccx, y + row_h / 2.0, 3.5, BLUE());
+            }
+            cx_off += 22.0;
+        }
         if let Some((done, ti)) = check {
             // 勾选圈（点击切换完成状态）
             let ccx = rx + 18.0;
@@ -2763,6 +3440,8 @@ fn paint_day_cell(
     hol: Option<&DayInfo>,
     has_agenda: bool,
     has_todo: bool,
+    n_items: usize,
+    agenda_col: Option<u32>,
     cfg: &Config,
 ) {
     let cx = rect.x + rect.w / 2.0;
@@ -2838,15 +3517,15 @@ fn paint_day_cell(
         let col = if is_today { WHITE } else { sub_col };
         if chars.len() <= 5 {
             // 5 字内自适应缩小字号完整显示（如“烈士纪念日”）
-            let px = fit_text_px(p, &sub, max_w, 11.0, 9.0);
+            let px = fit_text_px(p, &sub, max_w, 11.0, 10.0);
             p.text(&sub, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px, false, false, col);
         } else {
             // 超过 5 字换行：第一行 5 字，其余第二行
             let line1: String = chars[..5].iter().collect();
             let line2: String = chars[5..].iter().collect();
-            let px1 = fit_text_px(p, &line1, max_w, 11.0, 9.0);
+            let px1 = fit_text_px(p, &line1, max_w, 11.0, 10.0);
             p.text(&line1, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px1, false, false, col);
-            let px2 = fit_text_px(p, &line2, max_w, 11.0, 9.0);
+            let px2 = fit_text_px(p, &line2, max_w, 11.0, 10.0);
             p.text(&line2, rect.x + 1.0, line2_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px2, false, false, col);
         }
     }
@@ -2859,17 +3538,40 @@ fn paint_day_cell(
             let bx = rect.x + rect.w - 12.0 - 6.5;
             let by = rect.y + 8.0 - 6.5;
             p.fill_round(bx, by, 13.0, 13.0, 3.0, col);
-            p.text(tag, bx, by, 13.0, 13.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, false, WHITE);
+            p.text(tag, bx, by, 13.0, 13.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, WHITE);
         }
     }
 
     if has_agenda {
-        p.fill_circle(rect.x + 7.0, rect.y + 7.0, 2.0, BLUE());
+        p.fill_circle(rect.x + 7.0, rect.y + 7.0, 2.0, agenda_col.unwrap_or_else(BLUE));
     }
     // 待办角标：橙点（与日程蓝点并排）
     if has_todo {
         let x = if has_agenda { rect.x + 14.0 } else { rect.x + 7.0 };
         p.fill_circle(x, rect.y + 7.0, 2.0, TODO_ORANGE());
+    }
+    // 数量角标：日程+待办超过 2 条时在点右侧显示总数
+    if n_items > 2 {
+        let dx = if has_agenda && has_todo {
+            rect.x + 19.0
+        } else if has_agenda || has_todo {
+            rect.x + 12.0
+        } else {
+            rect.x + 7.0
+        };
+        p.text(
+            &format!("{}", n_items),
+            dx,
+            rect.y + 1.0,
+            18.0,
+            12.0,
+            gdi::HALIGN_NEAR,
+            gdi::HALIGN_CENTER,
+            9.0,
+            true,
+            false,
+            DATE_COL(),
+        );
     }
 }
 
@@ -3147,14 +3849,102 @@ impl Ui {
                 }
                 self.redraw();
             },
-            Action::Title | Action::BottomToday => {
+            Action::Title => {
+                // 点击月份标题：弹出/收起年月快速跳转面板（回今天走底部“今天”/Home/面板内按钮）
+                self.month_pick = match self.month_pick {
+                    Some(_) => None,
+                    None => Some(MonthPick { year: self.view_y }),
+                };
+                clear_preview(self);
+                self.hover = None;
+                self.redraw();
+            }
+            Action::BottomToday => {
                 let t = Local::now().date_naive();
                 self.view_y = t.year();
                 self.view_m = t.month();
                 self.selected = t;
                 self.page = Page::Calendar;
+                self.month_pick = None;
                 clear_preview(self);
                 self.redraw();
+            }
+            Action::MonthPickYear(delta) => {
+                if let Some(mp) = self.month_pick.as_mut() {
+                    mp.year = (mp.year + *delta).clamp(1900, 2999);
+                }
+                self.hover = None;
+                self.redraw();
+            }
+            Action::MonthPickGo(m) => {
+                let m = *m;
+                if let Some(mp) = self.month_pick.take() {
+                    self.view_y = mp.year;
+                    self.view_m = m;
+                    // 选中日不在目标月时落到该月 1 号；侧栏跟随刷新
+                    if self.selected.year() != mp.year || self.selected.month() != m {
+                        let first = NaiveDate::from_ymd_opt(mp.year, m, 1).unwrap_or_else(|| Local::now().date_naive());
+                        self.selected = first;
+                        if crate::sidebar::sidebar_visible() {
+                            crate::sidebar::sidebar_show(first);
+                        }
+                    }
+                    clear_preview(self);
+                    self.hover = None;
+                    self.redraw();
+                }
+            }
+            Action::MonthPickToday => {
+                let t = Local::now().date_naive();
+                self.view_y = t.year();
+                self.view_m = t.month();
+                self.selected = t;
+                self.month_pick = None;
+                if crate::sidebar::sidebar_visible() {
+                    crate::sidebar::sidebar_show(t);
+                }
+                clear_preview(self);
+                self.hover = None;
+                self.redraw();
+            }
+            Action::RowCopyTo(kind, idx, when) => {
+                self.row_menu = None;
+                match when {
+                    Some(d) => self.do_copy(*kind, *idx, *d),
+                    None => {
+                        // 进入点选目标日期模式：切到日历页，点击日期完成复制
+                        self.copy_src = Some((*kind, *idx));
+                        self.page = Page::Calendar;
+                        self.hover = None;
+                        self.redraw();
+                    }
+                }
+            }
+            Action::RowMulti => {
+                self.row_menu = None;
+                self.multi = Some((vec![false; self.agenda_resolved.len()], vec![false; self.agenda_todos.len()]));
+                self.hover = None;
+                self.redraw();
+            }
+            Action::MultiAll => {
+                if let Some((sa, st)) = self.multi.as_mut() {
+                    let any_off = sa.iter().any(|x| !*x) || st.iter().any(|x| !*x);
+                    for x in sa.iter_mut() {
+                        *x = any_off;
+                    }
+                    for x in st.iter_mut() {
+                        *x = any_off;
+                    }
+                }
+                self.redraw();
+            }
+            Action::MultiCancel => {
+                self.multi = None;
+                self.hover = None;
+                self.redraw();
+            }
+            Action::MultiPostpone | Action::MultiDelete => {
+                // 批量操作在 WM_LBUTTONDOWN 锁外路径执行（todo 写盘会触发重绘重入）
             }
             Action::BottomAgenda => {
                 self.page = Page::Agenda;
@@ -3163,6 +3953,15 @@ impl Ui {
                 self.redraw();
             }
             Action::Cell(d) => {
+                if let Some((kind, idx)) = self.copy_src.take() {
+                    // 复制模式：点击日期=复制到该日，回到日程页提示
+                    let d = *d;
+                    self.page = Page::Agenda;
+                    self.do_copy(kind, idx, d);
+                    self.set_hint(&format!("已复制到 {}月{}日", d.month(), d.day()), false);
+                    self.redraw();
+                    return;
+                }
                 self.selected = *d;
                 clear_preview(self);
                 // 点击日期：打开/切换日期侧边栏；再次点击同一日期收起
@@ -3285,6 +4084,8 @@ impl Ui {
                     recur_until: None,
                     skip_dates: Vec::new(),
                     done_dates: Vec::new(),
+                    note: None,
+                    color: None,
                 };
                 crate::sidebar::add_todo_quiet(td);
                 crate::sidebar::sidebar_repaint();
@@ -3311,6 +4112,8 @@ impl Ui {
                             recur: None,
                             recur_until: None,
                             skip_dates: Vec::new(),
+                            note: None,
+                            color: None,
                         })),
                         _ => None,
                     }
@@ -3326,6 +4129,8 @@ impl Ui {
                     recur: None,
                     recur_until: None,
                     skip_dates: Vec::new(),
+                    note: None,
+                    color: None,
                 })),
             };
             if let Some(entry) = entry {
@@ -3360,6 +4165,8 @@ impl Ui {
                 recur_until: None,
                 skip_dates: Vec::new(),
                 done_dates: Vec::new(),
+                note: None,
+                color: None,
             };
             crate::sidebar::add_todo_quiet(td);
             crate::sidebar::sidebar_repaint();
@@ -3485,7 +4292,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if sec != ui.last_second {
                             ui.last_second = sec;
                             if ui.page == Page::Calendar {
-                                ui.redraw();
+                                ui.redraw_clock();
+                            }
+                        }
+                        // tooltip 悬停计时到点 → 浮出完整内容
+                        if let Some((_, since, text, sx, sy)) = ui.tip_hover.clone() {
+                            if !crate::tooltip::visible() && since.elapsed() >= std::time::Duration::from_millis(500) {
+                                crate::tooltip::show(&text, sx, sy);
                             }
                         }
                         if ui.page == Page::Agenda && ui.tick % 2 == 0 {
@@ -3560,6 +4373,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
                 crate::ctxmenu::ctxmenu_date::date_menu_toggle(r.left + x_of(lp), r.top + y_of(lp), d);
+            } else {
+                // 日程页行右键：行菜单（复制/多选）
+                {
+                    let mut guard = UI.lock().unwrap();
+                    if let Some(sui) = guard.as_mut() {
+                        let ui = &mut sui.0;
+                        if ui.shown && ui.page == Page::Agenda {
+                            let lx = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
+                            let ly = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
+                            match hit {
+                                Some(Action::AgendaEdit(i)) => {
+                                    ui.row_menu = Some((0, i, lx, ly));
+                                    ui.hover = None;
+                                    ui.redraw();
+                                }
+                                Some(Action::TodoEdit(i)) => {
+                                    ui.row_menu = Some((1, i, lx, ly));
+                                    ui.hover = None;
+                                    ui.redraw();
+                                }
+                                _ => {
+                                    if ui.row_menu.take().is_some() {
+                                        ui.redraw();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             0
         }
@@ -3572,8 +4414,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
                     let y = (((lp as usize) >> 16) as u16 as i16) as f32 / ui.sf;
                     hit = ui.action_at(x, y);
-                    // 任意点击先收起悬停预览
+                    // 任意点击先收起悬停预览与 tooltip
                     ui.preview = None;
+                    ui.tip_hover = None;
+                    crate::tooltip::hide();
                     ui.hover_cell = None;
                     ui.hover_since = None;
                     // 快捷输入框点击：把光标放到点击位置附近
@@ -3593,6 +4437,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         }
                         hit = None;
                     }
+                    // 年月跳转面板展开中：点面板内动作照常分发（标题=切换收起），点面板外只收起
+                    if ui.month_pick.is_some()
+                        && !matches!(hit, Some(Action::MonthPickYear(_)) | Some(Action::MonthPickGo(_)) | Some(Action::MonthPickToday) | Some(Action::Title))
+                    {
+                        ui.month_pick = None;
+                        ui.hover = None;
+                        ui.redraw();
+                        hit = None;
+                    }
+                    // 行右键菜单展开中：点菜单项照常分发，点其他位置只收起
+                    if ui.row_menu.is_some() && !matches!(hit, Some(Action::RowCopyTo(..)) | Some(Action::RowMulti)) {
+                        ui.row_menu = None;
+                        ui.hover = None;
+                        ui.redraw();
+                        hit = None;
+                    }
                 }
             }
             if let Some(a) = hit {
@@ -3602,6 +4462,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let mut edit_agenda: Option<(String, usize, crate::events::AgendaEntry, NaiveDate)> = None;
                 let mut edit_todo: Option<(usize, crate::sidebar::Todo, NaiveDate)> = None;
                 let mut toggle_todo: Option<(usize, String)> = None;
+                let mut multi_res: Option<MultiResult> = None;
                 {
                     let mut guard = UI.lock().unwrap();
                     if let Some(sui) = guard.as_mut() {
@@ -3619,11 +4480,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             ui.hover = None;
                             open_input = Some(ui.selected);
                             ui.redraw();
+                        } else if matches!(a, Action::MultiPostpone | Action::MultiDelete) {
+                            // 批量操作：锁内收集结果，待办写盘/撤销通知在锁外执行
+                            let res = ui.multi_apply(a == Action::MultiDelete);
+                            ui.multi = None;
+                            ui.hover = None;
+                            ui.redraw();
+                            multi_res = Some(res);
                         } else if let Action::TodoToggle(i) = a {
                             // 勾选切换在锁外执行（toggle_todo_on 内部 flyout_repaint 会重入本锁）
                             if let Some((gi, _, d)) = ui.todo_row(i) {
                                 toggle_todo = Some((gi, crate::ics::key_of_date(d)));
                             }
+                        } else if ui.multi.is_some() && matches!(a, Action::AgendaEdit(_) | Action::TodoEdit(_)) {
+                            // 多选模式：行点击=切换选中（不再打开编辑）
+                            match a {
+                                Action::AgendaEdit(i) => {
+                                    if let Some(v) = ui.multi.as_mut().and_then(|(m, _)| m.get_mut(i)) {
+                                        *v = !*v;
+                                    }
+                                }
+                                Action::TodoEdit(i) => {
+                                    if let Some(v) = ui.multi.as_mut().and_then(|(_, m)| m.get_mut(i)) {
+                                        *v = !*v;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            ui.redraw();
                         } else if let Action::AgendaEdit(i) = a {
                             // 日程条目点击 → 编辑弹窗（锁外打开；行数据与出现日取自本次绘制的解析缓存）
                             let target = ui.resolved_row(i);
@@ -3647,6 +4531,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 }
                 if let Some((gi, key)) = toggle_todo {
                     crate::sidebar::toggle_todo_on(gi, &key);
+                    crate::sidebar::sidebar_repaint();
+                }
+                if let Some(res) = multi_res {
+                    for (gi, _) in &res.todo_deletes {
+                        crate::sidebar::remove_todo_at_quiet(*gi);
+                    }
+                    for (gi, td) in &res.todo_updates {
+                        crate::sidebar::update_todo_at(*gi, td.clone());
+                    }
+                    if let Some(u) = res.undo {
+                        crate::toast::notify_undo(u, &res.hint);
+                    } else if !res.hint.is_empty() {
+                        let mut guard = UI.lock().unwrap();
+                        if let Some(sui) = guard.as_mut() {
+                            sui.0.set_hint(&res.hint, false);
+                            sui.0.redraw();
+                        }
+                    }
                     crate::sidebar::sidebar_repaint();
                 }
                 if exit {
@@ -3686,6 +4588,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 recur: None,
                                 recur_until: None,
                                 skip_dates: Vec::new(),
+                                note: None,
+                                color: None,
                             };
                             crate::inputbox::open_agenda_edit(r.left, r.top, &key, idx, &ev, Some(view_date));
                         }
@@ -3714,8 +4618,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if a != ui.hover {
                             ui.hover = a;
                             ui.redraw();
-                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaEdit(_)) | Some(Action::TodoDel(_)) | Some(Action::TodoEdit(_)) | Some(Action::TodoToggle(_)) | Some(Action::AgendaAdd) | Some(Action::KindDropdown) | Some(Action::KindPick(_)) | Some(Action::OpenSettings) | Some(Action::Back));
+                            let clickable = matches!(a, Some(Action::Cell(_)) | Some(Action::Prev) | Some(Action::Next) | Some(Action::Title) | Some(Action::BottomAgenda) | Some(Action::BottomToday) | Some(Action::BottomPlus) | Some(Action::BottomSettings) | Some(Action::BottomExit) | Some(Action::AgendaDel(_)) | Some(Action::AgendaEdit(_)) | Some(Action::TodoDel(_)) | Some(Action::TodoEdit(_)) | Some(Action::TodoToggle(_)) | Some(Action::AgendaAdd) | Some(Action::KindDropdown) | Some(Action::KindPick(_)) | Some(Action::OpenSettings) | Some(Action::Back) | Some(Action::MonthPickYear(_)) | Some(Action::MonthPickGo(_)) | Some(Action::MonthPickToday) | Some(Action::RowCopyTo(..)) | Some(Action::RowMulti) | Some(Action::MultiAll) | Some(Action::MultiPostpone) | Some(Action::MultiDelete) | Some(Action::MultiCancel));
                             SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
+                        }
+                        // 截断文本 tooltip：日程/待办行悬停后浮出完整内容（计时在 WM_TIMER）
+                        let tip_hit = match a {
+                            Some(Action::AgendaEdit(i)) => Some((1u64 << 32 | i as u64, i, 0u8)),
+                            Some(Action::TodoEdit(i)) => Some((2u64 << 32 | i as u64, i, 1u8)),
+                            _ => None,
+                        };
+                        match tip_hit {
+                            Some((k, i, kind)) => {
+                                let same = matches!(&ui.tip_hover, Some((k0, ..)) if *k0 == k);
+                                if !same {
+                                    let mut text = String::new();
+                                    if kind == 0 {
+                                        if let Some((_, _, entry, _)) = ui.resolved_row(i) {
+                                            text = match crate::events::note_of_entry(&entry) {
+                                                Some(n) if !n.is_empty() => format!("{}\n{}", crate::events::display(&entry), n),
+                                                _ => crate::events::display(&entry),
+                                            };
+                                        }
+                                    } else if let Some((_, td, _)) = ui.todo_row(i) {
+                                        text = match &td.note {
+                                            Some(n) if !n.is_empty() => format!("{}\n{}", td.text, n),
+                                            _ => td.text.clone(),
+                                        };
+                                    }
+                                    // 可用文本宽 = 行宽 - 标签/勾选圈 - 删除按钮（与 draw_item_row 布局一致）
+                                    let mut avail = 0.0f32;
+                                    for (r, act) in ui.regions.iter().rev() {
+                                        let hit_row = match (kind, act) {
+                                            (0, Action::AgendaEdit(j)) => *j == i,
+                                            (1, Action::TodoEdit(j)) => *j == i,
+                                            _ => false,
+                                        };
+                                        if hit_row {
+                                            avail = r.w - if kind == 0 { 92.0 } else { 114.0 };
+                                            break;
+                                        }
+                                    }
+                                    if !text.is_empty() && avail > 0.0 && crate::tooltip::est_width(&text, 13.0) > avail {
+                                        let mut wr: RECT = std::mem::zeroed();
+                                        unsafe {
+                                            GetWindowRect(hwnd as HWND, &mut wr);
+                                        }
+                                        let sx = wr.left + (x * ui.sf) as i32;
+                                        let sy = wr.top + (y * ui.sf) as i32;
+                                        ui.tip_hover = Some((k, std::time::Instant::now(), text, sx, sy));
+                                    } else {
+                                        ui.tip_hover = None;
+                                        crate::tooltip::hide();
+                                    }
+                                }
+                            }
+                            None => {
+                                if ui.tip_hover.take().is_some() {
+                                    crate::tooltip::hide();
+                                }
+                            }
                         }
                         fc_open = a == Some(Action::Weather);
                         // 悬停预览：日历页停在同一日期格 400ms 后显示当天日程
@@ -3773,6 +4734,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         ui.hover_since = None;
                         repaint = ui.shown;
                     }
+                    if ui.tip_hover.take().is_some() {
+                        crate::tooltip::hide();
+                    }
                 }
             }
             if repaint {
@@ -3790,7 +4754,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     let ctrl = (GetKeyState(0x11) as u16) & 0x8000 != 0;
                     match wp as i32 {
                         0x1B => {
-                            if ui.page != Page::Calendar {
+                            if ui.copy_src.take().is_some() || ui.multi.take().is_some() || ui.row_menu.take().is_some() {
+                                ui.redraw();
+                            } else if ui.month_pick.take().is_some() {
+                                ui.redraw();
+                            } else if ui.page != Page::Calendar {
                                 ui.page = Page::Calendar;
                                 ui.redraw();
                             } else {

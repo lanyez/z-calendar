@@ -59,6 +59,10 @@ pub enum UndoData {
     Todos {
         items: Vec<(usize, crate::sidebar::Todo)>,
     },
+    /// 批量组合（多条日程/待办快照一次撤销）
+    Multi {
+        items: Vec<UndoData>,
+    },
 }
 
 /// 提醒投递消息（quiet=true 不播提示音，如撤销卡片）
@@ -206,6 +210,11 @@ fn undo_restore(data: &UndoData) {
         }
         UndoData::Todos { items } => {
             crate::sidebar::restore_todos(items);
+        }
+        UndoData::Multi { items } => {
+            for it in items {
+                undo_restore(it);
+            }
         }
     }
     crate::sidebar::sidebar_repaint();
@@ -454,7 +463,7 @@ fn paint_item(p: &Painter, y: f32, it: &Item, hover_btn: Option<u8>) {
     p.fill_round(0.0, y, TOAST_W, ITEM_H, 10.0, BG());
     p.stroke_round(0.5, y + 0.5, TOAST_W - 1.0, ITEM_H - 1.0, 10.0, 1.0, BORDER());
     // 铃铛图标
-    p.fill_circle(28.0, y + ITEM_H / 2.0, 14.0, gdi::argb(60, 62, 135, 250));
+    p.fill_circle(28.0, y + ITEM_H / 2.0, 14.0, gdi::argb_a(60, crate::theme::pal().blue));
     p.text("\u{E7E7}", 14.0, y + ITEM_H / 2.0 - 14.0, 28.0, 28.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, false, true, BLUE());
     // 标题 + 正文（最多两行，逐行绘制；第二行放不下以省略号收尾）
     p.text(&it.title, 52.0, y + 8.0, TOAST_W - 66.0, 16.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.5, true, false, ON_BG());
@@ -525,10 +534,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     for (i, it) in f.items.iter().enumerate() {
                         let iy = (ITEM_H + GAP) * i as f32;
                         if y >= iy && y < iy + ITEM_H {
-                            let (sx, sy, sw, sh) = snooze_rect(iy);
-                            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
-                                hover_btn = Some((i, 1));
-                            } else if it.has_undo() {
+                            // 命中顺序与 paint_item 一致：撤销卡只有撤销钮，
+                            // 完成卡有完成+稍后，普通卡只有稍后（撤销与稍后矩形重叠，
+                            // 先查稍后会把"撤销"点成"稍后10分钟"）
+                            if it.has_undo() {
                                 let (ux, uy, uw, uh) = undo_rect(iy);
                                 if x >= ux && x < ux + uw && y >= uy && y < uy + uh {
                                     hover_btn = Some((i, 3));
@@ -537,6 +546,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 let (dx, dy, dw, dh) = done_rect(iy);
                                 if x >= dx && x < dx + dw && y >= dy && y < dy + dh {
                                     hover_btn = Some((i, 2));
+                                } else {
+                                    let (sx, sy, sw, sh) = snooze_rect(iy);
+                                    if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                                        hover_btn = Some((i, 1));
+                                    }
+                                }
+                            } else {
+                                let (sx, sy, sw, sh) = snooze_rect(iy);
+                                if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                                    hover_btn = Some((i, 1));
                                 }
                             }
                             break;
@@ -585,21 +604,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     for (i, it) in f.items.iter().enumerate() {
                         let iy = (ITEM_H + GAP) * i as f32;
                         if y >= iy && y < iy + ITEM_H {
-                            let (sx, sy, sw, sh) = snooze_rect(iy);
-                            if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
-                                hit = Some((i, 1));
-                            } else if it.has_undo() {
+                            // 与 paint_item 的按钮布局一致（见上：撤销/稍后矩形重叠）
+                            if it.has_undo() {
                                 let (ux, uy, uw, uh) = undo_rect(iy);
                                 if x >= ux && x < ux + uw && y >= uy && y < uy + uh {
                                     hit = Some((i, 3));
+                                } else {
+                                    hit = Some((i, 0));
                                 }
                             } else if it.has_done() {
                                 let (dx, dy, dw, dh) = done_rect(iy);
+                                let (sx, sy, sw, sh) = snooze_rect(iy);
                                 if x >= dx && x < dx + dw && y >= dy && y < dy + dh {
                                     hit = Some((i, 2));
+                                } else if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                                    hit = Some((i, 1));
+                                } else {
+                                    hit = Some((i, 0));
                                 }
                             } else {
-                                hit = Some((i, 0));
+                                let (sx, sy, sw, sh) = snooze_rect(iy);
+                                if x >= sx && x < sx + sw && y >= sy && y < sy + sh {
+                                    hit = Some((i, 1));
+                                } else {
+                                    hit = Some((i, 0));
+                                }
                             }
                             break;
                         }

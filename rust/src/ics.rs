@@ -166,7 +166,7 @@ fn add_event(
 }
 
 pub fn fetch_map(url: &str) -> Option<HolidayMap> {
-    fetch_map_once(url).or_else(|| {
+    let r = fetch_map_once(url).or_else(|| {
         // 主源失败且 URL 是默认 jsdelivr 域名时，换官方镜像域名重试（自定义 URL 不动）
         let (host, path) = split_host_path(url)?;
         if host != "cdn.jsdelivr.net" {
@@ -175,7 +175,11 @@ pub fn fetch_map(url: &str) -> Option<HolidayMap> {
         ["fastly.jsdelivr.net", "gcore.jsdelivr.net"]
             .iter()
             .find_map(|m| fetch_map_once(&format!("https://{}{}", m, path)))
-    })
+    });
+    if r.is_none() {
+        crate::log::warn("节假日数据拉取失败（主源+镜像均失败）");
+    }
+    r
 }
 
 fn split_host_path(url: &str) -> Option<(&str, &str)> {

@@ -88,6 +88,9 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
             let sys_ok = crate::config::use_system_toast_on()
                 && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
             if !sys_ok {
+                if crate::config::use_system_toast_on() {
+                    crate::log::warn("系统通知中心发送失败，已回退内置提醒卡片");
+                }
                 let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone(), quiet: false });
             }
             changed = true;
@@ -310,6 +313,9 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         let sys_ok = crate::config::use_system_toast_on()
             && crate::wnotify::show_reminder(&c.title, &c.body, &c.act, crate::config::remind_sound_on());
         if !sys_ok {
+            if crate::config::use_system_toast_on() {
+                crate::log::warn("系统通知中心发送失败（稍后提醒），已回退内置提醒卡片");
+            }
             let _ = tx.send(crate::toast::ToastMsg { title: c.title.clone(), body: c.body.clone(), act: c.act.clone(), quiet: false });
         }
     }

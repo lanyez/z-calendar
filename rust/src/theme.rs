@@ -99,7 +99,10 @@ pub struct Pal {
     pub toast_bg: u32,
 }
 
-use crate::gdi::argb;
+use crate::gdi::{argb, argb_a};
+
+/// 全局强调色（0xRRGGBB）：深浅主题共用一个蓝，改这里即全应用生效
+pub const ACCENT: u32 = 0x3E87FA;
 
 pub static DARK: Pal = Pal {
     bg: argb(255, 0x20, 0x28, 0x38),
@@ -119,7 +122,7 @@ pub static DARK: Pal = Pal {
     week_num: argb(255, 0x82, 0x8C, 0x9A),
     icon: argb(255, 0x8A, 0x91, 0x9C),
     slate: argb(255, 0x8A, 0x93, 0xA0),
-    blue: argb(255, 0x3E, 0x87, 0xFA),
+    blue: argb_a(255, ACCENT),
     blue_hov: argb(255, 0x53, 0x99, 0xFB),
     plus_top: argb(255, 0x38, 0xA6, 0xFA),
     plus_bot: argb(255, 0x2E, 0x8E, 0xF0),
@@ -127,7 +130,7 @@ pub static DARK: Pal = Pal {
     red: argb(255, 0xE5, 0x4B, 0x4B),
     orange: argb(255, 0xF0, 0xA0, 0x3E),
     orange2: argb(255, 0xE8, 0x96, 0x3C),
-    sel_bg: argb(36, 62, 135, 250),
+    sel_bg: argb_a(36, ACCENT),
     on_bg: argb(255, 255, 255, 255),
     sun: argb(255, 0xFF, 0xC8, 0x50),
     cloud: argb(255, 0xE8, 0xEC, 0xF2),
@@ -153,7 +156,7 @@ pub static LIGHT: Pal = Pal {
     week_num: argb(255, 0x76, 0x80, 0x8E),
     icon: argb(255, 0x7A, 0x82, 0x8C),
     slate: argb(255, 0x6B, 0x72, 0x80),
-    blue: argb(255, 0x3E, 0x87, 0xFA),
+    blue: argb_a(255, ACCENT),
     blue_hov: argb(255, 0x2B, 0x6F, 0xE0),
     plus_top: argb(255, 0x38, 0xA6, 0xFA),
     plus_bot: argb(255, 0x2E, 0x8E, 0xF0),
@@ -162,7 +165,7 @@ pub static LIGHT: Pal = Pal {
     red: argb(255, 0xD1, 0x34, 0x38),
     orange: argb(255, 0xA6, 0x5F, 0x0E),
     orange2: argb(255, 0x9C, 0x5A, 0x0C),
-    sel_bg: argb(60, 62, 135, 250),
+    sel_bg: argb_a(60, ACCENT),
     on_bg: argb(255, 0x1B, 0x20, 0x28),
     sun: argb(255, 0xF0, 0xA6, 0x26),
     cloud: argb(255, 0x98, 0xA2, 0xAC),

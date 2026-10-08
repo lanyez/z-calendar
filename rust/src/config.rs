@@ -21,6 +21,9 @@ fn def_ics() -> String {
 fn def_motto_type() -> String {
     "d".to_string() // 名人名言
 }
+fn def_font_family() -> String {
+    "Microsoft YaHei UI".to_string()
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -49,6 +52,12 @@ pub struct Config {
     /// 界面字号系数（1.0/1.1/1.25）
     #[serde(default = "def_font_scale")]
     pub ui_font_scale: f32,
+    /// 界面字体族（GDI/GDI+ 正文统一字体）
+    #[serde(default = "def_font_family")]
+    pub ui_font_family: String,
+    /// 弹窗淡入淡出动画
+    #[serde(default = "def_true")]
+    pub fade_anim: bool,
     /// 主题：0=跟随系统 1=深色（默认） 2=浅色
     #[serde(default = "def_theme")]
     pub theme: u8,
@@ -163,6 +172,8 @@ impl Default for Config {
             sidebar_todo: true,
             sidebar_order: Vec::new(),
             ui_font_scale: 1.0,
+            ui_font_family: "Microsoft YaHei UI".to_string(),
+            fade_anim: true,
             theme: 1,
         }
     }
@@ -209,6 +220,7 @@ pub fn load_json_or_bak<T: serde::de::DeserializeOwned>(path: &PathBuf) -> (Opti
 static HOUR12: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static REMIND_SOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SYS_TOAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FADE_ANIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub fn hour12_on() -> bool {
     HOUR12.load(std::sync::atomic::Ordering::Relaxed)
@@ -229,12 +241,20 @@ pub fn use_system_toast_on() -> bool {
 pub fn set_use_system_toast(v: bool) {
     SYS_TOAST.store(v, std::sync::atomic::Ordering::Relaxed);
 }
+/// 弹窗显隐是否带淡入淡出动画
+pub fn fade_anim_on() -> bool {
+    FADE_ANIM.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_fade_anim(v: bool) {
+    FADE_ANIM.store(v, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// 启动时从配置同步原子缓存
 pub fn init_flags(cfg: &Config) {
     set_hour12(cfg.hour12);
     set_remind_sound(cfg.remind_sound);
     set_use_system_toast(cfg.use_system_toast);
+    set_fade_anim(cfg.fade_anim);
 }
 
 fn config_path() -> PathBuf {
@@ -245,8 +265,9 @@ impl Config {
     pub fn load() -> Self {
         let mut cfg = Config::default();
         if let Ok(text) = std::fs::read_to_string(config_path()) {
-            if let Ok(v) = serde_json::from_str::<Config>(&text) {
-                cfg = v;
+            match serde_json::from_str::<Config>(&text) {
+                Ok(v) => cfg = v,
+                Err(e) => crate::log::warn(&format!("config.json 解析失败，已回退默认值：{}", e)),
             }
         }
         if cfg.ics_url.is_empty() {

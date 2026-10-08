@@ -10,6 +10,7 @@ mod inputbox;
 mod gdi;
 mod history;
 mod ics;
+mod log;
 mod lunar;
 mod lunar_data;
 mod motto;
@@ -19,6 +20,7 @@ mod recur_menu;
 mod reminder;
 mod sidebar;
 mod textedit;
+mod tooltip;
 mod theme;
 mod toast;
 mod tray;
@@ -107,6 +109,11 @@ unsafe fn set_dpi_aware() {
 fn main() {
     // 必须先于一切窗口/DPI 相关调用
     unsafe { set_dpi_aware() };
+    // panic 留痕到诊断日志（zcalendar.log）
+    std::panic::set_hook(Box::new(|info| {
+        crate::log::error(&format!("panic: {}", info));
+    }));
+    crate::log::info(&format!("启动 v{}", env!("CARGO_PKG_VERSION")));
 
     // 通知中心按钮激活参数（zcal: 前缀）：已有实例时经 IPC 文件转发，否则本实例处理
     let toast_args: Vec<String> = std::env::args().skip(1).filter(|a| a.starts_with("zcal:")).collect();
@@ -134,6 +141,7 @@ fn main() {
     let config = config::Config::load();
     config::init_flags(&config);
     gdi::set_text_scale(config.ui_font_scale);
+    gdi::set_font_family(&config.ui_font_family);
     theme::set_mode(config.theme);
     let holidays = ics::load_cache();
     // 历史上的今天：删除不是当天的缓存数据
@@ -336,7 +344,10 @@ fn spawn_weather(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
                         weather::save_cache(&w);
                         *st.weather.lock().unwrap() = Some(w);
                     }
-                    None => ok = false,
+                    None => {
+                        ok = false;
+                        crate::log::warn("天气拉取失败（1 分钟后重试）");
+                    }
                 }
             } else {
                 *st.weather.lock().unwrap() = None;

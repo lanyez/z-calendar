@@ -1,6 +1,6 @@
 [package]
 name = "z-calendar"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "Z日历 - 替换 Windows 任务栏时钟点击弹出的日历（法定节假日/农历/节气）"
 

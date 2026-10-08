@@ -31,6 +31,12 @@ pub struct RichEvent {
     /// “仅此次”删除/修改产生的例外日期（与归属日期同格式，不补零）
     #[serde(default)]
     pub skip_dates: Vec<String>,
+    /// 备注（可选；悬停 tooltip 显示全文）
+    #[serde(default)]
+    pub note: Option<String>,
+    /// 自定义颜色：None=默认主题蓝 1绿 2橙 3红 4紫 5青
+    #[serde(default)]
+    pub color: Option<u8>,
 }
 
 static ID_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -43,6 +49,35 @@ pub fn gen_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("{:x}-{:x}", ts, n)
+}
+
+/// 条目自定义颜色（None=默认主题蓝；1绿 2橙 3红 4紫 5青）
+pub fn entry_color(c: Option<u8>) -> u32 {
+    let rgb = match c {
+        Some(1) => 0x3FB26F,
+        Some(2) => 0xF59E0B,
+        Some(3) => 0xE5484D,
+        Some(4) => 0x8E4EC6,
+        Some(5) => 0x0EA5E9,
+        _ => crate::theme::ACCENT,
+    };
+    crate::gdi::argb(255, (rgb >> 16) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)
+}
+
+/// 日程条目上标注的自定义色（Legacy 条目无色）
+pub fn color_of_entry(e: &AgendaEntry) -> Option<u8> {
+    match e {
+        AgendaEntry::Rich(ev) => ev.color,
+        AgendaEntry::Legacy(_) => None,
+    }
+}
+
+/// 日程条目备注
+pub fn note_of_entry(e: &AgendaEntry) -> Option<String> {
+    match e {
+        AgendaEntry::Rich(ev) => ev.note.clone(),
+        AgendaEntry::Legacy(_) => None,
+    }
 }
 
 /// 解析存储时间："2026-10-05 14:30"；"2026-10-05"（全天）按 09:00 计
@@ -807,6 +842,8 @@ mod tests {
                 recur: Some("d".into()),
                 recur_until: Some("2026-10-2".into()),
                 skip_dates: vec!["2026-10-3".into()],
+                note: None,
+                color: None,
             })],
         );
         assert_eq!(agenda_on(&map, a).len(), 1); // 锚点日
@@ -896,6 +933,8 @@ mod tests {
             recur: None,
             recur_until: None,
             skip_dates: Vec::new(),
+            note: None,
+            color: None,
         }));
         // 开始日、中段、尾段都展示；区间外不展示
         assert_eq!(agenda_on(&map, start).len(), 1);
