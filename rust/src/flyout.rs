@@ -78,7 +78,7 @@ static SHOWN_FLAG: AtomicUsize = AtomicUsize::new(0);
 pub struct SharedState {
     pub config: Arc<Mutex<Config>>,
     pub holidays: Arc<RwLock<HolidayMap>>,
-    pub weather: Arc<Mutex<Option<Weather>>>,
+    pub weather: Arc<Mutex<Vec<Weather>>>,
     pub clock: crate::overlay::SharedClock,
     pub refresh_tx: Sender<()>,
     pub weather_tx: Sender<()>,
@@ -1579,7 +1579,81 @@ fn settings_hover_unused() {}
 
 // ================= 近一周天气面板（紧贴日历左侧，顶部对齐，悬停天气热区时弹出） =================
 pub const FC_W: f32 = 576.0;
-pub const FC_H: f32 = 212.0;
+pub const FC_H: f32 = 216.0;
+
+/// 天气面板高度：预警横幅占用时增高（与 paint 内布局保持一致：
+/// 无预警 48+24+136+8，有预警 48+28+24+136+8）
+fn fc_height_for(w: &crate::weather::Weather) -> f32 {
+    if w.alarms.is_empty() {
+        216.0
+    } else {
+        244.0
+    }
+}
+
+fn rect_hit(x: f32, y: f32, r: &gdi::RectF) -> bool {
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// 待聚焦城市（添加后）已在数据中时切到其 tab 并清除挂起标记
+fn apply_pending_city(f: &mut ForecastUi) {
+    let Some(id) = f.pending_city.clone() else { return };
+    let pos = f.st.weather.lock().unwrap().iter().position(|c| c.station == id);
+    if let Some(i) = pos {
+        f.active = i;
+        f.pending_city = None;
+    }
+}
+
+/// 面板高度与选中城市的预警状态同步（切 tab / 删城市后调用）
+fn forecast_sync_height(f: &mut ForecastUi) {
+    let cities = f.st.weather.lock().unwrap().clone();
+    let want = cities.get(f.active).map(fc_height_for).unwrap_or(FC_H);
+    if (f.h - want).abs() > f32::EPSILON {
+        f.h = want;
+        unsafe {
+            gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(f.hwnd as HWND, &mut r);
+            SetWindowPos(
+                f.hwnd as HWND,
+                std::ptr::null_mut(),
+                r.left,
+                r.top,
+                gdi::phys(FC_W) as i32,
+                gdi::phys(want) as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+}
+
+/// 删除自定义城市：配置、运行数据、缓存与选中项同步（idx 为城市下标，>=1）
+fn forecast_remove_city(f: &mut ForecastUi, idx: usize) {
+    {
+        let mut cfg = f.st.config.lock().unwrap();
+        if idx > 0 && idx - 1 < cfg.wx_cities.len() {
+            cfg.wx_cities.remove(idx - 1);
+            cfg.save();
+        }
+    }
+    {
+        let mut v = f.st.weather.lock().unwrap();
+        if idx < v.len() {
+            v.remove(idx);
+        }
+        let (l, c) = match v.split_first() {
+            Some((first, rest)) => (Some(first), rest),
+            None => (None, &[][..]),
+        };
+        crate::weather::save_cache(l, c);
+    }
+    if f.active >= idx && f.active > 0 {
+        f.active -= 1;
+    }
+    forecast_sync_height(f);
+    f.redraw();
+}
 
 static FORECAST_HWND: AtomicUsize = AtomicUsize::new(0);
 static FORECAST_UI: Mutex<Option<SendFc>> = Mutex::new(None);
@@ -1606,6 +1680,17 @@ struct ForecastUi {
     link_hover: bool,
     /// 关闭按钮悬停
     close_hover: bool,
+    /// 当前选中的城市 tab
+    active: usize,
+    /// 城市 tab / 其删除 ✕ / “+”按钮热区（paint 时更新）
+    tab_rects: Vec<gdi::RectF>,
+    del_rects: Vec<gdi::RectF>,
+    plus_rect: gdi::RectF,
+    tab_hover: Option<usize>,
+    del_hover: Option<usize>,
+    plus_hover: bool,
+    /// 添加城市后待聚焦的站号（数据到达或下次打开面板时切到其 tab）
+    pending_city: Option<String>,
     /// 最近一次手动刷新时间（用于显示“更新中…”并防止连点）
     refreshing: Option<std::time::Instant>,
 }
@@ -1670,6 +1755,14 @@ pub fn create_forecast_window(st: SharedState) {
             link_rect: gdi::RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             link_hover: false,
             close_hover: false,
+            active: 0,
+            tab_rects: Vec::new(),
+            del_rects: Vec::new(),
+            plus_rect: gdi::RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            tab_hover: None,
+            del_hover: None,
+            plus_hover: false,
+            pending_city: None,
             refreshing: None,
         });
         let (f_mem_dc, f_hbmp, f_bmp, f_scan0) = gdi::alloc_dib(fui.w, fui.h);
@@ -1697,15 +1790,29 @@ pub fn forecast_open(main_hwnd: usize) {
         let mut guard = FORECAST_UI.lock().unwrap();
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
-        let w = f.st.weather.lock().unwrap().clone();
-        let Some(w) = w else { return };
-        if w.days.is_empty() {
+        // 添加城市后若其数据已就绪，直接切到该城市 tab
+        apply_pending_city(f);
+        let cities = f.st.weather.lock().unwrap().clone();
+        if cities.is_empty() || cities.iter().all(|c| c.days.is_empty()) {
             return;
         }
+        if f.active >= cities.len() {
+            f.active = 0;
+        }
+        let w = cities[f.active].clone();
         let fh = f.hwnd as HWND;
         if IsWindowVisible(fh) != 0 {
             return;
         }
+        // 面板高度随预警有无变化：更新目标高度并按需重建绘制位图
+        let want_h = fc_height_for(&w);
+        if (f.h - want_h).abs() > f32::EPSILON {
+            f.h = want_h;
+            unsafe {
+                gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
+            }
+        }
+        let panel_h = f.h;
         // 天气面板与日期侧栏同屏：侧栏开着时锚定其左缘（向左串联），二者不再互斥
         let mut mr: RECT = std::mem::zeroed();
         GetWindowRect(main_hwnd as HWND, &mut mr);
@@ -1721,8 +1828,8 @@ pub fn forecast_open(main_hwnd: usize) {
         };
         let mut x = anchor - gdi::phys(FC_W) as i32;
         let mut y = mr.top + gdi::phys(10.0) as i32;
-        if y + gdi::phys(FC_H) as i32 > wa.bottom - gdi::phys(4.0) as i32 {
-            y = wa.bottom - gdi::phys(4.0) as i32 - gdi::phys(FC_H) as i32;
+        if y + gdi::phys(panel_h) as i32 > wa.bottom - gdi::phys(4.0) as i32 {
+            y = wa.bottom - gdi::phys(4.0) as i32 - gdi::phys(panel_h) as i32;
         }
         if y < wa.top + gdi::phys(4.0) as i32 {
             y = wa.top + gdi::phys(4.0) as i32;
@@ -1731,7 +1838,7 @@ pub fn forecast_open(main_hwnd: usize) {
         // （窗口为贴屏幕右缘摆放，右缘已伸出屏幕外，不能再用窗口右缘做退路）
         let xmax = wa.right - gdi::phys(FC_W) as i32 - gdi::phys(4.0) as i32;
         x = x.max(wa.left + gdi::phys(4.0) as i32).min(xmax);
-        SetWindowPos(fh, HWND_TOPMOST, x, y, gdi::phys(FC_W) as i32, gdi::phys(FC_H) as i32, SWP_NOACTIVATE);
+        SetWindowPos(fh, HWND_TOPMOST, x, y, gdi::phys(FC_W) as i32, gdi::phys(panel_h) as i32, SWP_NOACTIVATE);
         ShowWindow(fh, SW_SHOWNA);
         f.redraw();
     }
@@ -1761,6 +1868,8 @@ pub fn forecast_close() {
         let mut guard = FORECAST_UI.lock().unwrap();
         if let Some(f) = guard.as_mut() {
             let ui = &mut f.0;
+            // 下次打开默认回到定位城市 tab（添加城市后由 pending_city 覆盖）
+            ui.active = 0;
             unsafe {
                 gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
             }
@@ -1769,12 +1878,27 @@ pub fn forecast_close() {
     }
 }
 
+/// 添加城市成功后聚焦其 tab：数据已就绪则立即切换并重绘，
+/// 尚未拉到时挂起（下次打开或数据到达重绘时生效）
+pub fn forecast_focus_city(station: &str) {
+    let mut guard = FORECAST_UI.lock().unwrap();
+    if let Some(f) = guard.as_mut() {
+        let f = &mut f.0;
+        f.pending_city = Some(station.to_string());
+        apply_pending_city(f);
+        if forecast_visible() {
+            forecast_sync_height(f);
+            f.redraw();
+        }
+    }
+}
+
 /// 光标是否位于软件自身弹窗（天气侧栏/设置窗口）内
 fn cursor_on_own_popup() -> bool {
     unsafe {
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
-        for h in [FORECAST_HWND.load(Ordering::Relaxed), SETTINGS_HWND.load(Ordering::Relaxed), crate::sidebar::sidebar_hwnd()] {
+        for h in [FORECAST_HWND.load(Ordering::Relaxed), SETTINGS_HWND.load(Ordering::Relaxed), crate::wxcity::hwnd(), crate::sidebar::sidebar_hwnd()] {
             if h != 0 && IsWindowVisible(h as HWND) != 0 {
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(h as HWND, &mut r);
@@ -1801,6 +1925,7 @@ pub fn foreground_is_own() -> bool {
             FORECAST_HWND.load(Ordering::Relaxed),
             crate::sidebar::sidebar_hwnd(),
             crate::inputbox::hwnd(),
+            crate::wxcity::hwnd(),
         ]
         .contains(&fgu)
     }
@@ -1895,26 +2020,97 @@ impl ForecastUi {
     }
 
     fn paint(&mut self, p: &Painter) {
-        // 面板底（无边框、无阴影环，窗口即面板）
-        p.fill_round(0.0, 0.0, FC_W, FC_H, 12.0, POPUP_BG());
+        // 待聚焦城市（添加后）数据已到达则先切 tab，再按下文布局绘制
+        apply_pending_city(self);
+        // 面板底（无边框、无阴影环，窗口即面板；高度随预警有无由 fc_height_for 决定）
+        p.fill_round(0.0, 0.0, FC_W, p.h, 12.0, POPUP_BG());
 
-        let w = self.st.weather.lock().unwrap().clone();
-        let Some(w) = w else { return };
+        let cities = self.st.weather.lock().unwrap().clone();
+        if cities.is_empty() {
+            return;
+        }
+        if self.active >= cities.len() {
+            self.active = 0;
+        }
+        let w = cities[self.active].clone();
         if w.days.is_empty() {
             return;
         }
         let today = Local::now().date_naive();
 
-        // 头部：定位城市 + 更新时间 + 手动刷新链接
-        p.text("\u{E81D}", 16.0, 12.0, 18.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, true, BLUE());
-        p.text(&w.city, 36.0, 12.0, 160.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.0, true, false, TITLE_COL());
+        // 头部：城市 tab（定位 📍 + 自定义✕删除 + “+”添加）+ 更新时间 + 手动刷新链接
+        self.tab_rects.clear();
+        self.del_rects.clear();
+        let mut tx = 14.0;
+        let tab_limit = FC_W - 190.0; // 右侧为更新时间/更新/关闭区
+        for (i, c) in cities.iter().enumerate() {
+            let name_w = p.measure(&c.city, 11.5, false, false).0;
+            let has_del = i > 0;
+            let mut tw = name_w + 16.0 + if has_del { 13.0 } else { 0.0 };
+            // 超长城市名截断（4 字起截）
+            let mut label = c.city.clone();
+            if name_w > 64.0 {
+                label = c.city.chars().take(4).collect::<String>();
+                tw = p.measure(&label, 11.5, false, false).0 + 16.0 + if has_del { 13.0 } else { 0.0 };
+            }
+            if tx + tw > tab_limit - 26.0 {
+                break; // 放不下的 tab 不绘制（不入热区）
+            }
+            let rect = gdi::RectF { x: tx, y: 12.0, w: tw, h: 22.0 };
+            let active = i == self.active;
+            let hov = self.tab_hover == Some(i);
+            if active {
+                p.fill_round(rect.x, rect.y, rect.w, rect.h, 6.0, gdi::argb_a(38, crate::theme::pal().blue));
+            } else if hov {
+                p.fill_round(rect.x, rect.y, rect.w, rect.h, 6.0, HOVER_BG());
+            }
+            if i == 0 {
+                // 定位城市：pill 左侧小图标 + 名称（名称右移让出图标）
+                p.text("\u{E81D}", rect.x + 3.0, rect.y, 13.0, rect.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.0, false, true, BLUE());
+                p.text(&label, rect.x + 14.0, rect.y, rect.w - 14.0 - if has_del { 13.0 } else { 0.0 }, rect.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if active { BLUE() } else { DATE_COL() });
+            } else {
+                p.text(&label, rect.x, rect.y, rect.w - if has_del { 13.0 } else { 0.0 }, rect.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.5, false, false, if active { BLUE() } else { DATE_COL() });
+            }
+            if has_del {
+                let dr = gdi::RectF { x: rect.x + rect.w - 13.0, y: rect.y, w: 13.0, h: rect.h };
+                let dh = self.del_hover == Some(i - 1);
+                p.text("✕", dr.x - 1.0, dr.y, dr.w, dr.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 8.0, false, false, if dh { RED() } else { SUB_DIM() });
+                self.del_rects.push(dr);
+            }
+            self.tab_rects.push(rect);
+            tx += tw + 6.0;
+        }
+        // “+” 添加城市
+        if cities.len() < 5 && tx + 24.0 <= tab_limit {
+            let pr = gdi::RectF { x: tx, y: 12.0, w: 24.0, h: 22.0 };
+            if self.plus_hover {
+                p.fill_round(pr.x, pr.y, pr.w, pr.h, 6.0, HOVER_BG());
+            }
+            p.text("+", pr.x, pr.y - 1.0, pr.w, pr.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 13.0, false, false, if self.plus_hover { DATE_COL() } else { SUB() });
+            self.plus_rect = pr;
+        } else {
+            self.plus_rect = gdi::RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+        }
+        // 节气（接口当日返回名称时，缀在 tab 行后）
+        if !w.jieqi.is_empty() && self.plus_rect.w > 0.0 {
+            p.text(&format!("·{}", w.jieqi), self.plus_rect.x + self.plus_rect.w + 4.0, 12.0, 60.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB());
+        }
         let refreshing = self
             .refreshing
             .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
             .unwrap_or(false);
-        let time_str = chrono::DateTime::from_timestamp((w.ts / 1000) as i64, 0)
-            .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-            .unwrap_or_else(|| "--:--".into());
+        // 更新时间优先用接口的数据发布时间（lastUpdate），缺省回退本地拉取时间
+        let time_str = w
+            .last_update
+            .split_whitespace()
+            .nth(1)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                chrono::DateTime::from_timestamp((w.ts / 1000) as i64, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                    .unwrap_or_else(|| "--:--".into())
+            });
         let head = format!("更新时间：{}", time_str);
         let (tail, tail_col) = if refreshing {
             ("更新中…", if self.link_hover { ON_BG() } else { BLUE() })
@@ -1934,6 +2130,40 @@ impl ForecastUi {
         p.text("✕", cr.x, cr.y, cr.w, cr.h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, if self.close_hover { RED() } else { SUB_DIM() });
         p.fill_rect(16.0, 42.0, FC_W - 32.0, 1.0, DIVIDER());
 
+        // 气象预警横幅（有则显示，背景/文字按最高预警级别着色）
+        let mut y0 = 48.0;
+        if !w.alarms.is_empty() {
+            let (r, g2, b) = crate::weather::alarm_color(&w.alarms[0].signallevel);
+            let label = w
+                .alarms
+                .iter()
+                .map(|a| format!("{}{}预警", a.signaltype, a.signallevel))
+                .collect::<Vec<_>>()
+                .join("；");
+            p.fill_round(12.0, y0, FC_W - 24.0, 22.0, 6.0, gdi::argb(36, r, g2, b));
+            p.text(&format!("⚠ {}", label), 22.0, y0, FC_W - 44.0, 22.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 11.0, false, false, gdi::argb(255, r, g2, b));
+            y0 += 28.0;
+        }
+
+        // 实况明细行：体感 / 湿度 / 气压 / 风向风力
+        let mut facts: Vec<String> = Vec::new();
+        if let Some(f) = w.feelst {
+            facts.push(format!("体感 {}℃", f));
+        }
+        if let Some(h) = w.humidity {
+            facts.push(format!("湿度 {}%", h));
+        }
+        if let Some(pr) = w.pressure {
+            facts.push(format!("气压 {}hPa", pr));
+        }
+        if !w.wind_dir.is_empty() || !w.wind_scale.is_empty() {
+            facts.push(crate::weather::wind_short(&w.wind_dir, &w.wind_scale));
+        }
+        if !facts.is_empty() {
+            p.text(&facts.join(" · "), 12.0, y0, FC_W - 24.0, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.5, false, false, SUB());
+        }
+        y0 += 24.0;
+
         // 每日列（不足 7 天时居中排布）
         let n = w.days.len().min(7);
         let col_w = (FC_W - 24.0) / 7.0;
@@ -1942,7 +2172,7 @@ impl ForecastUi {
             let cx = x0 + col_w * i as f32 + col_w / 2.0;
             let weekday = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
                 [d.date.weekday().num_days_from_sunday() as usize];
-            p.text(weekday, cx - col_w / 2.0, 52.0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, true, false, if d.date == today { ON_BG() } else { DATE_COL() });
+            p.text(weekday, cx - col_w / 2.0, y0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.5, true, false, if d.date == today { ON_BG() } else { DATE_COL() });
 
             // 日期 + 相对标签（今天/明天/后天）
             let dstr = d.date.format("%m-%d").to_string();
@@ -1956,29 +2186,18 @@ impl ForecastUi {
             let tw = if tag.is_empty() { 0.0 } else { p.measure(tag, 10.0, false, false).0 };
             let gap = if tag.is_empty() { 0.0 } else { 5.0 };
             let tx = cx - (dw + gap + tw) / 2.0;
-            p.text(&dstr, tx, 72.0, dw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB());
+            p.text(&dstr, tx, y0 + 20.0, dw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, SUB());
             if !tag.is_empty() {
-                p.text(tag, tx + dw + gap, 72.0, tw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, BLUE());
+                p.text(tag, tx + dw + gap, y0 + 20.0, tw + 2.0, 14.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.0, false, false, BLUE());
             }
 
-            draw_weather(p, cx, 110.0, d.code, 1.25);
-            p.text(crate::weather::wmo_text(d.code), cx - col_w / 2.0, 138.0, col_w, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, ROW_TXT());
-            p.text(&format!("{} ~ {}°C", d.tmin, d.tmax), cx - col_w / 2.0, 158.0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, DATE_COL());
-
-            // 空气质量（短等级带“空气”前缀，与参考样式一致）
-            match d.aqi {
-                Some(a) => {
-                    let (cat, (r, g2, b)) = crate::weather::aqi_level(a);
-                    let label = if cat.chars().count() <= 1 {
-                        format!("空气{} {}", cat, a)
-                    } else {
-                        format!("{} {}", cat, a)
-                    };
-                    p.text(&label, cx - col_w / 2.0, 180.0, col_w, 14.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, gdi::argb(255, r, g2, b));
-                }
-                None => {
-                    p.text("空气 --", cx - col_w / 2.0, 180.0, col_w, 14.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, SUB_DIM());
-                }
+            draw_weather(p, cx, y0 + 58.0, d.code, 1.25);
+            p.text(&d.text, cx - col_w / 2.0, y0 + 86.0, col_w, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 11.0, false, false, ROW_TXT());
+            p.text(&format!("{} ~ {}°C", d.tmin, d.tmax), cx - col_w / 2.0, y0 + 104.0, col_w, 18.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, DATE_COL());
+            // 白天风向风力（紧凑显示）
+            let wind = crate::weather::wind_short(&d.wind_dir, &d.wind_scale);
+            if !wind.is_empty() {
+                p.text(&wind, cx - col_w / 2.0, y0 + 122.0, col_w, 14.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 9.5, false, false, SUB_DIM());
             }
         }
     }
@@ -2000,27 +2219,50 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
                 let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                 let r = f.link_rect;
-                let hit = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+                let hit = rect_hit(x, y, &r);
                 if hit != f.link_hover {
                     f.link_hover = hit;
                     f.redraw();
                 }
                 let cr = forecast_close_rect();
-                let chit = x >= cr.x && x < cr.x + cr.w && y >= cr.y && y < cr.y + cr.h;
+                let chit = rect_hit(x, y, &cr);
                 if chit != f.close_hover {
                     f.close_hover = chit;
                     f.redraw();
                 }
-                if hit || chit {
+                let th = f.tab_rects.iter().position(|t| rect_hit(x, y, t));
+                let dh = f.del_rects.iter().position(|t| rect_hit(x, y, t));
+                let ph = f.plus_rect.w > 0.0 && rect_hit(x, y, &f.plus_rect);
+                if th != f.tab_hover || dh != f.del_hover || ph != f.plus_hover {
+                    f.tab_hover = th;
+                    f.del_hover = dh;
+                    f.plus_hover = ph;
+                    if dh.is_none() {
+                        crate::tooltip::hide();
+                    }
+                    f.redraw();
+                }
+                if hit || chit || th.is_some() || dh.is_some() || ph {
                     SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
-                    // 注册离开跟踪，移出链接/按钮后恢复箭头与颜色
+                    // 注册离开/悬停跟踪：移出恢复箭头，✕ 上停留 400ms 弹“删除”提示
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE,
+                        dwFlags: TME_LEAVE | TME_HOVER,
                         hwndTrack: hwnd,
-                        dwHoverTime: 0,
+                        dwHoverTime: 400,
                     };
                     TrackMouseEvent(&mut tme);
+                }
+            }
+            0
+        }
+        WM_MOUSEHOVER => {
+            let mut guard = FORECAST_UI.lock().unwrap();
+            if let Some(f) = guard.as_mut() {
+                if f.0.del_hover.is_some() && !crate::tooltip::visible() {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    GetCursorPos(&mut pt);
+                    crate::tooltip::show("删除", pt.x, pt.y);
                 }
             }
             0
@@ -2029,12 +2271,21 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             let mut guard = FORECAST_UI.lock().unwrap();
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                if f.link_hover || f.close_hover {
-                    f.link_hover = false;
-                    f.close_hover = false;
+                let dirty = f.link_hover
+                    || f.close_hover
+                    || f.tab_hover.is_some()
+                    || f.del_hover.is_some()
+                    || f.plus_hover;
+                f.link_hover = false;
+                f.close_hover = false;
+                f.tab_hover = None;
+                f.del_hover = None;
+                f.plus_hover = false;
+                if dirty {
                     f.redraw();
                 }
             }
+            crate::tooltip::hide();
             0
         }
         WM_LBUTTONDOWN => {
@@ -2046,15 +2297,27 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
                     let y = (((lp as usize) >> 16) as u16 as i16) as f32 / f.sf;
                     let cr = forecast_close_rect();
-                    if x >= cr.x && x < cr.x + cr.w && y >= cr.y && y < cr.y + cr.h {
+                    if rect_hit(x, y, &cr) {
                         want_close = true;
+                    } else if let Some(i) = f.del_rects.iter().position(|t| rect_hit(x, y, t)) {
+                        // 删除自定义城市（del_rects[i] 对应城市下标 i+1）
+                        forecast_remove_city(f, i + 1);
+                    } else if f.plus_rect.w > 0.0 && rect_hit(x, y, &f.plus_rect) {
+                        let st = f.st.clone();
+                        crate::wxcity::open(st);
+                    } else if let Some(i) = f.tab_rects.iter().position(|t| rect_hit(x, y, t)) {
+                        if f.active != i {
+                            f.active = i;
+                            forecast_sync_height(f);
+                            f.redraw();
+                        }
                     } else {
                         let r = f.link_rect;
                         let refreshing = f
                             .refreshing
                             .map(|t| t.elapsed() < std::time::Duration::from_secs(5))
                             .unwrap_or(false);
-                        if !refreshing && x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                        if !refreshing && rect_hit(x, y, &r) {
                             // 点击“更新”：唤醒天气线程立即拉取（5 秒内防连点）
                             f.refreshing = Some(std::time::Instant::now());
                             let _ = f.st.weather_tx.send(());
@@ -2737,7 +3000,7 @@ impl Ui {
         p.text(&lunar_txt, left + date_w + 8.0, 78.0, 140.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, false, false, SUB());
 
         // 天气（右上角，悬停弹出近一周天气面板）
-        let wx = if cfg.show_weather { self.st.weather.lock().unwrap().clone() } else { None };
+        let wx = if cfg.show_weather { self.st.weather.lock().unwrap().first().cloned() } else { None };
         if let Some(w) = &wx {
             let can_hover = !w.days.is_empty();
             if can_hover && self.hovered(&Action::Weather) {
@@ -2745,6 +3008,10 @@ impl Ui {
             }
             draw_weather(p, right - 22.0, 46.0, w.code, 1.0);
             p.text(&format!("{}°C", w.temp), right - 44.0, 70.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL());
+            // 有气象预警时图标右上角叠加橙色 ⚠ 角标（悬停面板内有详情横幅）
+            if !w.alarms.is_empty() {
+                p.text("⚠", right - 26.0, 28.0, 16.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, gdi::argb(255, 0xF0, 0x8C, 0x1E));
+            }
             if can_hover {
                 Self::hit_add(regions, right - 78.0, 28.0, 76.0, 62.0, Action::Weather);
             }

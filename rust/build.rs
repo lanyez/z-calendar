@@ -29,11 +29,29 @@ fn main() {
     let out = std::env::var("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out).join("tray_rgba.bin"), tray).expect("write tray_rgba.bin");
 
-    winresource::WindowsResource::new()
-        .set_icon("icon.ico")
-        .set("FileDescription", "Z日历")
-        .compile()
-        .expect("failed to compile windows resource");
+    // 资源编译（exe 图标 + "Z日历" 版本信息）：优先现场编译（rc.exe / windres）。
+    // 二者都不可用时（如本机工具链缺失）回退链接随仓库携带的预编译资源对象：
+    // prebuilt-resource.o 由具备资源编译器的环境构建一次后从 OUT_DIR 复制而来，
+    // 内容与 icon.png + FileDescription 等价；更换 icon.png 后需在具备 windres
+    // 的环境重建一次并替换该文件。ZC_NO_RES=1 仍可显式跳过（仅类型检查用）。
+    if std::env::var("ZC_NO_RES").is_err() {
+        let compiled = winresource::WindowsResource::new()
+            .set_icon("icon.ico")
+            .set("FileDescription", "Z日历")
+            .compile();
+        if let Err(e) = compiled {
+            let pre = std::env::var("CARGO_MANIFEST_DIR")
+                .map(|d| format!("{}\\prebuilt-resource.o", d))
+                .unwrap_or_default();
+            if std::path::Path::new(&pre).exists() {
+                println!("cargo:warning=rc/windres 不可用（{}），改用预编译资源对象", e);
+                println!("cargo:rerun-if-changed=prebuilt-resource.o");
+                println!("cargo:rustc-link-arg={}", pre);
+            } else {
+                panic!("windows 资源编译失败且无预编译资源对象：{}", e);
+            }
+        }
+    }
 }
 
 /// 非正方形图片等比缩放后居中放到正方形透明画布上（contain，不裁剪不变形）

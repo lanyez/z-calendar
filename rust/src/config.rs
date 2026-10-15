@@ -25,6 +25,13 @@ fn def_font_family() -> String {
     "Microsoft YaHei UI".to_string()
 }
 
+/// 天气面板自定义城市（站号 + 展示名，最多 4 个；首格为定位城市）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WxCity {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     // 软件设置
@@ -37,6 +44,9 @@ pub struct Config {
     // 日历设置
     #[serde(default = "def_true")]
     pub show_weather: bool,
+    /// 天气面板自定义城市（定位城市之外，最多 4 个）
+    #[serde(default)]
+    pub wx_cities: Vec<WxCity>,
     #[serde(default = "def_true")]
     pub show_lunar: bool,       // 显示农历/节日信息
     #[serde(default = "def_true")]
@@ -157,6 +167,7 @@ impl Default for Config {
             auto_update: true,
             show_tray: true,
             show_weather: true,
+            wx_cities: Vec::new(),
             show_lunar: true,
             show_adjust: true,
             show_other_month: true,

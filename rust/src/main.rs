@@ -25,6 +25,7 @@ mod theme;
 mod toast;
 mod tray;
 mod wnotify;
+mod wxcity;
 mod uia_clock;
 mod weather;
 
@@ -149,9 +150,15 @@ fn main() {
     // 时间格言：删除旧版本遗留的缓存（现改为每次点击日期都重新获取）
     motto::purge_stale();
     let weather = if std::env::var("CAL_FAKE_WX").map(|v| v == "1").unwrap_or(false) {
-        Some(weather::fake())
+        vec![weather::fake()]
     } else {
-        weather::load_cache()
+        let (located, custom) = weather::load_cache();
+        let mut v = Vec::new();
+        if let Some(l) = located {
+            v.push(l);
+        }
+        v.extend(custom);
+        v
     };
 
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>();
@@ -339,18 +346,34 @@ fn spawn_weather(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
             let mut ok = true;
             let show = st.config.lock().unwrap().show_weather;
             if show {
-                match weather::fetch() {
-                    Some(w) => {
-                        weather::save_cache(&w);
-                        *st.weather.lock().unwrap() = Some(w);
-                    }
-                    None => {
-                        ok = false;
-                        crate::log::warn("天气拉取失败（1 分钟后重试）");
-                    }
+                // 自定义城市（最多 4 个）+ 定位城市一起刷新
+                let custom: Vec<(String, String)> = st
+                    .config
+                    .lock()
+                    .unwrap()
+                    .wx_cities
+                    .iter()
+                    .map(|c| (c.id.clone(), c.name.clone()))
+                    .collect();
+                let prev = st.weather.lock().unwrap().clone();
+                let (located, customs) = weather::fetch_all(&custom, &prev);
+                if located.is_none() {
+                    ok = false;
+                    crate::log::warn("天气拉取失败（1 分钟后重试）");
+                }
+                weather::save_cache(located.as_ref(), &customs);
+                let mut v = Vec::new();
+                if let Some(l) = located {
+                    v.push(l);
+                }
+                v.extend(customs);
+                *st.weather.lock().unwrap() = v;
+                // 数据到达时刷新可见的天气面板（添加城市后的待聚焦 tab 即刻生效）
+                if flyout::forecast_visible() {
+                    flyout::forecast_redraw();
                 }
             } else {
-                *st.weather.lock().unwrap() = None;
+                *st.weather.lock().unwrap() = Vec::new();
             }
             // 失败 1 分钟后重试，成功 1 小时后刷新（每小时自动更新）
             let wait = if ok { Duration::from_secs(60 * 60) } else { Duration::from_secs(60) };
