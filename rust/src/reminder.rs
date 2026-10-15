@@ -26,7 +26,10 @@ pub fn spawn(tx: Sender<crate::toast::ToastMsg>) {
         .name("reminder".into())
         .stack_size(128 * 1024)
         .spawn(move || loop {
-            scan(&tx);
+            // 空转扫描（未发任何提醒）结束后修剪：加载日程/展开重复拉回的页面用完即还
+            if !scan(&tx) {
+                crate::trim_working_set();
+            }
             std::thread::sleep(std::time::Duration::from_secs(SCAN_SECS));
         })
         .ok();
@@ -116,18 +119,20 @@ fn save_done(map: &HashMap<String, i64>) {
 }
 
 /// 消费到点的“稍后提醒”（toast 点击登记），逐条补发
-fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
+fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) -> bool {
     let (list, healed) = crate::config::load_json_or_bak::<Vec<crate::toast::SnoozeEntry>>(&std::path::PathBuf::from(
         crate::config::data_dir().join("snooze.json"),
     ));
     if healed {
         crate::toast::notify("稍后提醒已恢复", "snooze.json 损坏，已自动从备份恢复");
     }
-    let Some(list) = list else { return };
+    let Some(list) = list else { return false };
     let mut keep = Vec::new();
     let mut changed = false;
+    let mut fired = false;
     for e in list {
         if e.t <= now {
+            fired = true;
             log_remind(&e.title, &e.body);
             // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
             let sys_ok = crate::config::use_system_toast_on()
@@ -148,6 +153,7 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) {
             let _ = crate::config::write_file_atomic(&crate::config::data_dir().join("snooze.json"), &text);
         }
     }
+    fired
 }
 
 /// 待提醒条目（归一化后的日程/待办）
@@ -165,9 +171,9 @@ struct Cand {
     act: crate::toast::Act,
 }
 
-fn scan(tx: &Sender<crate::toast::ToastMsg>) {
+fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
     let now = now_ms();
-    fire_snoozes(tx, now);
+    let mut fired = fire_snoozes(tx, now);
     let mut cands: Vec<Cand> = Vec::new();
     let today = chrono::Local::now().date_naive();
 
@@ -372,6 +378,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         }
         done.insert(dk, slot);
         dirty = true;
+        fired = true;
         log_remind(&c.title, &c.body);
         // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
         let sys_ok = crate::config::use_system_toast_on()
@@ -389,6 +396,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
         if !done.contains_key(&mk) {
             done.insert(mk, now);
             dirty = true;
+            fired = true;
             let n = missed.len();
             let mut body = missed.values().take(3).map(|(_, b)| b.clone()).collect::<Vec<_>>().join("；");
             if n > 3 {
@@ -405,6 +413,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
     if dirty {
         save_done(&done);
     }
+    fired
 }
 
 /// 条目去重 id：优先条目自身 id，旧数据回退为字段哈希

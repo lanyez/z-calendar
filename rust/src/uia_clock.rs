@@ -348,9 +348,42 @@ pub fn spawn() {
                 return;
             }
             let mut st = ScanState { buttons_only: true, button_misses: 0, fails: 5 };
+            // 空闲内存防涨：UIA 跨进程扫描每轮都会把 COM/UIA 代码页拉回工作集
+            // （数 MB 级），固定 1 秒一轮会让“隐藏态低内存”目标失效。时钟矩形
+            // 稳定后按 1→2→4→8→10 秒退频；矩形变化或丢失（任务栏隐藏/资源
+            // 管理器重启）立即回到 1 秒快扫。
+            let mut interval: u64 = 1;
+            let mut stable_runs: u32 = 0;
+            let mut last: Option<[i32; 4]> = None;
             loop {
                 scan_tick(uia, &mut st);
-                std::thread::sleep(Duration::from_secs(1));
+                let cur = if UIA_VALID.load(Ordering::Relaxed) {
+                    Some([
+                        UIA_L.load(Ordering::Relaxed),
+                        UIA_T.load(Ordering::Relaxed),
+                        UIA_R.load(Ordering::Relaxed),
+                        UIA_B.load(Ordering::Relaxed),
+                    ])
+                } else {
+                    None
+                };
+                if cur.is_some() && cur == last {
+                    stable_runs += 1;
+                    if stable_runs >= 3 && interval < 10 {
+                        interval = (interval * 2).min(10);
+                        stable_runs = 0;
+                    }
+                } else if cur != last {
+                    interval = 1;
+                    stable_runs = 0;
+                }
+                last = cur;
+                // 主面板隐藏时扫描完即修剪：本轮扫描拉回的页面用完就还
+                let fh = crate::flyout::hwnd() as HWND;
+                if fh.is_null() || IsWindowVisible(fh) == 0 {
+                    crate::trim_working_set();
+                }
+                std::thread::sleep(Duration::from_secs(interval));
             }
         })
         .ok();
