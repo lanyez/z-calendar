@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
 use winapi::um::winuser::*;
 
 use crate::flyout::SharedState;
@@ -16,7 +15,6 @@ use winapi::um::libloaderapi::GetModuleHandleW;
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
@@ -147,7 +145,7 @@ pub fn toggle(x: i32, y: i32) {
 pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
     unsafe {
         let cls = crate::wide("z-calendar-ctxmenu");
-        let hinstance = unsafe { GetModuleHandleW(std::ptr::null_mut()) };
+        let hinstance = GetModuleHandleW(std::ptr::null_mut());
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinstance;

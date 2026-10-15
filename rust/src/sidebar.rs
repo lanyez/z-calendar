@@ -257,11 +257,6 @@ fn todo_sort_key(t: &Todo) -> (u8, u8, u32, u8) {
     (done, untimed, mins, prio)
 }
 
-/// 是否存在某日的未完成待办（日历格角标）
-pub fn has_todo(key: &str) -> bool {
-    todos().iter().any(|t| t.date.as_deref() == Some(key) && !t.done)
-}
-
 /// 含未完成待办的日期集合（日历格角标），范围 [a, b]；
 /// 重复待办按规则展开（尊重截止日/“仅此次”例外，当天已完成的除外）。
 pub fn todo_keys_between(a: NaiveDate, b: NaiveDate) -> std::collections::HashSet<String> {
@@ -849,7 +844,7 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
         }
         SIDEBAR_HWND.store(hwnd as usize, Ordering::Relaxed);
 
-        let mut sui = Box::new(SidebarUi {
+        let sui = Box::new(SidebarUi {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             w: SB_W,
@@ -1052,7 +1047,7 @@ impl SidebarUi {
                     if cached.is_none() {
                         crate::history::ensure_fetched(date);
                     }
-                    let mut items: Vec<(i32, String)> = match cached {
+                    let items: Vec<(i32, String)> = match cached {
                         Some(v) =>
                             // 缓存数据已按重要性排好序，直接使用
                             v.into_iter().map(|it| (it.year, it.title)).collect(),
@@ -1180,7 +1175,7 @@ impl SidebarUi {
                         // 当日待办（可滚动）
                         self.todo_band = (ry, ry + list_h);
                         let off = self.todo_scroll.min(n.saturating_sub(TODO_VISIBLE));
-                        for (vi, (gi, td)) in todos.iter().enumerate().skip(off).take(TODO_VISIBLE) {
+                        for (_vi, (gi, td)) in todos.iter().enumerate().skip(off).take(TODO_VISIBLE) {
                             let label = if td.recur.is_some() { format!("{} ↻", td.text) } else { td.text.clone() };
                             self.paint_todo_row(p, cx, cw, ry, *gi, td, &label, past, false);
                             ry += 20.0;
@@ -1808,7 +1803,6 @@ fn priority_color(p: u8) -> Option<u32> {
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;

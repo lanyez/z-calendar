@@ -334,7 +334,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) {
 
     let mut done = load_done(now);
     let mut dirty = false;
-    /// 24 小时内错过的提醒（按条目去重）：统一汇总一条卡片，每自然日至多一次
+    // 24 小时内错过的提醒（按条目去重）：统一汇总一条卡片，每自然日至多一次
     let mut missed: HashMap<String, (String, String)> = HashMap::new();
     for c in &cands {
         // 当前应处的提醒档期：最后一个 ≤ now 的时点

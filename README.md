@@ -32,8 +32,9 @@ cd rust
 build.cmd          REM 将 MinGW 加入 PATH 后执行 cargo build --release 与 cargo test
 ```
 
-- 产物：`rust/target/release/z-calendar.exe`（约 2.5MB，静态链接 CRT，可直接拷贝运行）；`cargo test` 含农历/节气/黄历单元测试与天气联网测试。
-- 图标：构建时以 `rust/icon.png` 为源自动生成多尺寸 `icon.ico` 嵌入 exe（托盘图标同源）；无 rc.exe/windres 的环境自动回退链接 `prebuilt-resource.o`（更换 icon.png 后需在有资源编译器的环境重建一次并替换该文件）。
+- 工具链：stable-x86_64-pc-windows-gnu（rustup 默认）+ [MinGW-w64](https://github.com/niXman/mingw-builds-binaries/releases)（mingw-builds **msvcrt** 版 gcc 16.2，解压到 `E:\tools\mingw64`；须用 msvcrt 运行时变体与 Rust 的 windows-gnu 目标配套，winlibs 的 UCRT 版会混用运行时）。
+- 产物：`rust/target/release/z-calendar.exe`（约 2.5MB，静态链接 CRT，可直接拷贝运行；v1.0.4 起含 WinRT 通知中心依赖 `windows` crate）；`cargo test` 含农历/节气/黄历单元测试与天气联网测试。
+- 图标：构建时以 `rust/icon.png` 为源自动生成多尺寸 `icon.ico`（16~256px）嵌入 exe（托盘图标同源）；无 rc.exe/windres 的环境自动回退链接 `prebuilt-resource.o`（更换 icon.png 后需在有资源编译器的环境重建一次并替换该文件）。
 
 ## 目录结构
 

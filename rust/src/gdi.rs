@@ -12,7 +12,6 @@ pub const SMOOTH_ANTI_ALIAS: i32 = 4;
 // 4=纯灰度抗锯齿（无网格对齐，文字发虚） 5=ClearType 子像素（最锐利）
 // 注意：从内存位图创建的 Graphics 上 GDI+ 一律回退为灰度抗锯齿（含 ClearType），
 // 锐利与否取决于进程是否 DPI 感知（未感知会被 DWM 整窗拉伸发虚）
-pub const TEXT_HINT_AA_GRID_FIT: i32 = 3;
 pub const TEXT_HINT_CLEAR_TYPE: i32 = 5;
 pub const FONT_STYLE_NORMAL: i32 = 0;
 pub const FONT_STYLE_BOLD: i32 = 1;
@@ -213,17 +212,7 @@ pub unsafe fn free_dib(mem_dc: &mut usize, hbmp: &mut usize, bmp: &mut Gp, g: &m
 
 #[link(name = "gdi32")]
 extern "system" {
-    fn CreateCompatibleDC(hdc: winapi::shared::windef::HDC) -> winapi::shared::windef::HDC;
     fn DeleteDC(hdc: winapi::shared::windef::HDC) -> i32;
-    fn CreateDIBSection(
-        hdc: winapi::shared::windef::HDC,
-        bmi: *const winapi::um::wingdi::BITMAPINFO,
-        usage: u32,
-        bits: *mut *mut winapi::ctypes::c_void,
-        section: winapi::shared::ntdef::HANDLE,
-        offset: u32,
-    ) -> winapi::shared::windef::HBITMAP;
-    fn SelectObject(hdc: winapi::shared::windef::HDC, obj: *mut winapi::ctypes::c_void) -> *mut winapi::ctypes::c_void;
     fn DeleteObject(obj: *mut winapi::ctypes::c_void) -> i32;
 }
 
@@ -391,20 +380,14 @@ struct GdiplusStartupInput {
 #[link(name = "gdiplus")]
 extern "system" {
     fn GdiplusStartup(token: *mut usize, input: *const GdiplusStartupInput, output: Gp) -> i32;
-    fn GdipCreateFromHDC(hdc: Gp, graphics: *mut Gp) -> i32;
     fn GdipDeleteGraphics(graphics: Gp) -> i32;
     fn GdipGraphicsClear(graphics: Gp, color: u32) -> i32;
-    fn GdipSetSmoothingMode(graphics: Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: Gp, mode: i32) -> i32;
     fn GdipCreateSolidFill(color: u32, brush: *mut Gp) -> i32;
-    fn GdipDeleteBrush(brush: Gp) -> i32;
     fn GdipCreatePen1(color: u32, width: f32, unit: i32, pen: *mut Gp) -> i32;
-    fn GdipDeletePen(pen: Gp) -> i32;
     fn GdipCreatePath(fill_mode: i32, path: *mut Gp) -> i32;
     fn GdipDeletePath(path: Gp) -> i32;
     fn GdipAddPathArc(path: Gp, x: f32, y: f32, w: f32, h: f32, start: f32, sweep: f32) -> i32;
     fn GdipAddPathLine(path: Gp, x1: f32, y1: f32, x2: f32, y2: f32) -> i32;
-    fn GdipCloseFigure(path: Gp) -> i32;
     fn GdipDrawPath(graphics: Gp, pen: Gp, path: Gp) -> i32;
     fn GdipFillPath(graphics: Gp, brush: Gp, path: Gp) -> i32;
     fn GdipFillRectangle(graphics: Gp, brush: Gp, x: f32, y: f32, w: f32, h: f32) -> i32;
@@ -417,7 +400,6 @@ extern "system" {
     fn GdipCreateFont(family: Gp, em_size: f32, style: i32, unit: i32, font: *mut Gp) -> i32;
     fn GdipDeleteFont(font: Gp) -> i32;
     fn GdipCreateStringFormat(attrs: i32, lang: u16, format: *mut Gp) -> i32;
-    fn GdipDeleteStringFormat(format: Gp) -> i32;
     fn GdipSetStringFormatAlign(format: Gp, align: i32) -> i32;
     fn GdipSetStringFormatFlags(format: Gp, flags: i32) -> i32;
     fn GdipSetStringFormatTrimming(format: Gp, trimming: i32) -> i32;
@@ -841,11 +823,6 @@ impl Painter {
     fn quant_px(&self, px: f32) -> f32 {
         let phys = (px * self.sf).round().max(1.0);
         phys / self.sf
-    }
-
-    /// 居中单行文本（快捷）
-    pub fn text_c(&self, s: &str, cx: f32, cy: f32, px: f32, bold: bool, mdl2: bool, color: u32) {
-        self.text(s, cx - 150.0, cy - 20.0, 300.0, 40.0, HALIGN_CENTER, HALIGN_CENTER, px, bold, mdl2, color);
     }
 
     pub fn measure(&self, s: &str, px: f32, bold: bool, mdl2: bool) -> (f32, f32) {

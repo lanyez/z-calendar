@@ -27,7 +27,6 @@ const SNOOZE_MS: i64 = 10 * 60 * 1000;
 fn BG() -> u32 { crate::theme::pal().toast_bg }
 fn BORDER() -> u32 { crate::theme::ov(40) }
 fn BLUE() -> u32 { crate::theme::pal().blue }
-const WHITE: u32 = gdi::argb(255, 255, 255, 255);
 fn SUB() -> u32 { crate::theme::ov(170) }
 fn ON_BG() -> u32 { crate::theme::pal().on_bg }
 
@@ -323,8 +322,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     let mut shown = false;
     let mut msg: MSG = std::mem::zeroed();
     loop {
-        // 收取提醒引擎投递 + 过期清理，有变化才重摆/重绘
-        let mut dirty = false;
+        // 收取提醒引擎投递 + 过期清理
         let mut pushed_loud = 0usize;
         {
             let mut guard = TOAST_UI.lock().unwrap();
@@ -340,14 +338,9 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
                         f.items.remove(0);
                         f.dropped += 1;
                     }
-                    dirty = true;
                 }
-                let n0 = f.items.len();
                 let now = now_ms();
                 f.items.retain(|it| now - it.born < SHOW_MS);
-                if f.items.len() != n0 {
-                    dirty = true;
-                }
                 if f.items.is_empty() {
                     if shown {
                         ShowWindow(hwnd as HWND, SW_HIDE);

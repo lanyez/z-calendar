@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use chrono::NaiveDate;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
 use winapi::um::winuser::*;
 
 use crate::events::AgendaMap;
@@ -14,7 +13,6 @@ use crate::gdi::{self, Cache, Painter};
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(bmp: gdi::Gp, g: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(g: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(g: gdi::Gp, mode: i32) -> i32;
@@ -145,7 +143,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
         }
         RM_HWND.store(hwnd as usize, Ordering::Relaxed);
 
-        let mut ui = Box::new(RecurMenuUi {
+        let ui = Box::new(RecurMenuUi {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             mem_dc: 0,

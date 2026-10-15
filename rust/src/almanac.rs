@@ -5,8 +5,6 @@ use chrono::{Datelike, NaiveDate};
 use crate::lunar::LunarDate;
 use crate::lunar_data::SOLAR_TERM_DAYS;
 
-pub const STEMS: [&str; 10] = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
-pub const BRANCHES: [&str; 12] = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"];
 pub const ZODIACS: [&str; 12] = ["鼠", "牛", "虎", "兔", "龙", "蛇", "马", "羊", "猴", "鸡", "狗", "猪"];
 const GANZHI_NAMES: [&str; 60] = [
     "甲子", "乙丑", "丙寅", "丁卯", "戊辰", "己巳", "庚午", "辛未", "壬申", "癸酉",
@@ -138,7 +136,8 @@ pub fn jianzhi_yiji(zhi: usize) -> (&'static [&'static str], &'static [&'static 
     (YI[zhi], JI[zhi])
 }
 
-/// 日冲煞：（冲生肖, 煞方）
+/// 日冲煞：（冲生肖, 煞方）（当前仅单元测试覆盖；侧栏另按需计算）
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn chong_sha(date: NaiveDate) -> (&'static str, &'static str) {
     let branch = day_ganzhi(date) % 12;
     let chong = ZODIACS[(branch + 6) % 12];

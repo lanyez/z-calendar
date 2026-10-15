@@ -120,7 +120,6 @@ enum DlAction {
     TextInput,
     /// 颜色选择（0=默认 1绿 2橙 3红 4紫 5青）
     ColorPick(u8),
-    Noop,
 }
 
 enum Drop {
@@ -210,7 +209,6 @@ struct DialogUi {
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
@@ -218,9 +216,9 @@ extern "system" {
 
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut core::ffi::c_void;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut core::ffi::c_void) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut core::ffi::c_void, index: i32, buf: *mut core::ffi::c_void, len: i32) -> i32;
+    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
+    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
+    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -308,7 +306,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
         IB_HWND.store(hwnd as usize, Ordering::Relaxed);
 
         let now = chrono::Local::now().naive_local();
-        let mut ui = Box::new(DialogUi {
+        let ui = Box::new(DialogUi {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             h: 386.0,
@@ -1708,7 +1706,7 @@ unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
     let mut out = None;
     if len >= 0 {
         let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut core::ffi::c_void, len);
+        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
         if got >= 0 {
             let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
             out = Some(String::from_utf16_lossy(slice));
@@ -2167,13 +2165,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     f.color = if i == 0 { None } else { Some(i) };
                     f.redraw();
                 }
-                Some(DlAction::Noop) => {
-                    // 主文本卡片：备注聚焦时点回主卡取消聚焦
-                    if f.note_focus {
-                        f.note_focus = false;
-                        f.redraw();
-                    }
-                }
                 Some(DlAction::DropRow(list)) => {
                     f.drop = Some(Drop::List { list, anchor: y });
                     f.redraw();
@@ -2254,7 +2245,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 }
                 Some(DlAction::PickInput) => {
                     // 点击“直接键入”框：光标定位到点击处附近
-                    let (px, py, pw, _ph) = f.drop_rect();
+                    let (px, py, _pw, _ph) = f.drop_rect();
                     let is_time = matches!(f.drop, Some(Drop::Time { .. }));
                     let iy = if is_time { py + 272.0 } else { py + 260.0 };
                     if y >= iy && y < iy + 32.0 {
@@ -2341,7 +2332,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     f.hover = hit;
                     f.redraw();
                 }
-                let clickable = matches!(hit, Some(a) if !matches!(a, DlAction::Noop));
+                let clickable = hit.is_some();
                 SetCursor(LoadCursorW(std::ptr::null_mut(), if clickable { IDC_HAND } else { IDC_ARROW }));
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,

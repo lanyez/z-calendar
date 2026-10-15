@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::minwindef::{LPARAM, LRESULT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::winuser::*;
@@ -254,7 +254,7 @@ unsafe fn update_overlay() {
             let r = &ci.rect;
             let vis_h = ci.mon.3.min(r.bottom) - ci.mon.1.max(r.top);
             let vis_w = ci.mon.2.min(r.right) - ci.mon.0.max(r.left);
-            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            let (_w, h) = (r.right - r.left, r.bottom - r.top);
             if vis_h >= 20.min(h) && vis_w >= 20 {
                 suspended = false;
             }

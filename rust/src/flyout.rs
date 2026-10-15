@@ -26,7 +26,6 @@ fn TXT() -> u32 { crate::theme::pal().txt }
 fn DATE_COL() -> u32 { crate::theme::pal().date }
 fn SUB() -> u32 { crate::theme::pal().sub }
 fn SUB_DIM() -> u32 { crate::theme::pal().dim }
-fn LEGAL() -> u32 { crate::theme::pal().legal }
 /// 节日/节假日名称统一使用的鲜艳蓝色
 fn FEST_BLUE() -> u32 { crate::theme::pal().fest }
 /// 日历格悬停圆圈的半透明高亮
@@ -86,7 +85,6 @@ pub struct SharedState {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Action {
-    None,
     Prev,
     Next,
     Title,
@@ -383,7 +381,7 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
         }
         SETTINGS_HWND.store(hwnd as usize, Ordering::Relaxed);
 
-        let mut sui = Box::new(SettingsUi {
+        let sui = Box::new(SettingsUi {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             w: SETTINGS_W,
@@ -433,7 +431,7 @@ fn settings_position() -> (i32, i32) {
     } else {
         unsafe {
             let mut wa: RECT = std::mem::zeroed();
-            SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut c_void_ty2, 0);
+            SystemParametersInfoW(0x0030 /*SPI_GETWORKAREA*/, 0, &mut wa as *mut RECT as *mut winapi::ctypes::c_void, 0);
             (wa.left, wa.top, wa.right, wa.bottom)
         }
     };
@@ -442,11 +440,9 @@ fn settings_position() -> (i32, i32) {
     (x, y)
 }
 
-type c_void_ty2 = winapi::ctypes::c_void;
-
 #[link(name = "user32")]
 extern "system" {
-    fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void_ty2, init: u32) -> i32;
+    fn SystemParametersInfoW(action: u32, param: u32, data: *mut winapi::ctypes::c_void, init: u32) -> i32;
 }
 
 /// 打开系统自带“日期与时间”设置
@@ -581,16 +577,14 @@ impl SettingsUi {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = unsafe {
-            Painter {
-                g,
-                cache: cache_ptr,
-                sf: self.sf,
-                w: self.w,
-                h: self.h,
-                dc: self.mem_dc,
-                scan0: self.scan0,
-            }
+        let p = Painter {
+            g,
+            cache: cache_ptr,
+            sf: self.sf,
+            w: self.w,
+            h: self.h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
         };
         let mut regions: Vec<(gdi::RectF, SAction)> = Vec::new();
         p.clear();
@@ -829,7 +823,7 @@ impl SettingsUi {
             y += 8.0;
             let btn_w = if self.refreshing { 190.0 } else { 160.0 };
             Self::hit_add(regions, cx, y, btn_w, 32.0, SAction::Refresh);
-            let hov = self.hovered(&SAction::Refresh) && !self.refreshing;
+            let _hov = self.hovered(&SAction::Refresh) && !self.refreshing;
             p.fill_round(cx, y, btn_w, 32.0, 8.0, gdi::argb_a(38, crate::theme::pal().blue));
             p.stroke_round(cx, y, btn_w, 32.0, 8.0, 1.0, gdi::argb_a(110, crate::theme::pal().blue));
             let label = if self.refreshing { "正在更新节假日数据…" } else { "立即更新节假日数据" };
@@ -1466,7 +1460,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                     if a != ui.hover {
                         ui.hover = a;
                         ui.redraw();
-                        let clickable = matches!(a, Some(SAction::Tab(_)) | Some(SAction::Toggle(_)) | Some(SAction::SbRow(_)) | Some(SAction::WeekDropdown) | Some(SAction::WeekPick(_)) | Some(SAction::MottoDropdown) | Some(SAction::MottoPick(_)) | Some(SAction::FontScaleDropdown) | Some(SAction::FontScalePick(_)) | Some(SAction::ThemeDropdown) | Some(SAction::ThemePick(_)) | Some(SAction::Toggle(_)) | Some(SAction::Refresh) | Some(SAction::Confirm) | Some(SAction::Close));
+                        let clickable = matches!(a, Some(SAction::Tab(_)) | Some(SAction::Toggle(_)) | Some(SAction::SbRow(_)) | Some(SAction::WeekDropdown) | Some(SAction::WeekPick(_)) | Some(SAction::MottoDropdown) | Some(SAction::MottoPick(_)) | Some(SAction::FontScaleDropdown) | Some(SAction::FontScalePick(_)) | Some(SAction::ThemeDropdown) | Some(SAction::ThemePick(_)) | Some(SAction::Refresh) | Some(SAction::Confirm) | Some(SAction::Close));
                         SetCursor(if clickable { LoadCursorW(std::ptr::null_mut(), IDC_HAND) } else { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) });
                     }
                     // 注册离开跟踪：移出窗口后清悬停高亮（防残留）
@@ -1574,8 +1568,6 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
-
-fn settings_hover_unused() {}
 
 // ================= 近一周天气面板（紧贴日历左侧，顶部对齐，悬停天气热区时弹出） =================
 pub const FC_W: f32 = 576.0;
@@ -1776,9 +1768,7 @@ pub fn create_forecast_window(st: SharedState) {
         // forecast_open→redraw 惰性分配）
         if !fui.dump_path.is_empty() {
             fui.redraw();
-            unsafe {
-                gdi::free_dib(&mut fui.mem_dc, &mut fui.hbmp, &mut fui.bmp, &mut fui.g, &mut fui.scan0);
-            }
+            gdi::free_dib(&mut fui.mem_dc, &mut fui.hbmp, &mut fui.bmp, &mut fui.g, &mut fui.scan0);
         }
         FORECAST_UI.lock().unwrap().replace(SendFc(fui));
     }
@@ -1808,9 +1798,7 @@ pub fn forecast_open(main_hwnd: usize) {
         let want_h = fc_height_for(&w);
         if (f.h - want_h).abs() > f32::EPSILON {
             f.h = want_h;
-            unsafe {
-                gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
-            }
+            gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
         }
         let panel_h = f.h;
         // 天气面板与日期侧栏同屏：侧栏开着时锚定其左缘（向左串联），二者不再互斥
@@ -1818,7 +1806,7 @@ pub fn forecast_open(main_hwnd: usize) {
         GetWindowRect(main_hwnd as HWND, &mut mr);
         // 工作区取日历所在屏（多屏：不再固定主屏）
         let (fcl, fct, fcr, fcb) = gdi::work_area_of_point((mr.left + mr.right) / 2, (mr.top + mr.bottom) / 2);
-        let mut wa: RECT = RECT { left: fcl, top: fct, right: fcr, bottom: fcb };
+        let wa: RECT = RECT { left: fcl, top: fct, right: fcr, bottom: fcb };
         // 主面板可见边缘在窗口内 10px 处：面板右缘贴其左缘（间隔 0），顶部与日历对齐；
         // 日期侧栏打开时锚定到侧栏左缘（向左串联）。anchor/工作区均为物理像素，
         // 偏移与面板尺寸按 sf 放大
@@ -2377,8 +2365,8 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             Ok("agenda") => Page::Agenda,
             _ => Page::Calendar,
         };
-        let settings_open = std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false);
-        let settings_tab: usize = std::env::var("CAL_TAB")
+        let _settings_open = std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false);
+        let _settings_tab: usize = std::env::var("CAL_TAB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -2466,10 +2454,6 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
     }
 }
 
-pub fn shown_flag() -> usize {
-    SHOWN_FLAG.load(Ordering::Relaxed)
-}
-
 pub fn hwnd() -> usize {
     FLYOUT_HWND.load(Ordering::Relaxed)
 }
@@ -2547,16 +2531,6 @@ fn position_for(clock: Option<&crate::overlay::ClockInfo>, sf: f32, win_w: i32, 
         y: yi,
         flush_right: (xi as f32 + ww - PANEL_INSET - wa.2).abs() < 0.5,
         flush_bottom: (yi as f32 + wh - PANEL_INSET - wa.3).abs() < 0.5,
-    }
-}
-
-fn set_shown(ui: &mut Ui, show: bool) {
-    if show {
-        ui.shown = true;
-    } else {
-        ui.shown = false;
-        SHOWN_FLAG.store(0, Ordering::Relaxed);
-        crate::trim_working_set();
     }
 }
 
@@ -2669,11 +2643,6 @@ fn perform_hide(hwnd: HWND) {
     // 设置窗口保持打开，只由其"确定/✕"按钮关闭
     SHOWN_FLAG.store(0, Ordering::Relaxed);
     crate::trim_working_set();
-}
-
-fn toggle(ui: &mut Ui) {
-    let show = !ui.shown;
-    set_shown(ui, show);
 }
 
 /// 主面板窗口命中区域：可见面板四周内缩 PANEL_INSET（物理像素）。
@@ -2792,16 +2761,14 @@ impl Ui {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = unsafe {
-            Painter {
-                g,
-                cache: cache_ptr,
-                sf: self.sf,
-                w: self.w,
-                h: self.h,
-                dc: self.mem_dc,
-                scan0: self.scan0,
-            }
+        let p = Painter {
+            g,
+            cache: cache_ptr,
+            sf: self.sf,
+            w: self.w,
+            h: self.h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
         };
         let mut regions: Vec<(gdi::RectF, Action)> = Vec::new();
         p.clear();
@@ -2863,16 +2830,14 @@ impl Ui {
             GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
             GdipSetTextRenderingHint(g, gdi::text_hint());
         }
-        let p = unsafe {
-            Painter {
-                g,
-                cache: cache_ptr,
-                sf: self.sf,
-                w: self.w,
-                h: self.h,
-                dc: self.mem_dc,
-                scan0: self.scan0,
-            }
+        let p = Painter {
+            g,
+            cache: cache_ptr,
+            sf: self.sf,
+            w: self.w,
+            h: self.h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
         };
         let cfg = self.st.config.lock().unwrap().clone();
         let now = Local::now();
@@ -3716,7 +3681,7 @@ fn circle_geo(p: &Painter, rect: &gdi::RectF, sub: &str) -> (f32, f32) {
     let num_cy = rect.y + rect.h * 0.30;
     let line1_cy = rect.y + rect.h * 0.64;
     let line2_cy = line1_cy + 14.0;
-    let (mut top, mut bottom, mut w_half): (f32, f32, f32) = (num_cy - 18.0, num_cy + 18.0, 18.0);
+    let (top, mut bottom, mut w_half): (f32, f32, f32) = (num_cy - 18.0, num_cy + 18.0, 18.0);
     let chars: Vec<char> = sub.chars().collect();
     if !chars.is_empty() {
         bottom = line1_cy + 9.0;
@@ -4385,7 +4350,6 @@ impl Ui {
                 // 窗口操作必须在 UI 锁之外执行（见 WM_LBUTTONDOWN）：
                 // ShowWindow 激活设置窗口会同步触发本面板 WM_ACTIVATE 重入加锁 → 死锁
             }
-            Action::None => {}
             // 行点击在 WM_LBUTTONDOWN 锁外打开编辑弹窗，此处不处理
             Action::AgendaEdit(_) => {}
             Action::TodoEdit(_) => {}
@@ -4553,11 +4517,9 @@ fn free_surface(ui: &mut Ui) {
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipDeleteGraphics(graphics: gdi::Gp) -> i32;
 }
 
 fn x_of(lp: LPARAM) -> i32 {
@@ -5442,7 +5404,7 @@ unsafe fn read_ime_string(hwnd: HWND, mode: i32) -> Option<String> {
     let mut out = None;
     if len >= 0 {
         let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut c_void_ty, len);
+        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
         if got >= 0 {
             let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
             out = Some(String::from_utf16_lossy(slice));
@@ -5452,13 +5414,11 @@ unsafe fn read_ime_string(hwnd: HWND, mode: i32) -> Option<String> {
     out
 }
 
-type c_void_ty = winapi::ctypes::c_void;
-
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut c_void_ty;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut c_void_ty) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut c_void_ty, index: i32, buf: *mut c_void_ty, len: i32) -> i32;
+    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
+    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
+    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
 }
 
 unsafe fn paste_clipboard(ui: &mut Ui) {

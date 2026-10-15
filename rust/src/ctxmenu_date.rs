@@ -5,7 +5,6 @@ use std::sync::Mutex;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, SelectObject};
 use winapi::um::winuser::*;
 
 use super::{CM_ROW, CM_W, POPUP_BG, ROW_TXT};
@@ -13,10 +12,7 @@ use crate::gdi::{self, Cache, Painter};
 
 #[link(name = "gdiplus")]
 extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
 }
 static DM_HWND: AtomicUsize = AtomicUsize::new(0);
 static DM_UI: Mutex<Option<SendDm>> = Mutex::new(None);
@@ -140,7 +136,7 @@ pub fn create_date_menu_window() {
         }
         DM_HWND.store(hwnd as usize, Ordering::Relaxed);
 
-        let mut ui = Box::new(DateMenuUi {
+        let ui = Box::new(DateMenuUi {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             mem_dc: 0,

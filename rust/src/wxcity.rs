@@ -78,9 +78,9 @@ fn rect_hit(x: f32, y: f32, r: &gdi::RectF) -> bool {
 // ---------------------------------------------------------------------------
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut core::ffi::c_void;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut core::ffi::c_void) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut core::ffi::c_void, index: i32, buf: *mut core::ffi::c_void, len: i32) -> i32;
+    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
+    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
+    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
 }
 
 #[link(name = "user32")]
@@ -94,7 +94,6 @@ extern "system" {
     fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
     fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
     fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipDeleteGraphics(graphics: gdi::Gp) -> i32;
 }
 
 const GCS_COMPSTR: i32 = 0x0008;
@@ -109,7 +108,7 @@ unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
     let mut out = None;
     if len >= 0 {
         let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut core::ffi::c_void, len);
+        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
         if got >= 0 {
             let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
             out = Some(String::from_utf16_lossy(slice));

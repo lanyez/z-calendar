@@ -149,10 +149,18 @@ pub fn show(text: &str, sx: i32, sy: i32) {
             None => true,
         };
         if stale {
-            *guard = None;
+            // 缩放变化重建表面：先释放旧 DIB/位图，避免每次重建泄漏 GDI 句柄
+            if let Some(old) = guard.take() {
+                let mut m = old.mem_dc;
+                let mut hb = old.hbmp;
+                let mut b = old.bmp as crate::gdi::Gp;
+                let mut gr = old.g as crate::gdi::Gp;
+                let mut s = old.scan0 as *mut u8;
+                unsafe { crate::gdi::free_dib(&mut m, &mut hb, &mut b, &mut gr, &mut s) };
+            }
             let max_h = PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0;
             let (mem_dc, hbmp, bmp, scan0) = unsafe { crate::gdi::alloc_dib(MAX_W, max_h) };
-            let g = unsafe { crate::gdi::graphics_from_image(bmp) };
+            let g = crate::gdi::graphics_from_image(bmp);
             *guard = Some(TipSurf {
                 sf,
                 mem_dc,
@@ -169,16 +177,14 @@ pub fn show(text: &str, sx: i32, sy: i32) {
         None => return,
     };
     let cache = CACHE.get_or_init(crate::gdi::Cache::new);
-    let p = unsafe {
-        crate::gdi::Painter {
-            g: tip.g as crate::gdi::Gp,
-            cache,
-            sf: tip.sf,
-            w: MAX_W,
-            h: PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0,
-            dc: tip.mem_dc,
-            scan0: tip.scan0 as *mut u8,
-        }
+    let p = crate::gdi::Painter {
+        g: tip.g as crate::gdi::Gp,
+        cache,
+        sf: tip.sf,
+        w: MAX_W,
+        h: PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0,
+        dc: tip.mem_dc,
+        scan0: tip.scan0 as *mut u8,
     };
     p.clear();
 

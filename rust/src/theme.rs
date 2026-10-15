@@ -74,7 +74,6 @@ pub struct Pal {
     pub row: u32,
     pub sub: u32,
     pub dim: u32,
-    pub legal: u32,
     pub week_head: u32,
     pub week_num: u32,
     pub icon: u32,
@@ -117,7 +116,6 @@ pub static DARK: Pal = Pal {
     sub: argb(255, 0x9A, 0xA1, 0xA9),
     // 弱化文字：原 #5C6673 对深底仅约 2.5:1，提亮到 3.6:1 以上
     dim: argb(255, 0x77, 0x82, 0x90),
-    legal: argb(255, 0xE4, 0xE7, 0xEB),
     week_head: argb(255, 0xA6, 0xAD, 0xB6),
     week_num: argb(255, 0x82, 0x8C, 0x9A),
     icon: argb(255, 0x8A, 0x91, 0x9C),
@@ -151,7 +149,6 @@ pub static LIGHT: Pal = Pal {
     sub: argb(255, 0x5B, 0x64, 0x70),
     // 弱化文字：原 #9AA3AE 对浅底仅约 2.6:1，加深到 3.6:1 以上
     dim: argb(255, 0x76, 0x80, 0x8E),
-    legal: argb(255, 0x2F, 0x35, 0x3D),
     week_head: argb(255, 0x56, 0x5E, 0x68),
     week_num: argb(255, 0x76, 0x80, 0x8E),
     icon: argb(255, 0x7A, 0x82, 0x8C),

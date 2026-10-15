@@ -1,5 +1,7 @@
 // 让 exe 成为纯 GUI 程序：双击运行不再闪现控制台窗口
 #![windows_subsystem = "windows"]
+// 配色/字色快捷助手按惯例用 SCREAMING_CASE（BG()、ROW_TXT() 等），统一豁免命名检查
+#![allow(non_snake_case)]
 
 mod almanac;
 mod config;

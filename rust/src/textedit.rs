@@ -265,7 +265,7 @@ pub unsafe fn set_clipboard(hwnd: usize, s: &str) -> bool {
     use winapi::um::winuser::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData, CF_UNICODETEXT};
     #[link(name = "kernel32")]
     extern "system" {
-        fn GlobalLock(h: usize) -> *mut winapi::ctypes::c_void;
+        fn GlobalLock(h: usize) -> *mut u16;
         fn GlobalUnlock(h: usize) -> i32;
     }
     if s.is_empty() {
@@ -279,7 +279,7 @@ pub unsafe fn set_clipboard(hwnd: usize, s: &str) -> bool {
         EmptyClipboard();
         let h = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) as usize;
         let ok = if h != 0 {
-            let p = GlobalLock(h) as *mut u16;
+            let p = GlobalLock(h);
             if !p.is_null() {
                 std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
                 GlobalUnlock(h);
