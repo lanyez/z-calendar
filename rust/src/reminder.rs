@@ -139,7 +139,7 @@ fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) -> bool {
                 && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
             if !sys_ok {
                 if crate::config::use_system_toast_on() {
-                    crate::log::warn("系统通知中心发送失败，已回退内置提醒卡片");
+                    crate::log::warn("系统通知不可用（未开启或发送失败），已回退内置提醒卡片");
                 }
                 let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone(), quiet: false });
             }
@@ -363,6 +363,12 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
             }
         };
         let Some(slot) = slot else { continue };
+        let dk = format!("{}|{}", c.dedup, slot);
+        // 已提醒过的档期直接跳过。检查必须先于下面的宽限/错过判定：
+        // 成功提醒过的档期在 2 分钟宽限过后若走到错过分支，会被误报成"错过了提醒"
+        if done.contains_key(&dk) {
+            continue;
+        }
         let age = now - slot;
         // 错过太久的档期不再补提（重启/睡眠恢复场景）；24 小时内的错过
         // 进汇总（避免逐条轰炸），过时不追
@@ -370,10 +376,6 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
             if age > GRACE_MS && age <= 24 * 3600 * 1000 && slot <= c.boundary {
                 missed.entry(c.dedup.clone()).or_insert((c.title.clone(), c.body.clone()));
             }
-            continue;
-        }
-        let dk = format!("{}|{}", c.dedup, slot);
-        if done.contains_key(&dk) {
             continue;
         }
         done.insert(dk, slot);
@@ -385,7 +387,7 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
             && crate::wnotify::show_reminder(&c.title, &c.body, &c.act, crate::config::remind_sound_on());
         if !sys_ok {
             if crate::config::use_system_toast_on() {
-                crate::log::warn("系统通知中心发送失败（稍后提醒），已回退内置提醒卡片");
+                crate::log::warn("系统通知不可用（未开启或发送失败，稍后提醒），已回退内置提醒卡片");
             }
             let _ = tx.send(crate::toast::ToastMsg { title: c.title.clone(), body: c.body.clone(), act: c.act.clone(), quiet: false });
         }

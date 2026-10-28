@@ -1,12 +1,14 @@
 //! Windows 通知中心集成：提醒走系统 Toast（Win10/11 通知中心可见、不再错过）。
 //!
 //! 组成：
+//! - 通知开关检查（注册表）：Windows 关闭通知（总开关/本应用开关）时 Toast API
+//!   Show() 仍返回成功且不显示，必须先查注册表，关了就直接回退内置提醒卡片；
 //! - 进程 AUMID + 开始菜单快捷方式（带 PKEY_AppUserModel_ID 属性）——
 //!   非打包 Win32 应用显示 Toast 的身份前提（快捷方式缺失/过期时自动重建）；
 //! - WinRT ToastNotificationManager（windows crate，静态链接）发送通知；
 //! - 通知按钮（完成/稍后）以 `zcal:` 前缀参数回启应用，经单实例 IPC 转发给
 //!   常驻实例处理（dispatch）。
-//! 任一环节失败（老系统/权限）返回 false，提醒自动回退到内置提醒卡片。
+//! 任一环节失败（通知关闭/老系统/权限）返回 false，提醒自动回退到内置提醒卡片。
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -398,9 +400,44 @@ fn snooze_args(title: &str, body: &str, act: &crate::toast::Act) -> String {
     )
 }
 
+// ---------------- 通知开关检查（注册表） ----------------
+
+/// 系统通知是否可用：读 Win10/11 的通知总开关与本应用开关。
+/// 通知被关闭时 Toast API 的 Show() 依然返回成功且什么都不显示，
+/// 无法靠返回值感知，只能先查注册表。值缺失视为开启（系统默认开）。
+fn toast_allowed() -> bool {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    let hkcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+    let dword_on = |subkey: &str, name: &str| {
+        hkcu.open_subkey_with_flags(subkey, KEY_READ)
+            .and_then(|k| k.get_value::<u32, _>(name))
+            .map(|v| v != 0)
+            .unwrap_or(true)
+    };
+    // 总开关：HKCU\...\PushNotifications\ToastEnabled
+    let master = dword_on(
+        r"Software\Microsoft\Windows\CurrentVersion\PushNotifications",
+        "ToastEnabled",
+    );
+    // 本应用开关：HKCU\...\Notifications\Settings\<AUMID>\Enabled（首次发通知后才出现）
+    let app = dword_on(
+        &format!(r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\{}", AUMID),
+        "Enabled",
+    );
+    master && app
+}
+
 /// 发送一条提醒到系统通知中心。返回 false 时调用方回退到内置提醒卡片。
 /// act 为待办完成动作时带「完成」按钮；始终带「稍后10分钟」。
 pub fn show_reminder(title: &str, body: &str, act: &crate::toast::Act, allow_sound: bool) -> bool {
+    if !toast_allowed() {
+        // 每个进程只记一次日志（重复提醒档期多，避免刷屏）
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::log::warn("Windows 通知已关闭（系统设置），提醒改用内置弹窗卡片");
+        }
+        return false;
+    }
     if !ensure_ready() {
         return false;
     }
