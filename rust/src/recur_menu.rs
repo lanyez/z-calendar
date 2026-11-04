@@ -79,9 +79,9 @@ pub fn open(x: i32, y: i32, target: RmTarget) {
     if visible() {
         close();
     }
-    *RM_TARGET.lock().unwrap() = Some(target);
+    *RM_TARGET.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target);
     unsafe {
-        let mut guard = RM_UI.lock().unwrap();
+        let mut guard = RM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
         let pt = POINT { x, y };
@@ -113,7 +113,7 @@ pub fn open(x: i32, y: i32, target: RmTarget) {
 
 pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
     unsafe {
-        *AGENDA_SHARED.lock().unwrap() = Some(agenda);
+        *AGENDA_SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agenda);
         let cls = crate::wide("z-calendar-recurmenu");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null_mut());
         let mut wc: WNDCLASSW = std::mem::zeroed();
@@ -155,7 +155,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             regions: Vec::new(),
             hover: None,
         });
-        RM_UI.lock().unwrap().replace(SendRm(ui));
+        RM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendRm(ui));
     }
 }
 
@@ -248,7 +248,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-        let mut guard = RM_UI.lock().unwrap();
+        let mut guard = RM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();
@@ -263,7 +263,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_LBUTTONDOWN => {
-        let mut guard = RM_UI.lock().unwrap();
+        let mut guard = RM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();
@@ -271,31 +271,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if let Some(act) = hit {
-                    let target = RM_TARGET.lock().unwrap().take();
+                    let target = RM_TARGET.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
                     drop(guard);
                     close();
                     if let Some(t) = target {
                         match (act, t) {
                             (RmAction::ThisDay, RmTarget::Agenda { key, idx, date }) => {
-                                let agenda = AGENDA_SHARED.lock().unwrap().clone();
+                                let agenda = AGENDA_SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                                 if let Some(a) = agenda {
-                                    let mut map = a.lock().unwrap();
-                                    crate::events::agenda_skip_day(&mut map, &key, idx, date);
-                                    crate::events::save(&map);
-                                    drop(map);
+                                    crate::events::edit_and_save(&a, |map| {
+                                        crate::events::agenda_skip_day(map, &key, idx, date);
+                                    });
                                     refresh();
                                 }
                             }
                             (RmAction::Series, RmTarget::Agenda { key, idx, .. }) => {
-                                let agenda = AGENDA_SHARED.lock().unwrap().clone();
+                                let agenda = AGENDA_SHARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                                 if let Some(a) = agenda {
-                                    let mut map = a.lock().unwrap();
-                                    let entry = map.get(&key).and_then(|v| v.get(idx)).cloned();
-                                    let removed = crate::events::agenda_remove_at(&mut map, &key, idx);
-                                    crate::events::save(&map);
-                                    drop(map);
-                                    if removed {
-                                        if let Some(entry) = entry {
+                                    let removed = crate::events::edit_and_save(&a, |map| {
+                                        let entry = map.get(&key).and_then(|v| v.get(idx)).cloned();
+                                        let removed = crate::events::agenda_remove_at(map, &key, idx);
+                                        (entry, removed)
+                                    });
+                                    if removed.1 {
+                                        if let Some(entry) = removed.0 {
                                             let body = crate::events::display(&entry);
                                             crate::toast::notify_undo(crate::toast::UndoData::Agenda { key, idx, entry }, &body);
                                         }

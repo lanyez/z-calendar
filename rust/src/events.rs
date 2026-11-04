@@ -1,8 +1,9 @@
 //! 日程/待办共享数据类型与存取
 //! agenda.json 兼容旧的纯文本条目：新条目存为对象，旧条目仍是字符串（serde untagged）
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
-use chrono::{Datelike, Duration, NaiveDate, Timelike};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
 
 /// 富日程条目（日期右键“新增日程”创建）
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -106,11 +107,11 @@ static SHARED_AGENDA: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Ag
     std::sync::Mutex::new(None);
 
 pub fn set_shared_agenda(arc: std::sync::Arc<std::sync::Mutex<AgendaMap>>) {
-    *SHARED_AGENDA.lock().unwrap() = Some(arc);
+    *SHARED_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(arc);
 }
 
 pub fn shared_agenda() -> Option<std::sync::Arc<std::sync::Mutex<AgendaMap>>> {
-    SHARED_AGENDA.lock().unwrap().clone()
+    SHARED_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 pub fn load() -> AgendaMap {
@@ -125,12 +126,39 @@ pub fn load() -> AgendaMap {
     }
 }
 
-pub fn save(map: &AgendaMap) {
+/// 落盘已序列化的快照（备份轮转 + 原子写）
+fn commit(text: &str) {
     let path = crate::config::data_dir().join("agenda.json");
-    if let Ok(text) = serde_json::to_string(map) {
-        crate::config::backup_file(&path);
-        let _ = crate::config::write_file_atomic(&path, &text);
+    crate::config::backup_file(&path);
+    let _ = crate::config::write_file_atomic(&path, text);
+}
+
+/// 锁内变更 + 序列化（纯 CPU），锁外落盘：磁盘 IO（杀软扫描重命名时可达百
+/// 毫秒）不再握着数据锁阻塞并发读者（toast 撤销线程 / 输入弹窗线程）；且变更
+/// 与序列化在同一把锁内完成，消除“改完-解锁-再锁保存”两锁间隙里其他线程
+/// 读到未落盘状态的窗口。
+pub fn edit_and_save<R>(
+    agenda: &std::sync::Arc<std::sync::Mutex<AgendaMap>>,
+    edit: impl FnOnce(&mut AgendaMap) -> R,
+) -> R {
+    let (r, text) = {
+        let mut map = agenda.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let r = edit(&mut map);
+        AGENDA_GEN.fetch_add(1, Ordering::Relaxed);
+        (r, serde_json::to_string(&*map).ok())
+    };
+    if let Some(t) = text {
+        commit(&t);
     }
+    r
+}
+
+/// 日程数据代次：每次变更 +1（edit_and_save 锁内递增）。
+/// 月历派生数据缓存（flyout::MonthCache）据此判断失效。
+static AGENDA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn agenda_gen() -> u64 {
+    AGENDA_GEN.load(Ordering::Relaxed)
 }
 
 /// 列表展示文本（旧条目原样，富条目加时间/全天前缀；按天重复的加 ↻ 标记）
@@ -260,98 +288,146 @@ pub fn recur_rules(map: &AgendaMap) -> Vec<RecurRule> {
     out
 }
 
-/// 某日实际生效的日程（原生条目 + 重复展开，尊重截止日与“仅此次”例外），
-/// 返回 (原key, 原下标, 条目)，按开始时间排序（无法解析时间的旧条目排最后）。
-pub fn agenda_on(map: &AgendaMap, date: NaiveDate) -> Vec<(String, usize, AgendaEntry)> {
-    let key = crate::ics::key_of_date(date);
-    let mut out: Vec<(String, usize, AgendaEntry)> = Vec::new();
-    if let Some(v) = map.get(&key) {
+/// 条目摘要（一次构建、逐日复用）：月历 42 格/日程页 30 天逐日筛选时，
+/// 把 start/end 的 chrono 字符串解析从“每次按日一遍”摊销为“每帧一遍”。
+pub struct EntryDigest<'a> {
+    pub key: &'a str,
+    pub idx: usize,
+    pub e: &'a AgendaEntry,
+    /// 解析后的开始时间（Legacy 或无法解析的旧条目为 None）
+    pub start: Option<NaiveDateTime>,
+    /// 解析后的结束时间
+    pub end: Option<NaiveDateTime>,
+}
+
+/// 全表摘要：单趟遍历，每条 Rich 条目只解析一次 start/end
+pub fn digests(map: &AgendaMap) -> Vec<EntryDigest<'_>> {
+    let cap = map.values().map(|v| v.len()).sum();
+    let mut out = Vec::with_capacity(cap);
+    for (k, v) in map.iter() {
         for (i, e) in v.iter().enumerate() {
-            // 重复条目的锚点日也可能被截止/“仅此次”排除
-            if let AgendaEntry::Rich(r) = e {
-                if let Some(rc) = &r.recur {
-                    if let Some(sd) = parse_start(&r.start) {
-                        if !recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd.date(), date) {
-                            continue;
-                        }
-                    }
-                }
-            }
-            out.push((key.clone(), i, e.clone()));
+            let (start, end) = if let AgendaEntry::Rich(r) = e {
+                (parse_start(&r.start), parse_start(&r.end))
+            } else {
+                (None, None)
+            };
+            out.push(EntryDigest { key: k.as_str(), idx: i, e, start, end });
         }
     }
-    for (k, v) in map.iter() {
-        if *k == key {
+    out
+}
+
+/// 与 agenda_on 相同的按日匹配（原生日 + 重复展开 + 跨天中段/尾段，条件逐条等价），
+/// 对每个命中条目调用 f；解析结果复用摘要。
+fn for_each_on<'a, 'd>(
+    digests: &'d [EntryDigest<'a>],
+    key: &str,
+    date: NaiveDate,
+    mut f: impl FnMut(&'d EntryDigest<'a>),
+) {
+    // 原生日：重复条目的锚点日也可能被截止/“仅此次”排除
+    for d in digests {
+        if d.key != key {
             continue;
         }
-        for (i, e) in v.iter().enumerate() {
-            let AgendaEntry::Rich(r) = e else { continue };
-            let Some(rc) = &r.recur else { continue };
-            let Some(sd) = parse_start(&r.start).map(|d| d.date()) else { continue };
-            if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd, date) {
-                out.push((k.clone(), i, e.clone()));
+        if let AgendaEntry::Rich(r) = d.e {
+            if let (Some(rc), Some(sd)) = (&r.recur, d.start) {
+                if !recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd.date(), date) {
+                    continue;
+                }
             }
+        }
+        f(d);
+    }
+    // 其他日锚定的重复条目在本日的出现
+    for d in digests {
+        if d.key == key {
+            continue;
+        }
+        let AgendaEntry::Rich(r) = d.e else { continue };
+        let Some(rc) = &r.recur else { continue };
+        let Some(sd) = d.start.map(|x| x.date()) else { continue };
+        if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd, date) {
+            f(d);
         }
     }
     // 跨天日程：结束日 > 开始日的条目在中段/尾段也展示（开始日由上面的原生条目负责，
     // 重复条目的每次出现按 [出现日, 出现日+跨天数] 展开）
-    for (k, v) in map.iter() {
-        if *k == key {
+    for d in digests {
+        if d.key == key {
             continue;
         }
-        for (i, e) in v.iter().enumerate() {
-            let AgendaEntry::Rich(r) = e else { continue };
-            let (Some(sd), Some(ed)) = (parse_start(&r.start), parse_start(&r.end)) else { continue };
-            let (s, en) = (sd.date(), ed.date());
-            if en <= s || !(s <= date && date <= en) {
-                continue;
-            }
-            // 存储归属日（k == date 的 key）已由上面的原生条目展示，跳过避免重复
-            if *k == key {
-                continue;
-            }
-            let span = (en - s).num_days();
-            let covered = match &r.recur {
-                None => true,
-                Some(rc) => {
-                    // date 本身是出现日 → 由上面的重复展开负责；否则看是否落在某次出现的延展区内
-                    if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, date) {
-                        continue;
-                    }
-                    let mut cand = date - Duration::days(span);
-                    let mut hit = false;
-                    while cand < date {
-                        if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, cand) {
-                            hit = true;
-                            break;
-                        }
-                        cand += Duration::days(1);
-                    }
-                    hit
+        let AgendaEntry::Rich(r) = d.e else { continue };
+        let (Some(sd), Some(ed)) = (d.start, d.end) else { continue };
+        let (s, en) = (sd.date(), ed.date());
+        if en <= s || !(s <= date && date <= en) {
+            continue;
+        }
+        let span = (en - s).num_days();
+        let covered = match &r.recur {
+            None => true,
+            Some(rc) => {
+                // date 本身是出现日 → 由上面的重复展开负责；否则看是否落在某次出现的延展区内
+                if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, date) {
+                    continue;
                 }
-            };
-            if covered {
-                out.push((k.clone(), i, e.clone()));
+                let mut cand = date - Duration::days(span);
+                let mut hit = false;
+                while cand < date {
+                    if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, cand) {
+                        hit = true;
+                        break;
+                    }
+                    cand += Duration::days(1);
+                }
+                hit
             }
+        };
+        if covered {
+            f(d);
         }
     }
-    out.sort_by(|a, b| {
-        let ta = match &a.2 {
-            AgendaEntry::Rich(r) => parse_start(&r.start).map(|d| d.time()),
-            AgendaEntry::Legacy(_) => None,
-        };
-        let tb = match &b.2 {
-            AgendaEntry::Rich(r) => parse_start(&r.start).map(|d| d.time()),
-            AgendaEntry::Legacy(_) => None,
-        };
+}
+
+/// 当日命中的条目摘要（按 agenda_on 的排序键排好：开始时间 → key → 下标）
+fn hits_sorted<'a, 'd>(digests: &'d [EntryDigest<'a>], date: NaiveDate) -> Vec<&'d EntryDigest<'a>> {
+    let key = crate::ics::key_of_date(date);
+    let mut hits: Vec<&EntryDigest> = Vec::new();
+    for_each_on(digests, &key, date, |d| hits.push(d));
+    hits.sort_by(|a, b| {
+        let ta = a.start.map(|d| d.time());
+        let tb = b.start.map(|d| d.time());
         match (ta, tb) {
-            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1)),
+            (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.key.cmp(b.key)).then_with(|| a.idx.cmp(&b.idx)),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         }
     });
-    out
+    hits
+}
+
+/// agenda_on 的摘要版：结果与 agenda_on 相同（排序键用预解析时间，比较器零解析）
+pub fn agenda_on_digested(digests: &[EntryDigest<'_>], date: NaiveDate) -> Vec<(String, usize, AgendaEntry)> {
+    hits_sorted(digests, date)
+        .into_iter()
+        .map(|d| (d.key.to_string(), d.idx, d.e.clone()))
+        .collect()
+}
+
+/// 月历格角标用：与 agenda_on 相同的命中集合，但只取（条数, 首个自定义色），
+/// 不克隆条目（42 格逐格调用）。颜色按排序后顺序查找，与 agenda_on 的 find_map 一致。
+pub fn agenda_meta_on(digests: &[EntryDigest<'_>], date: NaiveDate) -> (usize, Option<u8>) {
+    let hits = hits_sorted(digests, date);
+    let color = hits.iter().find_map(|d| color_of_entry(d.e));
+    (hits.len(), color)
+}
+
+/// 某日实际生效的日程（原生条目 + 重复展开，尊重截止日与“仅此次”例外），
+/// 返回 (原key, 原下标, 条目)，按开始时间排序（无法解析时间的旧条目排最后）。
+pub fn agenda_on(map: &AgendaMap, date: NaiveDate) -> Vec<(String, usize, AgendaEntry)> {
+    let ds = digests(map);
+    agenda_on_digested(&ds, date)
 }
 
 /// 月历格角标用：[a, b] 内被"跨天日程"覆盖的日期 key 集合。
@@ -789,6 +865,143 @@ pub fn parse_quick_time(text: &str, base: NaiveDate) -> Option<(Option<NaiveDate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// agenda_on 旧实现（逐日全表三趟扫描、比较器内解析）作为参照：
+    /// 摘要版（digests/agenda_on_digested/agenda_meta_on）必须与其逐日完全等价。
+    #[test]
+    fn agenda_on_digest_equivalence() {
+        fn reference(map: &AgendaMap, date: NaiveDate) -> Vec<(String, usize, AgendaEntry)> {
+            let key = crate::ics::key_of_date(date);
+            let mut out: Vec<(String, usize, AgendaEntry)> = Vec::new();
+            if let Some(v) = map.get(&key) {
+                for (i, e) in v.iter().enumerate() {
+                    if let AgendaEntry::Rich(r) = e {
+                        if let Some(rc) = &r.recur {
+                            if let Some(sd) = parse_start(&r.start) {
+                                if !recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd.date(), date) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    out.push((key.clone(), i, e.clone()));
+                }
+            }
+            for (k, v) in map.iter() {
+                if *k == key {
+                    continue;
+                }
+                for (i, e) in v.iter().enumerate() {
+                    let AgendaEntry::Rich(r) = e else { continue };
+                    let Some(rc) = &r.recur else { continue };
+                    let Some(sd) = parse_start(&r.start).map(|d| d.date()) else { continue };
+                    if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, sd, date) {
+                        out.push((k.clone(), i, e.clone()));
+                    }
+                }
+            }
+            for (k, v) in map.iter() {
+                if *k == key {
+                    continue;
+                }
+                for (i, e) in v.iter().enumerate() {
+                    let AgendaEntry::Rich(r) = e else { continue };
+                    let (Some(sd), Some(ed)) = (parse_start(&r.start), parse_start(&r.end)) else { continue };
+                    let (s, en) = (sd.date(), ed.date());
+                    if en <= s || !(s <= date && date <= en) {
+                        continue;
+                    }
+                    if *k == key {
+                        continue;
+                    }
+                    let span = (en - s).num_days();
+                    let covered = match &r.recur {
+                        None => true,
+                        Some(rc) => {
+                            if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, date) {
+                                continue;
+                            }
+                            let mut cand = date - Duration::days(span);
+                            let mut hit = false;
+                            while cand < date {
+                                if recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, s, cand) {
+                                    hit = true;
+                                    break;
+                                }
+                                cand += Duration::days(1);
+                            }
+                            hit
+                        }
+                    };
+                    if covered {
+                        out.push((k.clone(), i, e.clone()));
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                let ta = match &a.2 {
+                    AgendaEntry::Rich(r) => parse_start(&r.start).map(|d| d.time()),
+                    AgendaEntry::Legacy(_) => None,
+                };
+                let tb = match &b.2 {
+                    AgendaEntry::Rich(r) => parse_start(&r.start).map(|d| d.time()),
+                    AgendaEntry::Legacy(_) => None,
+                };
+                match (ta, tb) {
+                    (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            });
+            out
+        }
+
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+        let rich = |name: &str, start: &str, end: &str, recur: Option<&str>, until: Option<&str>, skip: Vec<&str>, color: Option<u8>| {
+            AgendaEntry::Rich(RichEvent {
+                id: String::new(),
+                name: name.into(),
+                all_day: false,
+                start: start.into(),
+                end: end.into(),
+                remind: None,
+                repeat: None,
+                recur: recur.map(|s| s.into()),
+                recur_until: until.map(|s| s.into()),
+                skip_dates: skip.into_iter().map(|s| s.into()).collect(),
+                note: None,
+                color,
+            })
+        };
+        let mut map: AgendaMap = HashMap::new();
+        let k = crate::ics::key_of_date;
+        // 单次定时（带色）/ 全天单次
+        map.entry(k(d(2026, 11, 4))).or_default().push(rich("评审", "2026-11-4 14:00", "2026-11-4 15:00", None, None, vec![], Some(2)));
+        map.entry(k(d(2026, 11, 5))).or_default().push(rich("全天", "2026-11-5", "2026-11-5", None, None, vec![], None));
+        // 每周重复；另一条带“仅此次”例外；每月重复带截止日
+        map.entry(k(d(2026, 10, 15))).or_default().push(rich("周会", "2026-10-15 09:00", "2026-10-15 10:00", Some("w"), None, vec![], None));
+        map.entry(k(d(2026, 10, 16))).or_default().push(rich("健身", "2026-10-16 19:00", "2026-10-16 20:00", Some("w"), None, vec![k(d(2026, 11, 6)).as_str()], None));
+        map.entry(k(d(2026, 9, 20))).or_default().push(rich("月报", "2026-9-20 10:00", "2026-9-20 11:00", Some("m"), Some("2026-11-20"), vec![], None));
+        // 跨天（非重复）；跨天 + 每周重复
+        map.entry(k(d(2026, 11, 3))).or_default().push(rich("出差", "2026-11-3 08:00", "2026-11-8 20:00", None, None, vec![], Some(3)));
+        map.entry(k(d(2026, 10, 20))).or_default().push(rich("值班", "2026-10-20 09:00", "2026-10-22 18:00", Some("w"), None, vec![], None));
+        // 旧条目与无法解析时间的旧数据
+        map.entry(k(d(2026, 11, 7))).or_default().push(AgendaEntry::Legacy("旧条目".into()));
+        map.entry(k(d(2026, 11, 9))).or_default().push(rich("坏数据", "bad", "worse", None, None, vec![], None));
+
+        let ds = digests(&map);
+        for off in -10..40i64 {
+            let date = d(2026, 11, 1) + Duration::days(off);
+            let want = reference(&map, date);
+            let ser = |v: &Vec<(String, usize, AgendaEntry)>| serde_json::to_string(v).unwrap();
+            assert_eq!(ser(&agenda_on(&map, date)), ser(&want), "agenda_on @ {date}");
+            assert_eq!(ser(&agenda_on_digested(&ds, date)), ser(&want), "digested @ {date}");
+            let (n, color) = agenda_meta_on(&ds, date);
+            assert_eq!(n, want.len(), "count @ {date}");
+            assert_eq!(color, want.iter().find_map(|(_, _, e)| color_of_entry(e)), "color @ {date}");
+        }
+    }
 
     #[test]
     fn recur_hits_yearly_and_weekly() {

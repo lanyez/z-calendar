@@ -228,6 +228,7 @@ extern "system" {
     fn CloseClipboard() -> i32;
     fn GetClipboardData(fmt: u32) -> *mut core::ffi::c_void;
     fn GlobalLock(h: usize) -> *mut u16;
+    fn GlobalSize(h: usize) -> usize;
     fn GlobalUnlock(h: usize) -> i32;
     fn SetForegroundWindow(hwnd: HWND) -> i32;
     fn KillTimer(hwnd: HWND, id: usize) -> i32;
@@ -275,7 +276,7 @@ fn dialog_h(kind: Kind, time_on: bool, recur_rows: usize) -> f32 {
 
 pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
     unsafe {
-        *IB_AGENDA.lock().unwrap() = Some(agenda);
+        *IB_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agenda);
         let cls = crate::wide("z-calendar-input");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null_mut());
         let mut wc: WNDCLASSW = std::mem::zeroed();
@@ -352,7 +353,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             edit_todo: None,
         });
         // 后台位图不在创建时分配：open_with→redraw 惰性分配，关闭即释放
-        IB_UI.lock().unwrap().replace(SendIb(ui));
+        IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendIb(ui));
     }
 }
 
@@ -470,7 +471,7 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
         }
         let h = h as HWND;
         {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 f.kind = kind;
@@ -561,7 +562,7 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
         };
         let hh;
         {
-            let guard = IB_UI.lock().unwrap();
+            let guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             hh = guard.as_ref().map(|s| s.0.h).unwrap_or(386.0);
         }
         // 屏幕正中间（鼠标所在显示器的工作区）
@@ -577,7 +578,7 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
 }
 
 fn redraw() {
-    let mut guard = IB_UI.lock().unwrap();
+    let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         f.0.redraw();
     }
@@ -1476,14 +1477,20 @@ fn layout_lines(p: &Painter, s: &str, max_w: f32) -> Vec<(String, usize)> {
             continue;
         }
         let mut cur = String::new();
+        let mut cur_w = 0.0f32;
         let mut cur_start = char_pos;
         for chx in para.chars() {
             let cw = p.measure(&chx.to_string(), 12.5, false, false).0;
-            if !cur.is_empty() && p.measure(&cur, 12.5, false, false).0 + cw > max_w {
+            // 增量累加：此前每字符整行重测（O(n²) 次 GDI+ MeasureString，长备注
+            // 每帧卡顿）。字符宽度和与整串测量有细微字形排布差异，折行点可能
+            // 偏移一两个字符，展示用途可接受
+            if !cur.is_empty() && cur_w + cw > max_w {
                 out.push((std::mem::take(&mut cur), cur_start));
+                cur_w = 0.0;
                 cur_start = char_pos;
             }
             cur.push(chx);
+            cur_w += cw;
             char_pos += 1;
         }
         out.push((cur, cur_start));
@@ -1493,7 +1500,7 @@ fn layout_lines(p: &Painter, s: &str, max_w: f32) -> Vec<(String, usize)> {
 }
 
 fn confirm() {
-    let mut guard = IB_UI.lock().unwrap();
+    let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(f) = guard.as_mut() else { return };
     let f = &mut f.0;
     // 重复截止日（仅按天重复时存储）
@@ -1581,9 +1588,9 @@ fn confirm() {
                 note,
                 color,
             });
-            if let Some(agenda) = IB_AGENDA.lock().unwrap().as_ref() {
-                let mut map = agenda.lock().unwrap();
-                match edit {
+            let agenda = IB_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(agenda) = agenda {
+                events::edit_and_save(&agenda, |map| match edit {
                     Some((old_key, idx, ..)) => {
                         if scope_only {
                             // 仅这一天：系列条目追加例外（可顺带更新截止日），编辑结果另存为独立日程
@@ -1623,13 +1630,11 @@ fn confirm() {
                                 map.entry(key).or_default().push(entry);
                             }
                         }
-                        events::save(&map);
                     }
                     None => {
                         map.entry(key).or_default().push(entry);
-                        events::save(&map);
                     }
-                }
+                });
             }
             drop(guard);
         }
@@ -1649,7 +1654,7 @@ fn confirm() {
 
 /// 释放弹窗后台位图压缩内存（下次 redraw 重建）
 fn free_surface() {
-    let mut guard = IB_UI.lock().unwrap();
+    let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         let ui = &mut f.0;
         unsafe {
@@ -1673,7 +1678,7 @@ fn cancel() {
 /// 屏幕缩放变化：更新 sf、释放位图；可见时原地重设尺寸并重绘（保留已输入内容）
 pub fn rescale(sf: f32) {
     let vis = visible();
-    let mut guard = IB_UI.lock().unwrap();
+    let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         let ui = &mut f.0;
         ui.sf = sf;
@@ -1725,8 +1730,10 @@ unsafe fn read_clipboard(hwnd: usize) -> Option<String> {
     if !h.is_null() {
         let ptr = GlobalLock(h as usize);
         if !ptr.is_null() {
+            // 扫 NUL 终止符以分配大小为上界：异常数据（无终止符）时不越界读
+            let cap = GlobalSize(h as usize) / 2;
             let mut len = 0usize;
-            while *ptr.add(len) != 0 {
+            while len < cap && *ptr.add(len) != 0 {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -1746,7 +1753,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_ERASEBKGND => 1,
         WM_TIMER => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 f.caret_on = !f.caret_on;
@@ -1755,7 +1762,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_CHAR => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if (wp as u32) >= 0x20 {
@@ -1782,7 +1789,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_KEYDOWN => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let shift = (GetKeyState(0x10) as u16) & 0x8000 != 0;
@@ -2011,7 +2018,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_IME_COMPOSITION => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if lp as i32 & GCS_RESULTSTR != 0 {
@@ -2058,7 +2065,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let x = ((lp & 0xFFFF) as u16 as i16) as f32 / s;
             let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
             SetForegroundWindow(hwnd);
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(sui) = guard.as_mut() else { return 0 };
             let f = &mut sui.0;
             // 面板打开时点击面板外：先收起（吞掉本次点击）
@@ -2322,7 +2329,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSEMOVE => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -2345,7 +2352,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if f.hover.is_some() {
@@ -2360,7 +2367,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let delta = ((wp >> 16) as i16) as i32;
             let mut pt = POINT { x: (lp & 0xFFFF) as u16 as i16 as i32, y: (((lp as usize) >> 16) as u16 as i16) as i32 };
             unsafe { ScreenToClient(hwnd, &mut pt) };
-            let mut guard = IB_UI.lock().unwrap();
+            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if matches!(f.drop, Some(Drop::Time { .. })) {

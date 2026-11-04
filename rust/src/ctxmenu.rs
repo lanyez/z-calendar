@@ -78,7 +78,7 @@ pub fn rect() -> Option<(i32, i32, i32, i32)> {
     if !visible() {
         return None;
     }
-    *CM_RECT.lock().unwrap()
+    *CM_RECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub fn close() {
@@ -111,7 +111,7 @@ pub fn toggle(x: i32, y: i32) {
         return;
     }
     unsafe {
-        let mut guard = CM_UI.lock().unwrap();
+        let mut guard = CM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
         let pt = POINT { x, y };
@@ -138,7 +138,7 @@ pub fn toggle(x: i32, y: i32) {
         SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, cm_w, cm_h, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
-        *CM_RECT.lock().unwrap() = Some((mx, my, mx + cm_w, my + cm_h));
+        *CM_RECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mx, my, mx + cm_w, my + cm_h));
     }
 }
 
@@ -197,7 +197,7 @@ pub fn create_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray>>>) {
         cui.bmp = c_bmp;
         cui.scan0 = c_scan0;
         GdipGetImageGraphicsContext(cui.bmp, &mut cui.g);
-        CM_UI.lock().unwrap().replace(SendCm(cui));
+        CM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendCm(cui));
     }
 }
 
@@ -260,7 +260,7 @@ impl ContextMenuUi {
         p.clear();
         p.fill_round(0.0, 0.0, CM_W, CM_H, 10.0, POPUP_BG());
         p.stroke_round(0.0, 0.0, CM_W, CM_H, 10.0, 1.0, crate::theme::ov(26));
-        let autostart = self.st.config.lock().unwrap().autostart;
+        let autostart = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).autostart;
         let items: [(CmAction, &str, bool); 4] = [
             (CmAction::Settings, "软件设置", false),
             (CmAction::AutoStart, "开机自启", autostart),
@@ -292,7 +292,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-            let mut guard = CM_UI.lock().unwrap();
+            let mut guard = CM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -313,7 +313,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = CM_UI.lock().unwrap();
+            let mut guard = CM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if f.hover.is_some() {
@@ -324,7 +324,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_LBUTTONDOWN => {
-            let mut guard = CM_UI.lock().unwrap();
+            let mut guard = CM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -336,14 +336,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         crate::flyout::show_settings();
                     }
                     Some(CmAction::AutoStart) => {
-                        let on = f.st.config.lock().unwrap().autostart;
+                        let on = f.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).autostart;
                         {
-                            let mut cfg = f.st.config.lock().unwrap();
+                            let mut cfg = f.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             cfg.autostart = !on;
                             cfg.save();
                         }
                         crate::config::apply_autostart(!on);
-                        if let Some(t) = f.tray.lock().unwrap().as_ref() {
+                        if let Some(t) = f.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                             t.autostart_item.set_checked(!on);
                         }
                         f.redraw();

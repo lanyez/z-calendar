@@ -143,7 +143,7 @@ pub fn show(text: &str, sx: i32, sy: i32) {
 
     // 分配/复用绘制表面（上限尺寸一次分配，sf 变化重建）
     {
-        let mut guard = SURF.lock().unwrap();
+        let mut guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale = match guard.as_ref() {
             Some(t) => t.sf != sf,
             None => true,
@@ -171,7 +171,7 @@ pub fn show(text: &str, sx: i32, sy: i32) {
             });
         }
     }
-    let guard = SURF.lock().unwrap();
+    let guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tip = match guard.as_ref() {
         Some(t) => t,
         None => return,

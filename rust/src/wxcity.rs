@@ -130,13 +130,13 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
         }
         WM_ERASEBKGND => 1,
         WM_TIMER => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 match wp {
                     1 => {
                         f.caret_on = !f.caret_on;
-                        f.redraw();
+                        f.redraw_input();
                     }
                     2 => {
                         KillTimer(hwnd, 2);
@@ -171,7 +171,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         CP_MSG_HITS => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let hits = unsafe { Box::from_raw(lp as *mut Vec<crate::weather::CityHit>) };
@@ -185,7 +185,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         CP_MSG_ADD => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let got = unsafe { Box::from_raw(lp as *mut Result<(String, String), String>) };
@@ -220,7 +220,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_CHAR => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if (wp as u32) >= 0x20 {
@@ -235,7 +235,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_IME_COMPOSITION => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 if lp as i32 & GCS_RESULTSTR != 0 {
@@ -253,7 +253,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_KEYDOWN => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let shift = unsafe { (GetKeyState(0x10) as u16) & 0x8000 != 0 };
@@ -322,7 +322,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_MOUSEMOVE => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -354,7 +354,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let dirty = f.close_hover || f.hot_hover.is_some() || f.row_hover.is_some();
@@ -368,7 +368,7 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             0
         }
         WM_LBUTTONDOWN => {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -470,11 +470,11 @@ fn add_city(st: &SharedState, id: &str, name: &str) -> Result<(), &'static str> 
     let dup_loc = st
         .weather
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .first()
         .map(|w| w.station == id)
         .unwrap_or(false);
-    let mut cfg = st.config.lock().unwrap();
+    let mut cfg = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if cfg.wx_cities.len() >= 4 {
         return Err("最多添加 4 个自定义城市");
     }
@@ -497,7 +497,7 @@ pub fn open(st: SharedState) {
             return;
         }
         {
-            let mut guard = CP_UI.lock().unwrap();
+            let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 f.st = st;
@@ -527,7 +527,7 @@ pub fn open(st: SharedState) {
         ShowWindow(h as HWND, SW_SHOW);
         SetForegroundWindow(h as HWND);
         SetFocus(h as HWND);
-        let mut guard = CP_UI.lock().unwrap();
+        let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(f) = guard.as_mut() {
             f.0.redraw();
         }
@@ -542,6 +542,14 @@ pub fn close() {
             ShowWindow(h as HWND, SW_HIDE);
             KillTimer(h as HWND, 1);
             KillTimer(h as HWND, 2);
+        }
+        // 隐藏即释放绘制位图（与 inputbox/flyout 一致；下次 open 的 redraw 惰性重建）
+        let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = guard.as_mut() {
+            let ui = &mut f.0;
+            unsafe {
+                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
+            }
         }
     }
 }
@@ -615,7 +623,7 @@ pub fn create(st: SharedState) {
         ui.bmp = bmp;
         ui.scan0 = scan0;
         GdipGetImageGraphicsContext(ui.bmp, &mut ui.g);
-        CP_UI.lock().unwrap().replace(SendCp(ui));
+        CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendCp(ui));
     }
 }
 
@@ -625,12 +633,19 @@ pub fn create(st: SharedState) {
 
 impl CityUi {
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
-            self.mem_dc = mem_dc;
-            self.hbmp = hbmp;
-            self.bmp = bmp;
-            self.scan0 = scan0;
+        // 屏幕缩放/界面字号变化：按新 sf 重建位图（本窗口未接入 rescale 链，靠
+        // 打开时 open() 的 SetWindowPos(新物理尺寸) + 此处失配检测自愈；
+        // ulw 与鼠标坐标换算都取 self.sf，同步后整体对齐）
+        if (self.sf - gdi::scale()).abs() > 0.001 || self.bmp.is_null() {
+            unsafe {
+                gdi::free_dib(&mut self.mem_dc, &mut self.hbmp, &mut self.bmp, &mut self.g, &mut self.scan0);
+                let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(self.w, self.h);
+                self.mem_dc = mem_dc;
+                self.hbmp = hbmp;
+                self.bmp = bmp;
+                self.scan0 = scan0;
+            }
+            self.sf = gdi::scale();
         }
         if self.g.is_null() {
             unsafe {
@@ -682,20 +697,11 @@ impl CityUi {
         }
     }
 
-    fn paint(&mut self, p: &gdi::Painter) {
+    /// 输入框行（含占位符/文本/闪烁光标）：整窗 paint 与光标闪烁的局部重绘
+    /// （redraw_input）共用同一几何与绘制
+    fn paint_input(&self, p: &gdi::Painter) {
         use crate::gdi::{HALIGN_CENTER, HALIGN_NEAR};
         let pal = crate::theme::pal();
-
-        p.fill_round(0.0, 0.0, CP_W, CP_H, 12.0, pal.popup);
-
-        // 标题 + 关闭
-        p.text("添加城市", 16.0, 10.0, 160.0, 22.0, HALIGN_NEAR, HALIGN_CENTER, 13.5, true, false, pal.title);
-        let cr = gdi::RectF { x: CP_W - 30.0, y: 10.0, w: 20.0, h: 20.0 };
-        p.text("✕", cr.x, cr.y, cr.w, cr.h, HALIGN_CENTER, HALIGN_CENTER, 11.0, false, false, if self.close_hover { pal.red } else { pal.dim });
-        self.close_rect = cr;
-        p.fill_rect(16.0, 38.0, CP_W - 32.0, 1.0, crate::theme::ov(20));
-
-        // 输入框
         let inp = gdi::RectF { x: 16.0, y: 46.0, w: CP_W - 32.0, h: 30.0 };
         p.fill_round(inp.x, inp.y, inp.w, inp.h, 6.0, pal.field);
         p.stroke_round(inp.x, inp.y, inp.w, inp.h, 6.0, 1.0, crate::theme::ov(50));
@@ -730,6 +736,50 @@ impl CityUi {
                 p.fill_rect(tx_x + cw, inp.y + 8.0, 1.0, inp.h - 16.0, pal.sub);
             }
         }
+    }
+
+    /// 光标闪烁的局部重绘：仅擦写输入框带（y 44~80，含描边外扩）后重画该行 +
+    /// ULW，跳过热门城市/搜索结果列表与标题的整窗重绘
+    fn redraw_input(&mut self) {
+        if self.bmp.is_null() || self.g.is_null() {
+            self.redraw();
+            return;
+        }
+        let cache_ptr: *const gdi::Cache = &self.cache;
+        let g = self.g;
+        unsafe {
+            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
+        }
+        let p = gdi::Painter {
+            g,
+            cache: cache_ptr,
+            sf: self.sf,
+            w: self.w,
+            h: self.h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
+        };
+        p.fill_rect(14.0, 44.0, CP_W - 28.0, 36.0, crate::theme::pal().popup);
+        self.paint_input(&p);
+        self.ulw();
+    }
+
+    fn paint(&mut self, p: &gdi::Painter) {
+        use crate::gdi::{HALIGN_CENTER, HALIGN_NEAR};
+        let pal = crate::theme::pal();
+
+        p.fill_round(0.0, 0.0, CP_W, CP_H, 12.0, pal.popup);
+
+        // 标题 + 关闭
+        p.text("添加城市", 16.0, 10.0, 160.0, 22.0, HALIGN_NEAR, HALIGN_CENTER, 13.5, true, false, pal.title);
+        let cr = gdi::RectF { x: CP_W - 30.0, y: 10.0, w: 20.0, h: 20.0 };
+        p.text("✕", cr.x, cr.y, cr.w, cr.h, HALIGN_CENTER, HALIGN_CENTER, 11.0, false, false, if self.close_hover { pal.red } else { pal.dim });
+        self.close_rect = cr;
+        p.fill_rect(16.0, 38.0, CP_W - 32.0, 1.0, crate::theme::ov(20));
+
+        // 输入框
+        self.paint_input(p);
 
         self.hot_rects.clear();
         self.row_rects.clear();

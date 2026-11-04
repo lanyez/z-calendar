@@ -170,7 +170,7 @@ fn main() {
     let st = flyout::SharedState {
         config: Arc::new(Mutex::new(config)),
         holidays: Arc::new(RwLock::new(holidays)),
-        weather: Arc::new(Mutex::new(weather)),
+        weather: Arc::new(Mutex::new(Arc::new(weather))),
         clock: clock.clone(),
         refresh_tx,
         weather_tx,
@@ -182,11 +182,11 @@ fn main() {
     let agenda = Arc::new(Mutex::new(flyout::load_agenda()));
     // 注册共享句柄：提醒卡片撤销恢复等无窗口上下文的模块读写同一份数据
     events::set_shared_agenda(agenda.clone());
-    let tray = Arc::new(Mutex::new(tray::create(&st.config.lock().unwrap())));
+    let tray = Arc::new(Mutex::new(tray::create(&st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner))));
     // 托盘图标可见性按配置（默认显示）
     {
-        let show_tray = st.config.lock().unwrap().show_tray;
-        if let Some(t) = tray.lock().unwrap().as_ref() {
+        let show_tray = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).show_tray;
+        if let Some(t) = tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             t.set_visible(show_tray);
         }
     }
@@ -295,16 +295,17 @@ fn main() {
 }
 
 fn do_fetch(st: &flyout::SharedState) -> bool {
-    let url = st.config.lock().unwrap().ics_url.clone();
+    let url = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ics_url.clone();
     match ics::fetch_map(&url) {
         Some(map) => {
             {
-                let mut h = st.holidays.write().unwrap();
+                let mut h = st.holidays.write().unwrap_or_else(std::sync::PoisonError::into_inner);
                 *h = map.clone();
             }
-            ics::save_cache(&st.holidays.read().unwrap());
+            crate::ics::bump_holiday_gen();
+            ics::save_cache(&st.holidays.read().unwrap_or_else(std::sync::PoisonError::into_inner));
             {
-                let mut cfg = st.config.lock().unwrap();
+                let mut cfg = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 cfg.last_ics_update = now_ms();
                 cfg.save();
             }
@@ -320,7 +321,7 @@ fn spawn_fetch(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
         .stack_size(256 * 1024)
         .spawn(move || loop {
             let should = {
-                let cfg = st.config.lock().unwrap();
+                let cfg = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 cfg.auto_update && now_ms() - cfg.last_ics_update > 12 * 3600 * 1000
             };
             if should {
@@ -344,45 +345,84 @@ fn spawn_weather(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
     std::thread::Builder::new()
         .name("weather".into())
         .stack_size(256 * 1024)
-        .spawn(move || loop {
-            let mut ok = true;
-            let show = st.config.lock().unwrap().show_weather;
-            if show {
-                // 自定义城市（最多 4 个）+ 定位城市一起刷新
-                let custom: Vec<(String, String)> = st
-                    .config
-                    .lock()
-                    .unwrap()
-                    .wx_cities
-                    .iter()
-                    .map(|c| (c.id.clone(), c.name.clone()))
-                    .collect();
-                let prev = st.weather.lock().unwrap().clone();
-                let (located, customs) = weather::fetch_all(&custom, &prev);
-                if located.is_none() {
-                    ok = false;
-                    crate::log::warn("天气拉取失败（1 分钟后重试）");
+        .spawn(move || {
+            let mut fails = 0u32;
+            loop {
+                let show = st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).show_weather;
+                let mut fresh = true;
+                if show {
+                    // 刚从关闭切到开启（关闭期间内存天气被清空）：先回填 3 小时内
+                    // 的磁盘缓存，主面板头部即时显示；随后照常拉新覆盖
+                    let need_backfill = st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
+                    if need_backfill {
+                        let (located, customs) = weather::load_cache();
+                        let mut v = Vec::new();
+                        if let Some(l) = located {
+                            v.push(l);
+                        }
+                        v.extend(customs);
+                        if !v.is_empty() {
+                            *st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(v);
+                            flyout::post_repaint();
+                        }
+                    }
+                    // 自定义城市（最多 4 个）+ 定位城市一起刷新
+                    let custom: Vec<(String, String)> = st
+                        .config
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .wx_cities
+                        .iter()
+                        .map(|c| (c.id.clone(), c.name.clone()))
+                        .collect();
+                    let prev = st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                    let (located, customs, ok) = weather::fetch_all(&custom, &prev);
+                    fresh = ok;
+                    if ok {
+                        // 仅拿到新数据时落盘：失败轮不写缓存，避免把陈旧数据的 ts 反复“续期”
+                        weather::save_cache(located.as_ref(), &customs);
+                        fails = 0;
+                    } else {
+                        fails += 1;
+                    }
+                    let mut v = Vec::new();
+                    if let Some(l) = located {
+                        v.push(l);
+                    }
+                    v.extend(customs);
+                    *st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(v);
+                    // 数据到达时刷新可见的天气面板（添加城市后的待聚焦 tab 即刻生效）
+                    if flyout::forecast_visible() {
+                        flyout::forecast_redraw();
+                    }
+                    // 主面板头部温度/预警角标随新数据刷新（隐藏时为无操作）
+                    flyout::post_repaint();
+                } else {
+                    *st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(Vec::new());
                 }
-                weather::save_cache(located.as_ref(), &customs);
-                let mut v = Vec::new();
-                if let Some(l) = located {
-                    v.push(l);
+                // 成功 1 小时后刷新；失败指数退避 1→5→15→30 分钟封顶（断网时
+                // 不再每分钟重打定位链 5~8 个请求，恢复后最多 30 分钟追上）
+                let wait = if fresh {
+                    Duration::from_secs(60 * 60)
+                } else {
+                    let msg_wait = match fails {
+                        1 => Duration::from_secs(60),
+                        2 => Duration::from_secs(5 * 60),
+                        3 => Duration::from_secs(15 * 60),
+                        _ => Duration::from_secs(30 * 60),
+                    };
+                    crate::log::warn(&format!(
+                        "天气拉取失败（第 {} 次，{} 分钟后重试）",
+                        fails,
+                        msg_wait.as_secs() / 60
+                    ));
+                    msg_wait
+                };
+                crate::trim_working_set();
+                match rx.recv_timeout(wait) {
+                    Ok(()) => {}
+                    Err(_) => {}
                 }
-                v.extend(customs);
-                *st.weather.lock().unwrap() = v;
-                // 数据到达时刷新可见的天气面板（添加城市后的待聚焦 tab 即刻生效）
-                if flyout::forecast_visible() {
-                    flyout::forecast_redraw();
-                }
-            } else {
-                *st.weather.lock().unwrap() = Vec::new();
-            }
-            // 失败 1 分钟后重试，成功 1 小时后刷新（每小时自动更新）
-            let wait = if ok { Duration::from_secs(60 * 60) } else { Duration::from_secs(60) };
-            crate::trim_working_set();
-            match rx.recv_timeout(wait) {
-                Ok(()) => {}
-                Err(_) => {}
             }
         })
         .ok();

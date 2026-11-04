@@ -18,6 +18,18 @@ pub struct DayInfo {
 
 pub type HolidayMap = HashMap<String, DayInfo>;
 
+/// 假期数据代次：共享表被替换（启动加载 / 定时拉取成功）后 +1。
+/// 月历派生缓存（flyout::MonthCache，次行文本含法定节假日名）据此失效。
+static HOLIDAY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn holiday_gen() -> u64 {
+    HOLIDAY_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn bump_holiday_gen() {
+    HOLIDAY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn key_of(y: i32, m: u32, d: u32) -> String {
     format!("{}-{}-{}", y, m, d)
 }

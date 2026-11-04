@@ -52,7 +52,7 @@ pub fn date_menu_rect() -> Option<(i32, i32, i32, i32)> {
     if !date_menu_visible() {
         return None;
     }
-    *DM_RECT.lock().unwrap()
+    *DM_RECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub fn date_menu_close() {
@@ -71,10 +71,10 @@ pub fn date_menu_toggle(x: i32, y: i32, date: chrono::NaiveDate) {
         date_menu_close();
         return;
     }
-    *DM_DATE.lock().unwrap() = Some(date);
-    *DM_AT.lock().unwrap() = (x, y);
+    *DM_DATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(date);
+    *DM_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (x, y);
     unsafe {
-        let mut guard = DM_UI.lock().unwrap();
+        let mut guard = DM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
         let pt = POINT { x, y };
@@ -101,7 +101,7 @@ pub fn date_menu_toggle(x: i32, y: i32, date: chrono::NaiveDate) {
         SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, mx, my, cm_w, dm_h, SWP_NOACTIVATE);
         ShowWindow(f.hwnd as HWND, SW_SHOWNA);
         f.redraw();
-        *DM_RECT.lock().unwrap() = Some((mx, my, mx + cm_w, my + dm_h));
+        *DM_RECT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((mx, my, mx + cm_w, my + dm_h));
     }
 }
 
@@ -148,7 +148,7 @@ pub fn create_date_menu_window() {
             regions: Vec::new(),
             hover: None,
         });
-        DM_UI.lock().unwrap().replace(SendDm(ui));
+        DM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendDm(ui));
     }
 }
 
@@ -229,7 +229,7 @@ unsafe extern "system" fn date_menu_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, l
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-            let mut guard = DM_UI.lock().unwrap();
+            let mut guard = DM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();
@@ -244,7 +244,7 @@ unsafe extern "system" fn date_menu_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, l
             0
         }
         WM_LBUTTONDOWN => {
-            let mut guard = DM_UI.lock().unwrap();
+            let mut guard = DM_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let s = gdi::scale();
@@ -252,8 +252,8 @@ unsafe extern "system" fn date_menu_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, l
                 let y = (((lp as usize) >> 16) as u16 as i16) as f32 / s;
                 let hit = f.regions.iter().rev().find(|(r, _)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|(_, a)| *a);
                 if let Some(act) = hit {
-                    let date = DM_DATE.lock().unwrap().unwrap_or_else(|| chrono::Local::now().date_naive());
-                    let (ax, ay) = *DM_AT.lock().unwrap();
+                    let date = DM_DATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).unwrap_or_else(|| chrono::Local::now().date_naive());
+                    let (ax, ay) = *DM_AT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     drop(guard);
                     date_menu_close();
                     match act {

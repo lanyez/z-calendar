@@ -70,22 +70,12 @@ unsafe fn detect_scale() -> f32 {
             }
         }
     }
-    #[link(name = "shcore")]
-    extern "system" {
-        fn GetDpiForMonitor(
-            hmonitor: winapi::shared::windef::HMONITOR,
-            dpi_type: u32,
-            dpi_x: *mut u32,
-            dpi_y: *mut u32,
-        ) -> i32;
-    }
     use winapi::shared::windef::POINT;
     use winapi::um::wingdi::{GetDeviceCaps, LOGPIXELSX};
     use winapi::um::winuser::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
     let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
     if !mon.is_null() {
-        let (mut dx, mut dy) = (0u32, 0u32);
-        if GetDpiForMonitor(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mut dx, &mut dy) == 0 && dx > 0 {
+        if let Some((dx, _)) = get_dpi_for_monitor(mon) {
             return dx as f32 / 96.0;
         }
     }
@@ -118,20 +108,33 @@ pub fn monitor_dpi_at(x: i32, y: i32) -> f32 {
 }
 
 unsafe fn monitor_dpi(mon: winapi::shared::windef::HMONITOR) -> Option<f32> {
-    #[link(name = "shcore")]
-    extern "system" {
-        fn GetDpiForMonitor(
-            hmonitor: winapi::shared::windef::HMONITOR,
-            dpi_type: u32,
-            dpi_x: *mut u32,
-            dpi_y: *mut u32,
-        ) -> i32;
-    }
+    get_dpi_for_monitor(mon).map(|(dx, _)| dx as f32 / 96.0)
+}
+
+/// shcore!GetDpiForMonitor 动态解析（GetProcAddress，首次调用后缓存）：
+/// 静态 `#[link(name="shcore")]` 依赖 mingw-w64 完整发行版的 libshcore.a，
+/// rustup 自带的 windows-gnu 工具链没有它，裸环境 cargo build/test 直接链接失败。
+/// Win8.1 之前无此 API（模块或函数不存在），同样走 None → 调用方回退 GetDeviceCaps。
+unsafe fn get_dpi_for_monitor(mon: winapi::shared::windef::HMONITOR) -> Option<(u32, u32)> {
+    type GetDpiForMonitorFn =
+        unsafe extern "system" fn(winapi::shared::windef::HMONITOR, u32, *mut u32, *mut u32) -> i32;
+    static F: std::sync::OnceLock<Option<GetDpiForMonitorFn>> = std::sync::OnceLock::new();
+    let f = F.get_or_init(|| {
+        let h = winapi::um::libloaderapi::GetModuleHandleW(crate::wide("shcore.dll").as_ptr());
+        if h.is_null() {
+            return None;
+        }
+        let p = winapi::um::libloaderapi::GetProcAddress(h, b"GetDpiForMonitor\0".as_ptr() as *const i8);
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute(p) })
+        }
+    });
     let (mut dx, mut dy) = (0u32, 0u32);
-    if GetDpiForMonitor(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mut dx, &mut dy) == 0 && dx > 0 {
-        Some(dx as f32 / 96.0)
-    } else {
-        None
+    match f {
+        Some(g) if g(mon, 0 /*MDT_EFFECTIVE_DPI*/, &mut dx, &mut dy) == 0 && dx > 0 => Some((dx, dy)),
+        _ => None,
     }
 }
 
@@ -260,7 +263,7 @@ static FONT_GEN: AtomicU32 = AtomicU32::new(1);
 pub const DEFAULT_FONT_FAMILY: &str = "Microsoft YaHei UI";
 
 pub fn font_family() -> String {
-    FONT_FAMILY.read().unwrap().clone()
+    FONT_FAMILY.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// 切换界面字体族：失效 GDI HFONT 缓存与 GDI+ 字体缓存（Cache 按代数重建）
@@ -268,14 +271,14 @@ pub fn set_font_family(name: &str) {
     let name = name.trim();
     let name: &str = if name.is_empty() { DEFAULT_FONT_FAMILY } else { name };
     {
-        let mut w = FONT_FAMILY.write().unwrap();
+        let mut w = FONT_FAMILY.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if w.as_str() == name {
             return;
         }
         *w = name.to_string();
     }
     FONT_GEN.fetch_add(1, Ordering::Relaxed);
-    let mut map = GFONTS.lock().unwrap();
+    let mut map = GFONTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for (_, f) in map.drain() {
         unsafe {
             winapi::um::wingdi::DeleteObject(f as winapi::shared::windef::HGDIOBJ);
@@ -290,10 +293,16 @@ pub const FACE_EMOJI: u8 = 2; // Segoe UI Emoji（非 BMP 字符回退，GDI 无
 
 unsafe fn gdi_font(px: i32, bold: bool, face: u8) -> usize {
     use winapi::um::wingdi::{
-        CreateFontW, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL, OUT_DEFAULT_PRECIS,
+        CreateFontW, ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FW_BOLD, FW_NORMAL,
+        OUT_DEFAULT_PRECIS,
     };
-    let key = ((px as i64) << 3) | ((bold as i64) << 2) | face as i64;
-    let mut map = GFONTS.lock().unwrap();
+    // 抗锯齿质量随主题：深色主题的浅字深底用 ClearType 会产生 RGB 彩色镶边、
+    // 笔画变细，小字号观感"发虚发灰"（Windows 自家深色模式同样改用灰度抗锯
+    // 锈）；浅色主题的深字浅底保留 ClearType 子像素（最锐利）。
+    // 质量位并入缓存键，主题切换不会取到旧质量的字体。
+    let light = crate::theme::is_light();
+    let key = ((px as i64) << 4) | ((bold as i64) << 3) | ((!light as i64) << 2) | face as i64;
+    let mut map = GFONTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = map.get(&key) {
         return *f;
     }
@@ -315,7 +324,7 @@ unsafe fn gdi_font(px: i32, bold: bool, face: u8) -> usize {
         DEFAULT_CHARSET as u32,
         OUT_DEFAULT_PRECIS as u32,
         CLIP_DEFAULT_PRECIS as u32,
-        CLEARTYPE_QUALITY as u32,
+        if light { CLEARTYPE_QUALITY as u32 } else { ANTIALIASED_QUALITY as u32 },
         0,
         face.as_ptr(),
     );
@@ -511,7 +520,7 @@ impl Cache {
         }
         let old = self.family_yahei.swap(fam as usize, Ordering::Relaxed);
         self.family_gen.store(FONT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
-        let mut map = self.fonts.lock().unwrap();
+        let mut map = self.fonts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, f) in map.drain() {
             GdipDeleteFont(f);
         }
@@ -521,7 +530,7 @@ impl Cache {
     }
 
     unsafe fn brush(&self, color: u32) -> Gp {
-        let mut map = self.brushes.lock().unwrap();
+        let mut map = self.brushes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(b) = map.get(&color) {
             return *b;
         }
@@ -533,7 +542,7 @@ impl Cache {
 
     unsafe fn pen(&self, color: u32, width: f32) -> Gp {
         let key = (color, (width * 4.0) as u32);
-        let mut map = self.pens.lock().unwrap();
+        let mut map = self.pens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(p) = map.get(&key) {
             return *p;
         }
@@ -549,7 +558,7 @@ impl Cache {
             self.rebuild_family();
         }
         let key = ((px * 8.0) as u64) << 8 | (bold as u64) << 4 | (mdl2 as u64);
-        let mut map = self.fonts.lock().unwrap();
+        let mut map = self.fonts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(f) = map.get(&key) {
             return *f;
         }

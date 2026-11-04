@@ -496,7 +496,8 @@ pub fn dispatch(args: &str) {
             let id = it.next().unwrap_or("");
             let date = it.next().unwrap_or("");
             crate::sidebar::complete_todo_by_id(id, date);
-            crate::sidebar::sidebar_repaint();
+            // dispatch 可能跑在第二实例唤醒线程：重绘投递到侧栏属主线程
+            crate::sidebar::post_repaint();
         } else if let Some(rest) = a.strip_prefix("zcal:snooze:") {
             let mut it = rest.splitn(3, '|');
             let title = uri_decode(it.next().unwrap_or(""));

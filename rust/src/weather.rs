@@ -780,8 +780,12 @@ pub fn fetch_station(station: &str, display: &str) -> Option<Weather> {
 
 /// 一次刷新全部城市：定位城市 + 自定义（custom 为 (站号, 名称)，最多 4 个）；
 /// 单个城市失败时沿用 prev 里的旧数据（含定位城市）
-pub fn fetch_all(custom: &[(String, String)], prev: &[Weather]) -> (Option<Weather>, Vec<Weather>) {
-    let located = fetch().or_else(|| prev.first().cloned());
+/// 刷新全部城市。返回 (定位城市, 自定义城市列表, 定位城市是否为新拉取数据)：
+/// 定位失败时回退上一轮数据（prev 空则为 None）——此时调用方不应把陈旧数据当新缓存落盘。
+pub fn fetch_all(custom: &[(String, String)], prev: &[Weather]) -> (Option<Weather>, Vec<Weather>, bool) {
+    let fresh = fetch();
+    let fresh_ok = fresh.is_some();
+    let located = fresh.or_else(|| prev.first().cloned());
     let mut customs = Vec::new();
     for (id, name) in custom.iter().take(4) {
         if let Some(w) =
@@ -790,7 +794,7 @@ pub fn fetch_all(custom: &[(String, String)], prev: &[Weather]) -> (Option<Weath
             customs.push(w);
         }
     }
-    (located, customs)
+    (located, customs, fresh_ok)
 }
 
 /// 调试：CAL_FAKE_WX=1 时使用固定示例数据（离线验证界面）

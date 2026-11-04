@@ -12,7 +12,7 @@ use winapi::um::winuser::*;
 use crate::config::{apply_autostart, Config};
 use crate::gdi::{self, Cache, Painter};
 use crate::ics::{DayInfo, DayType, HolidayMap};
-use crate::lunar::{self, FestKind};
+use crate::lunar;
 use crate::tray;
 use crate::weather::Weather;
 
@@ -69,15 +69,19 @@ const CLOCK_GAP: f32 = 6.0;
 const WM_APP_TOGGLE: UINT = 0x8000 + 1;
 const WM_APP_SHOW: UINT = 0x8000 + 2;
 const WM_APP_ICS_DONE: UINT = 0x8000 + 3;
+/// 后台线程请求重绘（toast 线程/通知激活线程不能直接持 UI 锁绘制：
+/// UpdateLayeredWindow 是跨线程同步调用，会与主线程消息处理互锁）
+const WM_APP_REPAINT: UINT = 0x8000 + 4;
 
 static FLYOUT_HWND: AtomicUsize = AtomicUsize::new(0);
-static SHOWN_FLAG: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct SharedState {
     pub config: Arc<Mutex<Config>>,
     pub holidays: Arc<RwLock<HolidayMap>>,
-    pub weather: Arc<Mutex<Vec<Weather>>>,
+    /// 天气快照存 Arc：天气面板/主面板头部的重绘取快照只克隆指针计数
+    /// （此前每次悬停移动都深拷贝全部城市 × 7 天 + 预警）
+    pub weather: Arc<Mutex<Arc<Vec<Weather>>>>,
     pub clock: crate::overlay::SharedClock,
     pub refresh_tx: Sender<()>,
     pub weather_tx: Sender<()>,
@@ -138,6 +142,92 @@ struct MultiResult {
     todo_updates: Vec<(usize, crate::sidebar::Todo)>,
     undo: Option<crate::toast::UndoData>,
     hint: String,
+}
+
+/// 月历绘制所需的配置子集（Copy）。整窗重绘每次整体 clone 31 字段 Config
+/// （含 Vec<String>/String），悬停跨命中区移动即触发；改锁内取 7 个标量。
+struct CalPrefs {
+    hour12: bool,
+    show_lunar: bool,
+    show_adjust: bool,
+    show_other_month: bool,
+    show_week_num: bool,
+    show_weather: bool,
+    week_start: u32,
+}
+
+impl CalPrefs {
+    fn load(cfg: &Config) -> Self {
+        Self {
+            hour12: cfg.hour12,
+            show_lunar: cfg.show_lunar,
+            show_adjust: cfg.show_adjust,
+            show_other_month: cfg.show_other_month,
+            show_week_num: cfg.show_week_num,
+            show_weather: cfg.show_weather,
+            week_start: cfg.week_start,
+        }
+    }
+}
+
+/// 月历单格的派生信息（角标 + 次行文本布局），由 MonthCache 按代次缓存
+#[derive(Clone)]
+struct MonthCell {
+    has_agenda: bool,
+    n_agenda: usize,
+    color: Option<u8>,
+    has_todo: bool,
+    n_todo: usize,
+    /// 次行第一行文本（农历/节日/节气；空=不显示）与适配字号，
+    /// sub2=Some 时第二行文本与其字号（>5 字折行）
+    sub1: String,
+    sub2: Option<String>,
+    px1: f32,
+    px2: f32,
+    /// 次行为节日/节气/法定假日（蓝）还是普通农历（跟随 in_month 灰）
+    sub_fest: bool,
+}
+
+/// 月历派生数据缓存：数据代次（agenda/todo/config/holiday 任一变更）或视图
+/// （年月/行数/起始日/缩放）变化才重建。悬停跨命中区移动会触发整窗重绘，
+/// 此前每帧全表扫描 4 遍（待办展开/重复规则/跨天覆盖/摘要解析）+ 逐格农历
+/// 计算/节日查找/测宽；缓存后悬停重绘只做纯绘制。
+struct MonthCache {
+    key: (u64, u64, u64, u64, i32, u32, i64, NaiveDate, f32),
+    cells: Vec<MonthCell>, // rows*7 个，按日期偏移对齐
+}
+
+/// 月格次行文本（农历/节日/节气）与其颜色类别：只随 日期/假期数据/show_lunar
+/// 变化（fest_color 恒为 FEST_BLUE，颜色归约为 sub_fest 布尔 + 主题色现算）
+fn day_sub(date: NaiveDate, hol: Option<&DayInfo>, show_lunar: bool) -> (String, bool) {
+    if !show_lunar {
+        return (String::new(), false);
+    }
+    let l = lunar::solar_to_lunar(date);
+    let lf = l.as_ref().and_then(lunar::lunar_festival);
+    let sfest = lunar::solar_festival(date);
+    let term = lunar::jieqi_of(date);
+    let legal = hol
+        .filter(|h| h.ty == DayType::Xiu)
+        .map(|h| h.name.as_str());
+    if let Some((n, _)) = lf {
+        (n.to_string(), true)
+    } else if let Some(n) = legal {
+        (n.to_string(), true)
+    } else if let Some((n, _)) = sfest {
+        (n.to_string(), true)
+    } else if let Some(t) = term {
+        (t.to_string(), true)
+    } else if let Some(l) = l {
+        let txt = if l.day == 1 {
+            format!("{}月", lunar::month_cn(l.month))
+        } else {
+            lunar::day_cn(l.day).to_string()
+        };
+        (txt, false)
+    } else {
+        (String::new(), false)
+    }
 }
 
 /// 平移存储时间到目标日（保留时分；全天日期串只换日期）
@@ -225,6 +315,8 @@ struct Ui {
     multi: Option<(Vec<bool>, Vec<bool>)>,
     /// 年月快速跳转面板（None=收起）
     month_pick: Option<MonthPick>,
+    /// 月历派生角标缓存（数据代次/视图变化时重建）
+    month_cache: Option<MonthCache>,
     tick: u32,
     last_second: u32,
     idle_timer: bool,
@@ -339,6 +431,10 @@ struct SettingsUi {
     sb_drag: Option<SbDrag>,
     refreshing: bool,
     ics_status: Option<bool>,
+    /// 配置快照缓存（cfg_gen 与 config::config_gen 一致时复用）：
+    /// 设置窗内悬停移动高频重绘，不再每次整体 clone Config
+    cfg_snap: Config,
+    cfg_gen: u64,
     dumped: bool,
     dump_path: String,
 }
@@ -405,11 +501,13 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             sb_drag: None,
             refreshing: false,
             ics_status: None,
+            cfg_snap: Config::default(),
+            cfg_gen: 0,
             dumped: false,
             dump_path: std::env::var("CAL_DUMP2").unwrap_or_default(),
         });
         // 后台位图不在创建时分配：show_settings→redraw 惰性分配，隐藏即释放
-        SETTINGS_UI.lock().unwrap().replace(SendSettings(sui));
+        SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendSettings(sui));
     }
 }
 
@@ -417,7 +515,7 @@ pub const SETTINGS_W: f32 = 490.0;
 pub const SETTINGS_H: f32 = 640.0;
 
 fn settings_position() -> (i32, i32) {
-    if let Some((x, y)) = *SETTINGS_POS.lock().unwrap() {
+    if let Some((x, y)) = *SETTINGS_POS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return (x, y);
     }
     // 首次：居中于日历所在屏（多屏；取不到回退主屏工作区）
@@ -461,7 +559,7 @@ pub fn open_date_time_settings() {
 /// 以指定页签打开设置窗口（日期侧边栏“卡片管理”入口）
 pub fn show_settings_tab(tab: usize) {
     {
-        let mut guard = SETTINGS_UI.lock().unwrap();
+        let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sui) = guard.as_mut() {
             sui.0.tab = tab;
             sui.0.week_menu_open = false;
@@ -487,7 +585,7 @@ pub fn show_settings() {
         ShowWindow(hwnd as HWND, SW_SHOWNA);
     }
     {
-        let mut guard = SETTINGS_UI.lock().unwrap();
+        let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sui) = guard.as_mut() {
             sui.0.week_menu_open = false; // 重开时收起上次遗留的下拉
             sui.0.font_menu_open = false;
@@ -525,7 +623,7 @@ fn hide_settings() {
         if IsWindowVisible(hwnd as HWND) != 0 {
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(hwnd as HWND, &mut r);
-            *SETTINGS_POS.lock().unwrap() = Some((r.left, r.top));
+            *SETTINGS_POS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((r.left, r.top));
             ShowWindow(hwnd as HWND, SW_HIDE);
         }
         // 关闭设置后把前台还给仍显示的面板：其"失焦自动隐藏"恢复正常节奏
@@ -541,7 +639,7 @@ fn hide_settings() {
 /// 释放设置窗口后台位图（隐藏时压缩内存；下次 show_settings 重绘时重建）。
 /// 必须在 SETTINGS_UI 锁外调用。
 fn free_settings_surface() {
-    let mut guard = SETTINGS_UI.lock().unwrap();
+    let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sui) = guard.as_mut() {
         let ui = &mut sui.0;
         unsafe {
@@ -630,7 +728,7 @@ impl SettingsUi {
         }
     }
 
-    fn paint(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, SAction)>) {
+    fn paint(&mut self, p: &Painter, regions: &mut Vec<(gdi::RectF, SAction)>) {
         let m = 10.0;
         let pw = SETTINGS_W - 20.0;
         let ph = SETTINGS_H - 20.0;
@@ -686,7 +784,13 @@ impl SettingsUi {
         let cx = px + 148.0;
         let cw = px + pw - 16.0 - cx;
 
-        let cfg = self.st.config.lock().unwrap().clone();
+        // 配置快照缓存：保存代次（config::config_gen）未变时复用，悬停移动的
+        // 高频重绘不再整体 clone Config
+        if self.cfg_gen != crate::config::config_gen() {
+            self.cfg_snap = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            self.cfg_gen = crate::config::config_gen();
+        }
+        let cfg = &self.cfg_snap;
         let last_ics = cfg.last_ics_update;
 
         if self.tab == 0 {
@@ -1014,7 +1118,7 @@ impl SettingsUi {
             }
             SAction::Toggle(idx) => {
                 let on = {
-                    let mut cfg = self.st.config.lock().unwrap();
+                    let mut cfg = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match idx {
                         0 => {
                             cfg.autostart = !cfg.autostart;
@@ -1107,13 +1211,19 @@ impl SettingsUi {
                         _ => cfg.show_weather,
                     }
                 };
-                self.st.config.lock().unwrap().save();
+                self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save();
                 if (10..=16).contains(idx) || *idx == 19 {
                     crate::sidebar::sidebar_repaint();
                 }
+                // 日历相关开关（农历/调休/非本月/12小时制/周数/天气）：主面板同屏时
+                // 立即重绘——面板自身只靠鼠标悬停/翻页触发整窗重绘，否则要等
+                // 鼠标移入日历才可见（flyout_repaint 对隐藏面板无操作）
+                if matches!(idx, 2..=7) {
+                    flyout_repaint();
+                }
                 if *idx == 0 {
                     apply_autostart(on);
-                    if let Some(t) = self.tray.lock().unwrap().as_ref() {
+                    if let Some(t) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                         t.autostart_item.set_checked(on);
                     }
                 }
@@ -1121,7 +1231,7 @@ impl SettingsUi {
                     let _ = self.st.weather_tx.send(());
                 }
                 if *idx == 8 {
-                    if let Some(t) = self.tray.lock().unwrap().as_ref() {
+                    if let Some(t) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                         t.set_visible(on);
                     }
                 }
@@ -1144,12 +1254,15 @@ impl SettingsUi {
                 self.redraw();
             }
             SAction::WeekPick(i) => {
-                let mut cfg = self.st.config.lock().unwrap();
+                let mut cfg = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 cfg.week_start = *i as u32;
                 cfg.save();
                 drop(cfg);
                 self.week_menu_open = false;
                 self.hover = None;
+                // 每周起始日改变整个网格对齐：主面板同屏时立即重绘（缓存键含
+                // start，会自动重建派生数据）
+                flyout_repaint();
                 self.redraw();
             }
             SAction::FontScaleDropdown => {
@@ -1187,7 +1300,7 @@ impl SettingsUi {
             }
             SAction::ThemePick(i) => {
                 let v = (*i).min(2) as u8;
-                let mut cfg = self.st.config.lock().unwrap();
+                let mut cfg = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 cfg.theme = v;
                 cfg.save();
                 drop(cfg);
@@ -1208,7 +1321,7 @@ impl SettingsUi {
             SAction::MottoPick(i) => {
                 let letter = crate::motto::TYPES.get(*i).map(|(c, _)| c.to_string()).unwrap_or_else(|| "d".to_string());
                 {
-                    let mut cfg = self.st.config.lock().unwrap();
+                    let mut cfg = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     cfg.motto_type = letter;
                     cfg.save();
                 }
@@ -1290,7 +1403,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             // （上次拖动后捕获仍在本窗口时同样会触发），其处理需要 SETTINGS_UI 锁，
             // 绝不能在本锁持有期间调用（同线程重入 → 死锁）
             let sb_hit = {
-                let guard = SETTINGS_UI.lock().unwrap();
+                let guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.as_ref().and_then(|s| {
                     let ui = &s.0;
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
@@ -1307,7 +1420,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                         SetCapture(hwnd);
                     }
                 }
-                let mut guard = SETTINGS_UI.lock().unwrap();
+                let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     ui.sb_drag = Some(SbDrag { from: slot, sy: y, y, moved: false });
@@ -1320,7 +1433,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             let mut font_pick: Option<usize> = None;
             let mut family_pick: Option<usize> = None;
             {
-                let mut guard = SETTINGS_UI.lock().unwrap();
+                let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
@@ -1410,9 +1523,9 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 let vals = [1.0f32, 1.1, 1.25];
                 let v = vals[i.min(vals.len() - 1)];
                 {
-                    let mut guard = SETTINGS_UI.lock().unwrap();
+                    let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(sui) = guard.as_mut() {
-                        let mut cfg = sui.0.st.config.lock().unwrap();
+                        let mut cfg = sui.0.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         cfg.ui_font_scale = v;
                         cfg.save();
                     }
@@ -1425,9 +1538,9 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 let names = ["Microsoft YaHei UI", "DengXian", "SimSun", "SimHei", "Segoe UI"];
                 let name = names[i.min(names.len() - 1)];
                 {
-                    let mut guard = SETTINGS_UI.lock().unwrap();
+                    let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(sui) = guard.as_mut() {
-                        let mut cfg = sui.0.st.config.lock().unwrap();
+                        let mut cfg = sui.0.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         cfg.ui_font_family = name.to_string();
                         cfg.save();
                     }
@@ -1443,7 +1556,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_MOUSEMOVE => {
-            let mut guard = SETTINGS_UI.lock().unwrap();
+            let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
@@ -1476,7 +1589,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = SETTINGS_UI.lock().unwrap();
+            let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 if ui.hover.is_some() {
@@ -1490,27 +1603,27 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             // 拖动提交 / 原地点击切换（后者延后到锁外执行，handle_action 会操作托盘等）
             let mut click_toggle: Option<u8> = None;
             {
-                let mut guard = SETTINGS_UI.lock().unwrap();
+                let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     if let Some(d) = ui.sb_drag.take() {
                         if d.moved {
                             // 拖动提交：按松开位置重排并保存
-                            let mut order = ui.st.config.lock().unwrap().sidebar_card_order();
+                            let mut order = ui.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sidebar_card_order();
                             let motto_slot = order.iter().position(|c| *c == "motto").unwrap_or(7);
                             let tops = sb_slot_tops(motto_slot);
                             let item = order.remove(d.from.min(order.len() - 1));
                             let target = sb_slot_at(&tops, d.y).min(order.len());
                             order.insert(target, item);
                             {
-                                let mut cfg = ui.st.config.lock().unwrap();
+                                let mut cfg = ui.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 cfg.set_sidebar_order(&order);
                                 cfg.save();
                             }
                             crate::sidebar::sidebar_repaint();
                             ui.redraw();
                         } else {
-                            let order = ui.st.config.lock().unwrap().sidebar_card_order();
+                            let order = ui.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).sidebar_card_order();
                             click_toggle = order
                                 .get(d.from)
                                 .and_then(|id| crate::config::SIDEBAR_CARDS.iter().find(|(c, _, _)| c == id).copied())
@@ -1520,7 +1633,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
                 }
             }
             if let Some(tidx) = click_toggle {
-                let mut guard = SETTINGS_UI.lock().unwrap();
+                let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     sui.0.handle_action(&SAction::Toggle(tidx));
                 }
@@ -1536,7 +1649,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_CAPTURECHANGED => {
-            let mut guard = SETTINGS_UI.lock().unwrap();
+            let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 if sui.0.sb_drag.take().is_some() {
                     sui.0.redraw();
@@ -1552,7 +1665,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_APP_ICS_DONE => {
-            let mut guard = SETTINGS_UI.lock().unwrap();
+            let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 ui.refreshing = false;
@@ -1590,7 +1703,7 @@ fn rect_hit(x: f32, y: f32, r: &gdi::RectF) -> bool {
 /// 待聚焦城市（添加后）已在数据中时切到其 tab 并清除挂起标记
 fn apply_pending_city(f: &mut ForecastUi) {
     let Some(id) = f.pending_city.clone() else { return };
-    let pos = f.st.weather.lock().unwrap().iter().position(|c| c.station == id);
+    let pos = f.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|c| c.station == id);
     if let Some(i) = pos {
         f.active = i;
         f.pending_city = None;
@@ -1599,8 +1712,11 @@ fn apply_pending_city(f: &mut ForecastUi) {
 
 /// 面板高度与选中城市的预警状态同步（切 tab / 删城市后调用）
 fn forecast_sync_height(f: &mut ForecastUi) {
-    let cities = f.st.weather.lock().unwrap().clone();
-    let want = cities.get(f.active).map(fc_height_for).unwrap_or(FC_H);
+    // 高度计算只需要选中城市：锁内直接借用，不克隆全部城市
+    let want = {
+        let cities = f.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cities.get(f.active).map(fc_height_for).unwrap_or(FC_H)
+    };
     if (f.h - want).abs() > f32::EPSILON {
         f.h = want;
         unsafe {
@@ -1623,14 +1739,15 @@ fn forecast_sync_height(f: &mut ForecastUi) {
 /// 删除自定义城市：配置、运行数据、缓存与选中项同步（idx 为城市下标，>=1）
 fn forecast_remove_city(f: &mut ForecastUi, idx: usize) {
     {
-        let mut cfg = f.st.config.lock().unwrap();
+        let mut cfg = f.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if idx > 0 && idx - 1 < cfg.wx_cities.len() {
             cfg.wx_cities.remove(idx - 1);
             cfg.save();
         }
     }
     {
-        let mut v = f.st.weather.lock().unwrap();
+        let mut v = f.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let v = Arc::make_mut(&mut *v);
         if idx < v.len() {
             v.remove(idx);
         }
@@ -1695,6 +1812,23 @@ fn forecast_close_rect() -> gdi::RectF {
 pub fn forecast_visible() -> bool {
     let h = FORECAST_HWND.load(Ordering::Relaxed);
     h != 0 && unsafe { IsWindowVisible(h as HWND) != 0 }
+}
+
+/// “更新中…”5 秒窗口是否刚到期：到期后补一次重绘把链接文案换回“更新”（并清
+/// 状态，只补画一次）。天气数据本身每小时才更新，新数据到达由天气线程直接
+/// forecast_redraw，悬停/点击由面板自身消息触发——定时器不再无条件驱动重绘。
+fn forecast_refresh_expired() -> bool {
+    let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.as_mut() {
+        Some(f) => match f.0.refreshing {
+            Some(t) if t.elapsed() >= std::time::Duration::from_secs(5) => {
+                f.0.refreshing = None;
+                true
+            }
+            _ => false,
+        },
+        None => false,
+    }
 }
 
 pub fn create_forecast_window(st: SharedState) {
@@ -1770,19 +1904,28 @@ pub fn create_forecast_window(st: SharedState) {
             fui.redraw();
             gdi::free_dib(&mut fui.mem_dc, &mut fui.hbmp, &mut fui.bmp, &mut fui.g, &mut fui.scan0);
         }
-        FORECAST_UI.lock().unwrap().replace(SendFc(fui));
+        FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendFc(fui));
     }
 }
 
 /// 悬停天气热区：在主面板左侧弹出面板（放不下时改到右侧）
 pub fn forecast_open(main_hwnd: usize) {
     unsafe {
-        let mut guard = FORECAST_UI.lock().unwrap();
+        let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
+        // 已显示：只做待聚焦城市切换与 tab 越界钳制后早退。悬停天气热区期间每条
+        // MOUSEMOVE 都会进到这里，不能每次都克隆整个城市天气列表（含 7 天+预警）。
+        if IsWindowVisible(f.hwnd as HWND) != 0 {
+            apply_pending_city(f);
+            if f.active >= f.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() {
+                f.active = 0;
+            }
+            return;
+        }
         // 添加城市后若其数据已就绪，直接切到该城市 tab
         apply_pending_city(f);
-        let cities = f.st.weather.lock().unwrap().clone();
+        let cities = f.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         if cities.is_empty() || cities.iter().all(|c| c.days.is_empty()) {
             return;
         }
@@ -1791,9 +1934,6 @@ pub fn forecast_open(main_hwnd: usize) {
         }
         let w = cities[f.active].clone();
         let fh = f.hwnd as HWND;
-        if IsWindowVisible(fh) != 0 {
-            return;
-        }
         // 面板高度随预警有无变化：更新目标高度并按需重建绘制位图
         let want_h = fc_height_for(&w);
         if (f.h - want_h).abs() > f32::EPSILON {
@@ -1853,7 +1993,7 @@ pub fn forecast_close() {
             ShowWindow(h as HWND, SW_HIDE);
         }
         // 释放后台位图压缩内存（下次 forecast_open 重绘时重建）
-        let mut guard = FORECAST_UI.lock().unwrap();
+        let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(f) = guard.as_mut() {
             let ui = &mut f.0;
             // 下次打开默认回到定位城市 tab（添加城市后由 pending_city 覆盖）
@@ -1869,7 +2009,7 @@ pub fn forecast_close() {
 /// 添加城市成功后聚焦其 tab：数据已就绪则立即切换并重绘，
 /// 尚未拉到时挂起（下次打开或数据到达重绘时生效）
 pub fn forecast_focus_city(station: &str) {
-    let mut guard = FORECAST_UI.lock().unwrap();
+    let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         let f = &mut f.0;
         f.pending_city = Some(station.to_string());
@@ -1921,7 +2061,7 @@ pub fn foreground_is_own() -> bool {
 
 /// 重绘主面板（日程保存后刷新日程页）
 pub fn flyout_repaint() {
-    let mut guard = UI.lock().unwrap();
+    let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sui) = guard.as_mut() {
         if sui.0.shown {
             sui.0.redraw();
@@ -1929,10 +2069,21 @@ pub fn flyout_repaint() {
     }
 }
 
+/// 供后台线程（toast / 通知激活分发）请求重绘：投递到主线程消息循环执行，
+/// 避免跨线程持 UI 锁直接绘制
+pub fn post_repaint() {
+    let h = FLYOUT_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            PostMessageW(h as HWND, WM_APP_REPAINT, 0, 0);
+        }
+    }
+}
+
 /// 设置窗口可见时重绘（主题切换 / 字号变化等全局外观事件）
 pub fn settings_repaint_if_visible() {
     if settings_visible() {
-        let mut guard = SETTINGS_UI.lock().unwrap();
+        let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sui) = guard.as_mut() {
             sui.0.redraw();
         }
@@ -1940,7 +2091,7 @@ pub fn settings_repaint_if_visible() {
 }
 
 pub fn forecast_redraw() {
-    let mut guard = FORECAST_UI.lock().unwrap();
+    let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         f.0.redraw();
     }
@@ -2013,7 +2164,7 @@ impl ForecastUi {
         // 面板底（无边框、无阴影环，窗口即面板；高度随预警有无由 fc_height_for 决定）
         p.fill_round(0.0, 0.0, FC_W, p.h, 12.0, POPUP_BG());
 
-        let cities = self.st.weather.lock().unwrap().clone();
+        let cities = self.st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         if cities.is_empty() {
             return;
         }
@@ -2201,7 +2352,7 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         // 点击面板不改变激活状态：主面板不会因失焦隐藏，点击消息正常送达本面板
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_MOUSEMOVE => {
-            let mut guard = FORECAST_UI.lock().unwrap();
+            let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -2245,7 +2396,7 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_MOUSEHOVER => {
-            let mut guard = FORECAST_UI.lock().unwrap();
+            let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 if f.0.del_hover.is_some() && !crate::tooltip::visible() {
                     let mut pt = POINT { x: 0, y: 0 };
@@ -2256,7 +2407,7 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = FORECAST_UI.lock().unwrap();
+            let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 let dirty = f.link_hover
@@ -2279,7 +2430,7 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         WM_LBUTTONDOWN => {
             let mut want_close = false;
             {
-                let mut guard = FORECAST_UI.lock().unwrap();
+                let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(f) = guard.as_mut() {
                     let f = &mut f.0;
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / f.sf;
@@ -2419,6 +2570,7 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             copy_src: None,
             multi: None,
             month_pick: None,
+            month_cache: None,
             tick: 0,
             last_second: 0,
             idle_timer: false,
@@ -2439,9 +2591,9 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
         }
         // 后台位图不再启动时常驻：显示时 perform_show→redraw 惰性分配，隐藏即释放。
         // 初始绘制仅服务于 CAL_DUMP 首帧转储（转储完成立即释放）
-        UI.lock().unwrap().replace(SendUi(ui));
+        UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendUi(ui));
         {
-            let mut guard = UI.lock().unwrap();
+            let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 if !sui.0.dump_path.is_empty() {
                     sui.0.redraw();
@@ -2558,8 +2710,8 @@ fn perform_show(hwnd: HWND) {
     // 副屏缩放不同或系统缩放改动后首次弹出，先全局重摆再定位
     if !gdi::scale_overridden() && !RESCALING.load(Ordering::Relaxed) {
         let clock: Option<crate::overlay::ClockInfo> = {
-            let guard = UI.lock().unwrap();
-            let c = guard.as_ref().unwrap().0.st.clock.lock().unwrap().clone();
+            let guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let c = guard.as_ref().unwrap().0.st.clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             c
         };
         if let Some(cr) = clock.as_ref() {
@@ -2578,9 +2730,9 @@ fn perform_show(hwnd: HWND) {
         }
     }
     let p = {
-        let guard = UI.lock().unwrap();
+        let guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let ui = &guard.as_ref().unwrap().0;
-        let clock = ui.st.clock.lock().unwrap().clone();
+        let clock = ui.st.clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         position_for(clock.as_ref(), ui.sf, ui.w as i32, ui.h as i32)
     };
     let (w, h) = (gdi::phys(WIN_W) as i32, gdi::phys(WIN_H) as i32);
@@ -2588,13 +2740,12 @@ fn perform_show(hwnd: HWND) {
         SetWindowPos(hwnd, HWND_TOPMOST, gdi::phys(p.x as f32) as i32, gdi::phys(p.y as f32) as i32, w, h, SWP_NOACTIVATE);
     }
     let fade = crate::config::fade_anim_on();
-    let mut guard = UI.lock().unwrap();
+    let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sui) = guard.as_mut() {
         let ui = &mut sui.0;
         ui.flush_right = p.flush_right;
         ui.flush_bottom = p.flush_bottom;
         ui.shown = true;
-        SHOWN_FLAG.store(1, Ordering::Relaxed);
         if fade {
             // 先合成全亮表面并压暗，显示后分步渐亮（避免先闪一帧全亮）
             ui.redraw();
@@ -2616,7 +2767,7 @@ fn perform_show(hwnd: HWND) {
 fn perform_hide(hwnd: HWND) {
     let was_shown;
     {
-        let mut guard = UI.lock().unwrap();
+        let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match guard.as_mut() {
             Some(sui) => {
                 was_shown = sui.0.shown;
@@ -2641,7 +2792,6 @@ fn perform_hide(hwnd: HWND) {
         crate::sidebar::sidebar_hide();
     }
     // 设置窗口保持打开，只由其"确定/✕"按钮关闭
-    SHOWN_FLAG.store(0, Ordering::Relaxed);
     crate::trim_working_set();
 }
 
@@ -2668,7 +2818,7 @@ fn poll_scale_change() {
     }
     // 可见时以弹窗所在屏为准（副屏缩放独立变化也能跟随），隐藏时以主屏为准
     let now = {
-        let guard = UI.lock().unwrap();
+        let guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match guard.as_ref() {
             Some(sui) if sui.0.shown => {
                 let mut r: RECT = unsafe { std::mem::zeroed() };
@@ -2693,7 +2843,7 @@ fn rescale_all(sf: f32) {
     // 主面板：命中区域与位图都按新 sf 重建；显示中 → 立即按新 sf 重摆重绘
     let shown;
     {
-        let mut guard = UI.lock().unwrap();
+        let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sui) = guard.as_mut() {
             let ui = &mut sui.0;
             ui.sf = sf;
@@ -2713,7 +2863,7 @@ fn rescale_all(sf: f32) {
     // 设置窗口：可见 → 原地重设尺寸并重绘；不可见 → 仅更新 sf（位图已释放）
     let settings_vis = settings_visible();
     {
-        let mut guard = SETTINGS_UI.lock().unwrap();
+        let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sui) = guard.as_mut() {
             let ui = &mut sui.0;
             ui.sf = sf;
@@ -2839,11 +2989,11 @@ impl Ui {
             dc: self.mem_dc,
             scan0: self.scan0,
         };
-        let cfg = self.st.config.lock().unwrap().clone();
+        let hour12 = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hour12;
         let now = Local::now();
         let left = 24.0; // panel_x0(10) + pad(14)
         p.fill_rect(left - 6.0, 18.0, 344.0, 60.0, BG());
-        let clock_str = if cfg.hour12 {
+        let clock_str = if hour12 {
             let (pm, h12) = now.hour12();
             format!(
                 "{} {:02}:{:02}:{:02}",
@@ -2856,6 +3006,41 @@ impl Ui {
             format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second())
         };
         p.text(&clock_str, left, 22.0, 320.0, 52.0, gdi::HALIGN_NEAR, gdi::HALIGN_NEAR, 40.0, true, false, TXT());
+        self.ulw();
+    }
+
+    /// 日程页 500ms 光标闪烁的局部重绘：仅擦写底部工具条区域（含类型下拉展开）
+    /// 后重画 + ULW，跳过 30 天日程解析与整窗重绘（列表/头部像素不变）。
+    /// 擦写范围避开面板底部左右圆角（x ≥ 24、y 上界 WIN_H-30）。
+    fn redraw_input(&mut self) {
+        if self.bmp.is_null() || self.g.is_null() || self.page != Page::Agenda {
+            self.redraw();
+            return;
+        }
+        let cache_ptr: *const Cache = &self.cache;
+        let g = self.g;
+        unsafe {
+            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
+            GdipSetTextRenderingHint(g, gdi::text_hint());
+        }
+        let p = Painter {
+            g,
+            cache: cache_ptr,
+            sf: self.sf,
+            w: self.w,
+            h: self.h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
+        };
+        // 覆盖“滚轮查看更多”提示带 / 输入条 / 添加按钮 / 下拉向上展开区
+        p.fill_rect(24.0, WIN_H - 148.0, WIN_W - 14.0 - 24.0, 118.0, BG());
+        // 命中区域几何与整窗重绘时一致，丢弃本次生成的 regions 即可
+        let mut regions = Vec::new();
+        if self.multi.is_some() {
+            self.paint_multi_bar(&p, &mut regions);
+        } else {
+            self.paint_agenda_bottom(&p, &mut regions);
+        }
         self.ulw();
     }
 
@@ -2930,10 +3115,10 @@ impl Ui {
         self.hover.map(|h| h == *a).unwrap_or(false)
     }
 
-    fn paint_calendar(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
+    fn paint_calendar(&mut self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
         let today = Local::now().date_naive();
         let now = Local::now();
-        let cfg = self.st.config.lock().unwrap().clone();
+        let cfg = CalPrefs::load(&self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         let panel_x0 = 10.0;
         let panel_x1 = WIN_W - 10.0;
         let pad = 14.0;
@@ -2964,17 +3149,26 @@ impl Ui {
         let date_w = p.measure(&date_str, 13.5, false, false).0;
         p.text(&lunar_txt, left + date_w + 8.0, 78.0, 140.0, 20.0, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 13.5, false, false, SUB());
 
-        // 天气（右上角，悬停弹出近一周天气面板）
-        let wx = if cfg.show_weather { self.st.weather.lock().unwrap().first().cloned() } else { None };
-        if let Some(w) = &wx {
-            let can_hover = !w.days.is_empty();
+        // 天气（右上角，悬停弹出近一周天气面板）：锁内只取头部所需 4 个标量，
+        // 不整体克隆 Weather（含 7 天 Vec 与预警列表，悬停移动每次重绘都执行）
+        let wx = if cfg.show_weather {
+            self.st
+                .weather
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first()
+                .map(|w| (w.code, w.temp, !w.days.is_empty(), !w.alarms.is_empty()))
+        } else {
+            None
+        };
+        if let Some((code, temp, can_hover, has_alarm)) = wx {
             if can_hover && self.hovered(&Action::Weather) {
                 p.fill_round(right - 78.0, 32.0, 76.0, 58.0, 8.0, HOVER_BG());
             }
-            draw_weather(p, right - 22.0, 46.0, w.code, 1.0);
-            p.text(&format!("{}°C", w.temp), right - 44.0, 70.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL());
+            draw_weather(p, right - 22.0, 46.0, code, 1.0);
+            p.text(&format!("{}°C", temp), right - 44.0, 70.0, 44.0, 20.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 15.0, false, false, DATE_COL());
             // 有气象预警时图标右上角叠加橙色 ⚠ 角标（悬停面板内有详情横幅）
-            if !w.alarms.is_empty() {
+            if has_alarm {
                 p.text("⚠", right - 26.0, 28.0, 16.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 10.0, false, false, gdi::argb(255, 0xF0, 0x8C, 0x1E));
             }
             if can_hover {
@@ -3045,15 +3239,77 @@ impl Ui {
         let rows = if cfg.show_other_month { 6 } else { rows_min };
         let row_h = (grid_h / rows as f32).max(52.0);
         // 持锁借用代替 clone：重绘每秒发生，避免整表复制把堆撑大
-        let holidays = self.st.holidays.read().unwrap();
-        let agenda = self.agenda.lock().unwrap();
+        let holidays = self.st.holidays.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let agenda = self.agenda.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // 含未完成待办的日期（橙点角标，按天重复的待办展开到可见范围）
-        let todo_keys = crate::sidebar::todo_keys_between(start, start + Duration::days((rows * 7 - 1) as i64));
-        // 按天重复的日程规则：逐格判断角标
-        let recur_rules = crate::events::recur_rules(&agenda);
-        // 跨天日程覆盖的日期（中段/尾段补角标；开始日由原生条目负责）
-        let span_keys = crate::events::agenda_span_keys(&agenda, start, start + Duration::days((rows * 7 - 1) as i64));
+        // 派生角标+次行缓存：数据代次（日程/待办/配置/假期任一变更，见
+        // events::edit_and_save / sidebar::edit_todos / config::save / ics 拉取）
+        // 或视图变化才重建；悬停移动的整窗重绘只做纯绘制。
+        // start 由 年月+每周起始日 推导：改 week_start 设置也会换 start，须入键；
+        // 次行适配字号依赖测宽 → sf 入键
+        let cache_key = (
+            crate::events::agenda_gen(),
+            crate::sidebar::todo_gen(),
+            crate::config::config_gen(),
+            crate::ics::holiday_gen(),
+            self.view_y,
+            self.view_m,
+            rows,
+            start,
+            self.sf,
+        );
+        if self.month_cache.as_ref().map(|c| c.key != cache_key).unwrap_or(true) {
+            let end = start + Duration::days(rows * 7 - 1);
+            // 每日未完成待办条数（橙点角标 + 数量角标，按天重复的待办展开到可见范围）
+            let todo_counts = crate::sidebar::todo_counts_between(start, end);
+            // 按天重复的日程规则：逐格判断角标
+            let recur_rules = crate::events::recur_rules(&agenda);
+            // 跨天日程覆盖的日期（中段/尾段补角标；开始日由原生条目负责）
+            let span_keys = crate::events::agenda_span_keys(&agenda, start, end);
+            // 全表摘要：逐格筛选复用预解析的 start/end（42 格逐格调 agenda_on 每格要
+            // 全表扫描 2~3 遍并反复 chrono 解析）
+            let digests = crate::events::digests(&agenda);
+            let max_sub_w = col_w - 4.0;
+            let mut cells = Vec::with_capacity((rows * 7) as usize);
+            for off in 0..rows * 7 {
+                let date = start + Duration::days(off);
+                let key = crate::ics::key_of_date(date);
+                let hol = holidays.get(&key);
+                let has_agenda = agenda.get(&key).map(|v| !v.is_empty()).unwrap_or(false)
+                    || recur_rules.iter().any(|rule| rule.hits(date))
+                    || span_keys.contains(&key);
+                let (n_agenda, color) = crate::events::agenda_meta_on(&digests, date);
+                // 次行：农历/节日文本 + 折行布局与适配字号（>5 字两行）
+                let (sub, sub_fest) = day_sub(date, hol, cfg.show_lunar);
+                let chars: Vec<char> = sub.chars().collect();
+                let (sub1, sub2, px1, px2) = if chars.is_empty() {
+                    (String::new(), None, 11.0, 11.0)
+                } else if chars.len() <= 5 {
+                    let px = fit_text_px(p, &sub, max_sub_w, 11.0, 10.0);
+                    (sub, None, px, 11.0)
+                } else {
+                    let l1: String = chars[..5].iter().collect();
+                    let l2: String = chars[5..].iter().collect();
+                    let px1 = fit_text_px(p, &l1, max_sub_w, 11.0, 10.0);
+                    let px2 = fit_text_px(p, &l2, max_sub_w, 11.0, 10.0);
+                    (l1, Some(l2), px1, px2)
+                };
+                cells.push(MonthCell {
+                    has_agenda,
+                    n_agenda,
+                    color,
+                    has_todo: todo_counts.contains_key(&key),
+                    n_todo: todo_counts.get(&key).copied().unwrap_or(0),
+                    sub1,
+                    sub2,
+                    px1,
+                    px2,
+                    sub_fest,
+                });
+            }
+            self.month_cache = Some(MonthCache { key: cache_key, cells });
+        }
+        let cells: &[MonthCell] = self.month_cache.as_ref().map(|c| &c.cells[..]).unwrap_or(&[]);
         for r in 0..rows {
             let row_top = grid_y + row_h * r as f32;
             let row_start = start + Duration::days(r * 7);
@@ -3083,17 +3339,11 @@ impl Ui {
                 }
                 let key = crate::ics::key_of_date(date);
                 let hol = holidays.get(&key);
-                let has_agenda = agenda.get(&key).map(|v| !v.is_empty()).unwrap_or(false)
-                    || recur_rules.iter().any(|rule| rule.hits(date))
-                    || span_keys.contains(&key);
-                let has_todo = todo_keys.contains(&key);
-                // 数量角标：日程（含重复/跨天展开）+ 未完成待办；日程点色取当天首个自定义色
-                let day_items = crate::events::agenda_on(&agenda, date);
-                let n_items = day_items.len()
-                    + crate::sidebar::todos_for(&key).iter().filter(|(_, t)| !t.done).count();
-                let agenda_col = day_items.iter().find_map(|(_, _, e)| crate::events::color_of_entry(e)).map(|c| crate::events::entry_color(Some(c)));
+                let mc = &cells[(r * 7 + c) as usize];
+                // 日程点色取当天首个自定义色（数量角标由 paint_day_cell 从 mc 算）
+                let agenda_col = mc.color.map(|c| crate::events::entry_color(Some(c)));
                 Self::hit_add(regions, cx, row_top, col_w, row_h, Action::Cell(date));
-                paint_day_cell(p, self, &rect, date, today, self.selected, in_month, hol, has_agenda, has_todo, n_items, agenda_col, &cfg);
+                paint_day_cell(p, self, &rect, date, today, self.selected, in_month, hol, mc, agenda_col, &cfg);
             }
         }
 
@@ -3113,7 +3363,10 @@ impl Ui {
                         w: col_w,
                         h: row_h,
                     };
-                    let items = crate::events::agenda_on(&agenda, pv);
+                    // 预览为瞬态悬停：只在显示时为该日期重建摘要（缓存里是取出的
+                    // 角标结果，不含借用的摘要数据）
+                    let digests = crate::events::digests(&agenda);
+                    let items = crate::events::agenda_on_digested(&digests, pv);
                     let tds = crate::sidebar::todos_for(&crate::ics::key_of_date(pv));
                     paint_day_preview(p, &cell, pv, &items, &tds);
                 }
@@ -3240,27 +3493,32 @@ impl Ui {
         self.agenda_resolved_dates.clear();
         self.agenda_todos.clear();
         let mut rows: Vec<AgRow> = Vec::new();
-        for off in 0..30i64 {
-            let d = self.agenda_from + Duration::days(off);
-            let items = crate::events::agenda_on(&self.agenda.lock().unwrap(), d);
-            let tds = crate::sidebar::todos_for(&crate::ics::key_of_date(d));
-            if items.is_empty() && tds.is_empty() {
-                continue;
+        {
+            // 摘要一次构建：30 天逐日复用预解析结果（此前每天全表扫描 2~3 遍 + 反复解析）
+            let agenda = self.agenda.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let digests = crate::events::digests(&agenda);
+            for off in 0..30i64 {
+                let d = self.agenda_from + Duration::days(off);
+                let items = crate::events::agenda_on_digested(&digests, d);
+                let tds = crate::sidebar::todos_for(&crate::ics::key_of_date(d));
+                if items.is_empty() && tds.is_empty() {
+                    continue;
+                }
+                rows.push(AgRow::Head(d, d == today));
+                let base = self.agenda_resolved.len();
+                for i in 0..items.len() {
+                    rows.push(AgRow::Agenda(base + i));
+                }
+                self.agenda_resolved.extend(items.iter().cloned());
+                for _ in 0..items.len() {
+                    self.agenda_resolved_dates.push(d);
+                }
+                let base_t = self.agenda_todos.len();
+                for i in 0..tds.len() {
+                    rows.push(AgRow::Todo(base_t + i));
+                }
+                self.agenda_todos.extend(tds.into_iter().map(|(gi, t)| (gi, t, d)));
             }
-            rows.push(AgRow::Head(d, d == today));
-            let base = self.agenda_resolved.len();
-            for i in 0..items.len() {
-                rows.push(AgRow::Agenda(base + i));
-            }
-            self.agenda_resolved.extend(items.iter().cloned());
-            for _ in 0..items.len() {
-                self.agenda_resolved_dates.push(d);
-            }
-            let base_t = self.agenda_todos.len();
-            for i in 0..tds.len() {
-                rows.push(AgRow::Todo(base_t + i));
-            }
-            self.agenda_todos.extend(tds.into_iter().map(|(gi, t)| (gi, t, d)));
         }
         let row_h = 38.0;
         let gap = 6.0;
@@ -3325,6 +3583,38 @@ impl Ui {
             self.paint_multi_bar(p, regions);
             return;
         }
+        self.paint_agenda_bottom(p, regions);
+
+        // 行右键菜单（最后绘制 → 命中最优先）
+        if let Some((kind, idx, mx, my)) = self.row_menu {
+            let mw = 158.0;
+            let ih = 30.0;
+            let mh = ih * 3.0 + 8.0;
+            let x = mx.min(WIN_W - 20.0 - mw);
+            let y = my.min(WIN_H - 66.0 - mh);
+            p.fill_round(x, y, mw, mh, 8.0, POPUP_BG());
+            p.stroke_round(x, y, mw, mh, 8.0, 1.0, BORDER());
+            let tomorrow = Local::now().date_naive() + chrono::Duration::days(1);
+            let items: [(Action, &str); 3] = [
+                (Action::RowCopyTo(kind, idx, Some(tomorrow)), "复制到明天"),
+                (Action::RowCopyTo(kind, idx, None), "复制到指定日期…"),
+                (Action::RowMulti, "多选"),
+            ];
+            for (i, (act, label)) in items.iter().enumerate() {
+                let oy = y + 4.0 + ih * i as f32;
+                Self::hit_add(regions, x + 1.0, oy, mw - 2.0, ih, *act);
+                let hov = self.hovered(act);
+                if hov {
+                    p.fill_round(x + 2.0, oy, mw - 4.0, ih - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
+                }
+                p.text(label, x + 10.0, oy, mw - 16.0, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
+            }
+        }
+    }
+
+    /// 日程页底部工具条：类型下拉（日程/待办）+ 输入框 + 添加按钮（含下拉展开）。
+    /// 整窗重绘与光标闪烁的局部重绘（redraw_input）共用；多选条由 paint_multi_bar 替代。
+    fn paint_agenda_bottom(&self, p: &Painter, regions: &mut Vec<(gdi::RectF, Action)>) {
         let pill = gdi::RectF { x: 28.0, y: WIN_H - 66.0, w: 78.0, h: 30.0 };
         Self::hit_add(regions, pill.x, pill.y, pill.w, pill.h, Action::KindDropdown);
         let hov = self.hovered(&Action::KindDropdown);
@@ -3394,32 +3684,6 @@ impl Ui {
                 p.text(name, pill.x + 1.0, oy, pill.w - 2.0, opt_h, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 12.0, false, false, if sel { col } else { ROW_TXT() });
             }
         }
-
-        // 行右键菜单（最后绘制 → 命中最优先）
-        if let Some((kind, idx, mx, my)) = self.row_menu {
-            let mw = 158.0;
-            let ih = 30.0;
-            let mh = ih * 3.0 + 8.0;
-            let x = mx.min(WIN_W - 20.0 - mw);
-            let y = my.min(WIN_H - 66.0 - mh);
-            p.fill_round(x, y, mw, mh, 8.0, POPUP_BG());
-            p.stroke_round(x, y, mw, mh, 8.0, 1.0, BORDER());
-            let tomorrow = Local::now().date_naive() + chrono::Duration::days(1);
-            let items: [(Action, &str); 3] = [
-                (Action::RowCopyTo(kind, idx, Some(tomorrow)), "复制到明天"),
-                (Action::RowCopyTo(kind, idx, None), "复制到指定日期…"),
-                (Action::RowMulti, "多选"),
-            ];
-            for (i, (act, label)) in items.iter().enumerate() {
-                let oy = y + 4.0 + ih * i as f32;
-                Self::hit_add(regions, x + 1.0, oy, mw - 2.0, ih, *act);
-                let hov = self.hovered(act);
-                if hov {
-                    p.fill_round(x + 2.0, oy, mw - 4.0, ih - 1.0, 6.0, gdi::argb_a(50, crate::theme::pal().blue));
-                }
-                p.text(label, x + 10.0, oy, mw - 16.0, ih, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 12.0, false, false, ROW_TXT());
-            }
-        }
     }
 
     /// 复制条目到目标日期：日程复制为单次（重复属性不带走）；待办平移归属日
@@ -3455,8 +3719,7 @@ impl Ui {
                     }
                 };
                 let key = crate::ics::key_of_date(target);
-                self.agenda.lock().unwrap().entry(key).or_default().push(ne);
-                save_agenda(&self.agenda.lock().unwrap());
+                crate::events::edit_and_save(&self.agenda, |m| m.entry(key).or_default().push(ne));
                 done = true;
             }
         } else if let Some((_, td, _)) = self.todo_row(idx) {
@@ -3542,18 +3805,15 @@ impl Ui {
         if delete {
             // 日程：同 key 按下标降序删（避免位移），保留原快照用于一次撤销
             ag_del.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-            let mut removed = 0usize;
-            {
-                let mut m = self.agenda.lock().unwrap();
+            let removed = crate::events::edit_and_save(&self.agenda, |m| {
+                let mut removed = 0usize;
                 for (key, idx, _) in &ag_del {
-                    if crate::events::agenda_remove_at(&mut m, key, *idx) {
+                    if crate::events::agenda_remove_at(m, key, *idx) {
                         removed += 1;
                     }
                 }
-            }
-            if removed > 0 {
-                save_agenda(&self.agenda.lock().unwrap());
-            }
+                removed
+            });
             res.todo_deletes.sort_by_key(|(gi, _)| std::cmp::Reverse(*gi));
             let mut items: Vec<crate::toast::UndoData> = ag_del
                 .iter()
@@ -3569,9 +3829,8 @@ impl Ui {
             }
         } else {
             ag_moves.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-            let mut moved = 0usize;
-            {
-                let mut m = self.agenda.lock().unwrap();
+            let moved = crate::events::edit_and_save(&self.agenda, |m| {
+                let mut moved = 0usize;
                 for (key, idx, nd) in &ag_moves {
                     if let Some(v) = m.get_mut(key.as_str()) {
                         if *idx < v.len() {
@@ -3586,10 +3845,8 @@ impl Ui {
                         }
                     }
                 }
-            }
-            if moved > 0 {
-                save_agenda(&self.agenda.lock().unwrap());
-            }
+                moved
+            });
             let n = moved + res.todo_updates.len();
             res.hint = if skipped > 0 {
                 format!("已顺延 {} 项，{} 项重复条目已跳过", n, skipped)
@@ -3676,26 +3933,19 @@ impl Ui {
 }
 
 /// 圆圈几何：包住数字与次行农历/节日文本（宽度按次行扩展，最大不超格子）。
-/// 今天/选中/悬停三种圆圈共用，保证形状一致。
-fn circle_geo(p: &Painter, rect: &gdi::RectF, sub: &str) -> (f32, f32) {
+/// 今天/选中/悬停三种圆圈共用，保证形状一致。次行文本取月历缓存的布局结果。
+fn circle_geo(p: &Painter, rect: &gdi::RectF, l1: &str, l2: Option<&str>) -> (f32, f32) {
     let num_cy = rect.y + rect.h * 0.30;
     let line1_cy = rect.y + rect.h * 0.64;
     let line2_cy = line1_cy + 14.0;
     let (top, mut bottom, mut w_half): (f32, f32, f32) = (num_cy - 18.0, num_cy + 18.0, 18.0);
-    let chars: Vec<char> = sub.chars().collect();
-    if !chars.is_empty() {
+    if !l1.is_empty() {
         bottom = line1_cy + 9.0;
-        let l1: String = if chars.len() <= 5 {
-            sub.to_string()
-        } else {
-            chars[..5].iter().collect()
-        };
-        if chars.len() > 5 {
-            let l2: String = chars[5..].iter().collect();
+        if let Some(l2) = l2 {
             bottom = line2_cy + 9.0;
-            w_half = w_half.max(p.measure(&l2, 11.0, false, false).0 / 2.0 + 9.0);
+            w_half = w_half.max(p.measure(l2, 11.0, false, false).0 / 2.0 + 9.0);
         }
-        w_half = w_half.max(p.measure(&l1, 11.0, false, false).0 / 2.0 + 9.0);
+        w_half = w_half.max(p.measure(l1, 11.0, false, false).0 / 2.0 + 9.0);
     }
     let cy = (top + bottom) / 2.0;
     let r = ((bottom - top) / 2.0 + 4.0).max(w_half).min(rect.w / 2.0 - 1.0);
@@ -3711,11 +3961,9 @@ fn paint_day_cell(
     selected: NaiveDate,
     in_month: bool,
     hol: Option<&DayInfo>,
-    has_agenda: bool,
-    has_todo: bool,
-    n_items: usize,
+    mc: &MonthCell,
     agenda_col: Option<u32>,
-    cfg: &Config,
+    cfg: &CalPrefs,
 ) {
     let cx = rect.x + rect.w / 2.0;
     let num_cy = rect.y + rect.h * 0.30;
@@ -3733,73 +3981,36 @@ fn paint_day_cell(
     }
     let num = date.day().to_string();
 
-    // 次行内容（先计算：今天的圆圈要把农历/节日一并圈住）
-    let mut sub = String::new();
-    let mut sub_col = SUB();
-    if cfg.show_lunar {
-        let l = lunar::solar_to_lunar(date);
-        let lf = l.as_ref().and_then(lunar::lunar_festival);
-        let sfest = lunar::solar_festival(date);
-        let term = lunar::jieqi_of(date);
-        let legal = hol
-            .filter(|h| h.ty == DayType::Xiu)
-            .map(|h| h.name.as_str());
-
-        let (s, c) = if let Some((n, k)) = lf {
-            (n.to_string(), fest_color(k))
-        } else if let Some(n) = legal {
-            (n.to_string(), FEST_BLUE())
-        } else if let Some((n, k)) = sfest {
-            (n.to_string(), fest_color(k))
-        } else if let Some(t) = term {
-            (t.to_string(), FEST_BLUE())
-        } else if let Some(l) = l {
-            let txt = if l.day == 1 {
-                format!("{}月", lunar::month_cn(l.month))
-            } else {
-                lunar::day_cn(l.day).to_string()
-            };
-            (txt, if in_month { SUB() } else { SUB_DIM() })
-        } else {
-            (String::new(), SUB())
-        };
-        sub = s;
-        sub_col = c;
-    }
-
     // 悬停：半透明圆圈垫底（选中/今天的格子悬停时同样有效）；
     // 今天：大蓝圈包住数字与次行；选中：同形状的空心蓝环
     if hovered && in_month {
-        let (cy, r) = circle_geo(p, rect, &sub);
+        let (cy, r) = circle_geo(p, rect, &mc.sub1, mc.sub2.as_deref());
         p.fill_circle(cx, cy, r, CELL_HOVER());
     }
     if is_today {
-        let (cy, r) = circle_geo(p, rect, &sub);
+        let (cy, r) = circle_geo(p, rect, &mc.sub1, mc.sub2.as_deref());
         p.fill_circle(cx, cy, r, BLUE());
     } else if is_selected {
-        let (cy, r) = circle_geo(p, rect, &sub);
+        let (cy, r) = circle_geo(p, rect, &mc.sub1, mc.sub2.as_deref());
         p.stroke_circle(cx, cy, r - 2.25, 4.5, BLUE());
     }
     p.text(&num, cx - 22.0, num_cy - 16.0, 44.0, 32.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, 18.0, true, false, if is_today { WHITE } else { num_col });
 
-    // 次行：农历/节日/节气
-    if !sub.is_empty() {
-        let chars: Vec<char> = sub.chars().collect();
-        let max_w = rect.w - 4.0;
+    // 次行：农历/节日/节气（文本与适配字号来自月历缓存；>5 字两行）
+    if !mc.sub1.is_empty() {
         // 今天圆圈为蓝色，次行用白色保证可读
-        let col = if is_today { WHITE } else { sub_col };
-        if chars.len() <= 5 {
-            // 5 字内自适应缩小字号完整显示（如“烈士纪念日”）
-            let px = fit_text_px(p, &sub, max_w, 11.0, 10.0);
-            p.text(&sub, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px, false, false, col);
+        let col = if is_today {
+            WHITE
+        } else if mc.sub_fest {
+            FEST_BLUE()
+        } else if in_month {
+            SUB()
         } else {
-            // 超过 5 字换行：第一行 5 字，其余第二行
-            let line1: String = chars[..5].iter().collect();
-            let line2: String = chars[5..].iter().collect();
-            let px1 = fit_text_px(p, &line1, max_w, 11.0, 10.0);
-            p.text(&line1, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px1, false, false, col);
-            let px2 = fit_text_px(p, &line2, max_w, 11.0, 10.0);
-            p.text(&line2, rect.x + 1.0, line2_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, px2, false, false, col);
+            SUB_DIM()
+        };
+        p.text(&mc.sub1, rect.x + 1.0, line1_cy - 8.0, rect.w - 2.0, 16.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, mc.px1, false, false, col);
+        if let Some(l2) = &mc.sub2 {
+            p.text(l2, rect.x + 1.0, line2_cy - 8.0, rect.w - 2.0, 15.0, gdi::HALIGN_CENTER, gdi::HALIGN_CENTER, mc.px2, false, false, col);
         }
     }
 
@@ -3815,19 +4026,20 @@ fn paint_day_cell(
         }
     }
 
-    if has_agenda {
+    if mc.has_agenda {
         p.fill_circle(rect.x + 7.0, rect.y + 7.0, 2.0, agenda_col.unwrap_or_else(BLUE));
     }
     // 待办角标：橙点（与日程蓝点并排）
-    if has_todo {
-        let x = if has_agenda { rect.x + 14.0 } else { rect.x + 7.0 };
+    if mc.has_todo {
+        let x = if mc.has_agenda { rect.x + 14.0 } else { rect.x + 7.0 };
         p.fill_circle(x, rect.y + 7.0, 2.0, TODO_ORANGE());
     }
     // 数量角标：日程+待办超过 2 条时在点右侧显示总数
+    let n_items = mc.n_agenda + mc.n_todo;
     if n_items > 2 {
-        let dx = if has_agenda && has_todo {
+        let dx = if mc.has_agenda && mc.has_todo {
             rect.x + 19.0
-        } else if has_agenda || has_todo {
+        } else if mc.has_agenda || mc.has_todo {
             rect.x + 12.0
         } else {
             rect.x + 7.0
@@ -3934,11 +4146,6 @@ fn paint_day_preview(
     }
 }
 
-/// 节日名称统一鲜艳蓝色（不再区分红/蓝）
-fn fest_color(_k: FestKind) -> u32 {
-    FEST_BLUE()
-}
-
 fn draw_weather(p: &Painter, cx: f32, cy: f32, code: u32, sc: f32) {
     match code {
         0 => draw_sun(p, cx, cy, sc),
@@ -4035,10 +4242,6 @@ fn save_bmp(scan0: *const u8, w: i32, h: i32, path: &str) {
 
 pub fn load_agenda() -> crate::events::AgendaMap {
     crate::events::load()
-}
-
-fn save_agenda(map: &crate::events::AgendaMap) {
-    crate::events::save(map);
 }
 
 // ================= 交互 =================
@@ -4299,11 +4502,10 @@ impl Ui {
                         crate::recur_menu::open(pt.x, pt.y, crate::recur_menu::RmTarget::Agenda { key, idx, date: view_date });
                     } else {
                         let body = crate::events::display(&entry);
-                        let mut a = self.agenda.lock().unwrap();
-                        let removed = crate::events::agenda_remove_at(&mut a, &key, idx);
-                        drop(a);
+                        let removed = crate::events::edit_and_save(&self.agenda, |m| {
+                            crate::events::agenda_remove_at(m, &key, idx)
+                        });
                         if removed {
-                            save_agenda(&self.agenda.lock().unwrap());
                             crate::toast::notify_undo(crate::toast::UndoData::Agenda { key, idx, entry }, &body);
                         }
                         crate::sidebar::sidebar_repaint();
@@ -4438,8 +4640,7 @@ impl Ui {
             };
             if let Some(entry) = entry {
                 let key = crate::ics::key_of_date(day);
-                self.agenda.lock().unwrap().entry(key).or_default().push(entry);
-                save_agenda(&self.agenda.lock().unwrap());
+                crate::events::edit_and_save(&self.agenda, |m| m.entry(key).or_default().push(entry));
                 crate::sidebar::sidebar_repaint();
                 self.draft.clear();
                 self.comp.clear();
@@ -4476,8 +4677,7 @@ impl Ui {
             self.set_hint("未识别日期/时间，已添加到今天的待办", true);
         } else {
             let key = crate::ics::key_of_date(base);
-            self.agenda.lock().unwrap().entry(key).or_default().push(crate::events::AgendaEntry::Legacy(text));
-            save_agenda(&self.agenda.lock().unwrap());
+            crate::events::edit_and_save(&self.agenda, |m| m.entry(key).or_default().push(crate::events::AgendaEntry::Legacy(text)));
             crate::sidebar::sidebar_repaint();
             self.set_hint("未识别日期/时间，已存为今日纯文本日程", true);
         }
@@ -4555,7 +4755,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut new_interval: u32 = 250;
             let mut fc_repaint = false;
             {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     ui.tick += 1;
@@ -4563,14 +4763,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         match id.as_str() {
                             "show" => want_show = true,
                             "autostart" => {
-                                let on = ui.st.config.lock().unwrap().autostart;
+                                let on = ui.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).autostart;
                                 {
-                                    let mut cfg = ui.st.config.lock().unwrap();
+                                    let mut cfg = ui.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     cfg.autostart = !on;
                                     cfg.save();
                                 }
                                 apply_autostart(!on);
-                                if let Some(t) = ui.tray.lock().unwrap().as_ref() {
+                                if let Some(t) = ui.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
                                     t.autostart_item.set_checked(!on);
                                 }
                             }
@@ -4609,20 +4809,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 ui.hint.clear();
                                 ui.hint_until = None;
                             }
-                            ui.redraw();
+                            // 局部重绘输入条（仅光标/提示变化，无需 30 天全量重算）
+                            ui.redraw_input();
                         }
-                        // 近一周天气面板：随秒重绘（每小时更新的数据及时反映）
-                        if forecast_visible() {
+                        // 近一周天气面板：仅“更新中…”5 秒窗口到期时补一次重绘
+                        //（数据到达由天气线程直接 forecast_redraw，悬停/点击由面板消息各自触发）
+                        if forecast_visible() && forecast_refresh_expired() {
                             fc_repaint = true;
                         }
                     } else if !settings_visible() {
-                        // 空闲防涨：回到空闲立即修剪，之后每 10 秒一次
+                        // 空闲防涨：回到空闲立即修剪；之后低频兜底（高频修剪-
+                        // 换页互相打架反而制造 page churn，与 uia_clock 的降频扫描冲突）
                         if !ui.idle_timer {
                             ui.idle_timer = true;
                             idle_retune = true;
                             new_interval = 500;
                             crate::trim_working_set();
-                        } else if ui.tick % 40 == 0 {
+                        } else if ui.tick % 1200 == 0 {
                             crate::trim_working_set();
                         }
                         // 空闲时降低定时器频率，减少代码页回填
@@ -4655,7 +4858,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_RBUTTONDOWN => {
             // 右键日期格：打开“新增日程 / 新增待办”菜单
             let hit = {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     if ui.shown {
@@ -4677,7 +4880,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             } else {
                 // 日程页行右键：行菜单（复制/多选）
                 {
-                    let mut guard = UI.lock().unwrap();
+                    let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(sui) = guard.as_mut() {
                         let ui = &mut sui.0;
                         if ui.shown && ui.page == Page::Agenda {
@@ -4709,7 +4912,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_LBUTTONDOWN => {
             let mut hit: Option<Action> = None;
             {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     let x = ((lp & 0xFFFF) as u16 as i16) as f32 / ui.sf;
@@ -4772,7 +4975,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let mut open_input_todo: Option<NaiveDate> = None;
                 let mut todo_at: (i32, i32) = (0, 0);
                 {
-                    let mut guard = UI.lock().unwrap();
+                    let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(sui) = guard.as_mut() {
                         let ui = &mut sui.0;
                         // 系统双击判定：间隔 < GetDoubleClickTime 且落在双击矩形内，且是同一格
@@ -4873,7 +5076,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     if let Some(u) = res.undo {
                         crate::toast::notify_undo(u, &res.hint);
                     } else if !res.hint.is_empty() {
-                        let mut guard = UI.lock().unwrap();
+                        let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         if let Some(sui) = guard.as_mut() {
                             sui.0.set_hint(&res.hint, false);
                             sui.0.redraw();
@@ -4942,7 +5145,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_MOUSEMOVE => {
             let mut fc_open = false;
             {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     if ui.shown {
@@ -5058,7 +5261,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_MOUSELEAVE => {
             let mut repaint = false;
             {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     if ui.hover.is_some() || ui.preview.is_some() || ui.hover_cell.is_some() {
@@ -5081,7 +5284,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_KEYDOWN => {
             let mut hide = false;
             {
-                let mut guard = UI.lock().unwrap();
+                let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
                     let ui = &mut sui.0;
                     let shift = (GetKeyState(0x10) as u16) & 0x8000 != 0;
@@ -5263,7 +5466,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_CHAR => {
-            let mut guard = UI.lock().unwrap();
+            let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 if ui.page == Page::Agenda && (wp as u32) >= 0x20 {
@@ -5278,7 +5481,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_IME_COMPOSITION => {
-            let mut guard = UI.lock().unwrap();
+            let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 if ui.page == Page::Agenda {
@@ -5300,7 +5503,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         WM_MOUSEWHEEL => {
             // 滚轮：月历翻月，日程页滚动列表
             let delta = ((wp as usize) >> 16) as u16 as i16;
-            let mut guard = UI.lock().unwrap();
+            let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
                 let ui = &mut sui.0;
                 if ui.shown && delta != 0 {
@@ -5344,7 +5547,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             // 只有点击发生在软件相关窗口之外才关闭日历
             if low == 0 && !settings_visible() && !cursor_on_own_popup() && !crate::inputbox::visible() {
                 let hide = {
-                    let mut guard = UI.lock().unwrap();
+                    let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let mut hide = false;
                     if let Some(sui) = guard.as_mut() {
                         let ui = &mut sui.0;
@@ -5361,7 +5564,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     forecast_close();
                     crate::sidebar::sidebar_hide();
                     // 设置窗口保持打开：只由其"确定/✕"按钮关闭
-                    SHOWN_FLAG.store(0, Ordering::Relaxed);
                     crate::trim_working_set();
                 }
             }
@@ -5369,7 +5571,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_APP_TOGGLE => {
             let shown = {
-                let guard = UI.lock().unwrap();
+                let guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.as_ref().map(|s| s.0.shown).unwrap_or(false)
             };
             if shown {
@@ -5381,6 +5583,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_APP_SHOW => {
             perform_show(hwnd);
+            0
+        }
+        WM_APP_REPAINT => {
+            flyout_repaint();
             0
         }
         WM_CLOSE => {
@@ -5429,8 +5635,10 @@ unsafe fn paste_clipboard(ui: &mut Ui) {
     if !h.is_null() {
         let ptr = GlobalLock(h as usize);
         if !ptr.is_null() {
+            // 扫 NUL 终止符以分配大小为上界：异常数据（无终止符）时不越界读
+            let cap = GlobalSize(h as usize) / 2;
             let mut len = 0usize;
-            while *ptr.add(len) != 0 {
+            while len < cap && *ptr.add(len) != 0 {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -5448,5 +5656,6 @@ unsafe fn paste_clipboard(ui: &mut Ui) {
 #[link(name = "kernel32")]
 extern "system" {
     fn GlobalLock(h: usize) -> *mut u16;
+    fn GlobalSize(h: usize) -> usize;
     fn GlobalUnlock(h: usize) -> i32;
 }

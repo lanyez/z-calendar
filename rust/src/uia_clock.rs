@@ -12,7 +12,7 @@
 //! 声明：只按虚表槽位调用 ElementFromHandle / CreatePropertyCondition /
 //! CreateTrueCondition / FindAll / GetCurrentPropertyValue，槽位序号与头文件一致。
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use winapi::ctypes::c_void;
@@ -273,6 +273,9 @@ static UIA_L: AtomicI32 = AtomicI32::new(0);
 static UIA_T: AtomicI32 = AtomicI32::new(0);
 static UIA_R: AtomicI32 = AtomicI32::new(0);
 static UIA_B: AtomicI32 = AtomicI32::new(0);
+/// 4 坐标写入的 seqlock 版本号：奇=写入中，偶=稳定。读者撞上写一半时重读，
+/// 保证拼出的矩形 4 边来自同一轮定位（4 个独立原子量的非原子组会撕出"左新右旧"）
+static UIA_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// overlay 线程每秒读取：UIA 最近一次定位到的时钟矩形（屏幕坐标；进程未声明
 /// DPI 感知，与 GetWindowRect 返回的坐标系同为虚拟化坐标，二者可直接混用）
@@ -280,12 +283,22 @@ pub fn snapshot_rect() -> Option<RECT> {
     if !UIA_VALID.load(Ordering::Relaxed) {
         return None;
     }
-    Some(RECT {
-        left: UIA_L.load(Ordering::Relaxed),
-        top: UIA_T.load(Ordering::Relaxed),
-        right: UIA_R.load(Ordering::Relaxed),
-        bottom: UIA_B.load(Ordering::Relaxed),
-    })
+    loop {
+        let v1 = UIA_SEQ.load(Ordering::Acquire);
+        if v1 & 1 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let r = RECT {
+            left: UIA_L.load(Ordering::Relaxed),
+            top: UIA_T.load(Ordering::Relaxed),
+            right: UIA_R.load(Ordering::Relaxed),
+            bottom: UIA_B.load(Ordering::Relaxed),
+        };
+        if UIA_SEQ.load(Ordering::Acquire) == v1 {
+            return Some(r);
+        }
+    }
 }
 
 /// 是否 Windows 11 或更新（build ≥ 22000）：任务栏时钟为 XAML 渲染，需要 UIA 定位。
@@ -327,6 +340,9 @@ pub fn spawn() {
         .spawn(|| unsafe {
             let hr = CoInitializeEx(null_mut(), COINIT_MULTITHREADED);
             if hr < 0 && hr != RPC_E_CHANGED_MODE {
+                // Win11 上走到这里意味着 UIA 定位线程整个不工作（时钟只能靠经典
+                // 窗口链，大概率找不到）：必须留痕，否则无从排查
+                crate::log::warn(&format!("UIA: CoInitializeEx 失败 hr={:#010X}，时钟定位线程退出", hr));
                 return;
             }
             let need_uninit = hr == 0 || hr == 1; // S_OK / S_FALSE
@@ -342,12 +358,13 @@ pub fn spawn() {
             ) == 0
                 && !uia.is_null();
             if !ok {
+                crate::log::warn("UIA: CoCreateInstance(CUIAutomation) 失败，时钟定位线程退出");
                 if need_uninit {
                     CoUninitialize();
                 }
                 return;
             }
-            let mut st = ScanState { buttons_only: true, button_misses: 0, fails: 5 };
+            let mut st = ScanState { buttons_only: true, button_misses: 0, fulltree_runs: 0, fails: 5 };
             // 空闲内存防涨：UIA 跨进程扫描每轮都会把 COM/UIA 代码页拉回工作集
             // （数 MB 级），固定 1 秒一轮会让“隐藏态低内存”目标失效。时钟矩形
             // 稳定后按 1→2→4→8→10 秒退频；矩形变化或丢失（任务栏隐藏/资源
@@ -355,6 +372,10 @@ pub fn spawn() {
             let mut interval: u64 = 1;
             let mut stable_runs: u32 = 0;
             let mut last: Option<[i32; 4]> = None;
+            // 主面板隐藏时低频修剪：每轮扫描确实会把 COM/UIA 代码页拉回工作集，但
+            // 每轮都修剪与换页互相打架反而制造 churn（且与主面板/提醒线程的修剪
+            // 冲突），收敛到 5 分钟一次；隐藏瞬间的修剪由主面板空闲路径负责。
+            let mut last_trim = std::time::Instant::now();
             loop {
                 scan_tick(uia, &mut st);
                 let cur = if UIA_VALID.load(Ordering::Relaxed) {
@@ -378,10 +399,13 @@ pub fn spawn() {
                     stable_runs = 0;
                 }
                 last = cur;
-                // 主面板隐藏时扫描完即修剪：本轮扫描拉回的页面用完就还
+                // 主面板隐藏时低频修剪（5 分钟节流）
                 let fh = crate::flyout::hwnd() as HWND;
-                if fh.is_null() || IsWindowVisible(fh) == 0 {
+                if (fh.is_null() || IsWindowVisible(fh) == 0)
+                    && last_trim.elapsed() >= Duration::from_secs(300)
+                {
                     crate::trim_working_set();
+                    last_trim = std::time::Instant::now();
                 }
                 std::thread::sleep(Duration::from_secs(interval));
             }
@@ -394,21 +418,33 @@ struct ScanState {
     /// 全子树扫描（个别版本时钟可能不暴露为 Button，只能靠 Name 匹配兜底）
     buttons_only: bool,
     button_misses: u32,
+    /// 降级后连续全子树命中轮数：到阈值后安排一次"回试轮"重走按钮快路径
+    /// （降级不该是永久的——Button 形态偶发缺失恢复后即回到廉价扫描）
+    fulltree_runs: u32,
     /// 连续失败轮数（≥5 清空快照，避免 explorer 重启后残留旧矩形）
     fails: u32,
 }
 
+/// 连续多少轮全子树命中后回试一次按钮模式（按 1~10 秒轮询约 1~3 分钟一次）
+const FULLTREE_PROBE_AT: u32 = 30;
+
+/// CAL_UIA_LOG 只在启动时读一次（每轮读环境变量无谓开销）
+static UIA_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 unsafe fn scan_tick(uia: *mut c_void, st: &mut ScanState) {
-    let logging = std::env::var("CAL_UIA_LOG").map(|v| v == "1").unwrap_or(false);
+    let logging = *UIA_LOG.get_or_init(|| std::env::var("CAL_UIA_LOG").map(|v| v == "1").unwrap_or(false));
     let mut log: Vec<String> = Vec::new();
     let found = locate(uia, st, &mut log);
     match found {
         Some(r) => {
             st.fails = 0;
+            // seqlock 写侧：先置奇（写入中）→ 写 4 坐标 → 再置偶（稳定）
+            UIA_SEQ.fetch_add(1, Ordering::SeqCst);
             UIA_L.store(r.left, Ordering::Relaxed);
             UIA_T.store(r.top, Ordering::Relaxed);
             UIA_R.store(r.right, Ordering::Relaxed);
             UIA_B.store(r.bottom, Ordering::Relaxed);
+            UIA_SEQ.fetch_add(1, Ordering::SeqCst);
             UIA_VALID.store(true, Ordering::Relaxed);
             if logging {
                 log.insert(0, format!("mode=buttons:{} OK ({},{})-({},{})", st.buttons_only, r.left, r.top, r.right, r.bottom));
@@ -446,12 +482,22 @@ unsafe fn locate(
     }
     let taskbar = element_from_handle(uia, tray)?;
     let mut best: Option<RECT> = None;
-    if st.buttons_only {
+    // 回试轮：降级状态下按钮快路径周期性重试。回试轮按钮未命中时同轮仍走
+    // 全子树兜底，不产生空轮/丢矩形。
+    let mut probe = false;
+    if !st.buttons_only && st.fulltree_runs >= FULLTREE_PROBE_AT {
+        probe = true;
+        st.fulltree_runs = 0;
+    }
+    if st.buttons_only || probe {
         let cond = property_condition(uia, UIA_CONTROL_TYPE, UIA_BUTTON_CONTROL_TYPE);
         best = scan(taskbar, cond, log);
         com_release(cond);
         if best.is_some() {
             st.button_misses = 0;
+            if probe {
+                st.buttons_only = true; // 回试成功：恢复按钮快路径
+            }
         } else {
             st.button_misses += 1;
             if st.button_misses >= 3 {
@@ -459,10 +505,13 @@ unsafe fn locate(
             }
         }
     }
-    if best.is_none() && !st.buttons_only {
+    if best.is_none() && (!st.buttons_only || probe) {
         let cond = true_condition(uia);
         best = scan(taskbar, cond, log);
         com_release(cond);
+        if best.is_some() {
+            st.fulltree_runs += 1;
+        }
     }
     com_release(taskbar);
     best
@@ -616,7 +665,7 @@ mod tests {
                 CoUninitialize();
                 panic!("CoCreateInstance(CUIAutomation) failed: hr=0x{:08x}", ihr);
             }
-            let mut st = ScanState { buttons_only: true, button_misses: 0, fails: 0 };
+            let mut st = ScanState { buttons_only: true, button_misses: 0, fulltree_runs: 0, fails: 0 };
             let mut log: Vec<String> = Vec::new();
             let r = locate(uia, &mut st, &mut log);
             com_release(uia);

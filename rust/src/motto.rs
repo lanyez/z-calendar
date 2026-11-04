@@ -59,7 +59,7 @@ pub fn on_sidebar_show() {
 /// 当前应显示的格言；尚未取到返回 None（调用方用内置格言兜底）
 pub fn current(ty: &str) -> Option<Motto> {
     ensure(ty);
-    let g = ENTRY.lock().unwrap();
+    let g = ENTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let e = g.as_ref()?;
     // 换分类后不显示旧分类的内容；新的一条返回前继续显示上一条
     if e.ty != ty {
@@ -72,7 +72,7 @@ pub fn current(ty: &str) -> Option<Motto> {
 fn ensure(ty: &str) {
     let gen = GEN.load(Ordering::Relaxed);
     {
-        let g = ENTRY.lock().unwrap();
+        let g = ENTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // 本轮已经取到同分类的格言则不再请求
         if g.as_ref().map(|e| e.ty == ty && e.gen == gen).unwrap_or(false) {
             return;
@@ -93,7 +93,7 @@ fn ensure(ty: &str) {
             match fetch_quote(&ty) {
                 Some(m) => {
                     // 记录完成时的代数：拉取期间用户又点了日期，本轮结果仍然有效
-                    *ENTRY.lock().unwrap() = Some(Entry { ty: ty.clone(), gen: GEN.load(Ordering::Relaxed), motto: m });
+                    *ENTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Entry { ty: ty.clone(), gen: GEN.load(Ordering::Relaxed), motto: m });
                     crate::sidebar::post_repaint();
                 }
                 None => {
@@ -179,7 +179,7 @@ mod tests {
         // 第一次打开侧栏：等待取到
         super::on_sidebar_show();
         let first = wait_for(|| super::current("d")).expect("首次拉取失败");
-        assert_eq!(super::ENTRY.lock().unwrap().as_ref().unwrap().ty, "d");
+        assert_eq!(super::ENTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().unwrap().ty, "d");
 
         // 第二次打开侧栏：槽位立即作废（触发新一次拉取），
         // 但界面上继续显示上一条，不闪回内置格言
@@ -189,7 +189,7 @@ mod tests {
 
         // 等新一条落地（代数推进到 gen2）
         wait_for(|| {
-            let g = super::ENTRY.lock().unwrap();
+            let g = super::ENTRY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.as_ref().filter(|e| e.gen == gen2).map(|e| e.motto.clone())
         })
         .expect("重新拉取超时");

@@ -102,7 +102,7 @@ static MEMO: Mutex<Option<(u32, HashMap<u32, Vec<HistoryItem>>)>> = Mutex::new(N
 
 /// 指定日期的事件（年份从近到远排序）；当月无缓存返回 None
 pub fn load_for(date: NaiveDate) -> Option<Vec<HistoryItem>> {
-    let mut g = MEMO.lock().unwrap();
+    let mut g = MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let need_load = match g.as_ref() {
         Some((m, _)) => *m != date.month(),
         None => true,
@@ -136,7 +136,7 @@ pub fn ensure_fetched(date: NaiveDate) {
     }
     let now = now_ms();
     {
-        let mut g = ATTEMPT.lock().unwrap();
+        let mut g = ATTEMPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let skip = match g.as_ref() {
             Some((m, ts, ok)) => *m == date.month() && (*ok || now - *ts < RETRY_MS),
             None => false,
@@ -152,7 +152,7 @@ pub fn ensure_fetched(date: NaiveDate) {
         .stack_size(512 * 1024)
         .spawn(move || {
             let ok = fetch_and_split().is_some();
-            *ATTEMPT.lock().unwrap() = Some((date.month(), now_ms(), ok));
+            *ATTEMPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((date.month(), now_ms(), ok));
             if ok {
                 crate::sidebar::post_repaint();
             }
@@ -201,7 +201,7 @@ fn fetch_and_split() -> Option<()> {
         return None;
     }
     // 内存缓存失效，下次 load_for 重新读盘
-    *MEMO.lock().unwrap() = None;
+    *MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     Some(())
 }
 

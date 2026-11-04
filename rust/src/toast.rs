@@ -113,7 +113,18 @@ fn snooze_path() -> std::path::PathBuf {
     crate::config::data_dir().join("snooze.json")
 }
 
+/// snooze.json 读-改-写串行化锁：本线程的点击登记与提醒线程的补发回写
+/// （各自 load→修改→整文件重写）可能并发，无锁会把对方刚写入的条目覆盖丢失。
+/// 提醒线程取同一把锁（见 reminder::fire_snoozes）。
+static SNOOZE_FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 提醒线程访问 snooze.json 前先取这把锁（读-改-写整段持锁）
+pub fn snooze_lock() -> std::sync::MutexGuard<'static, ()> {
+    SNOOZE_FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn snooze_add(entry: SnoozeEntry) {
+    let _g = snooze_lock();
     let (list, healed) = crate::config::load_json_or_bak::<Vec<SnoozeEntry>>(&snooze_path());
     if healed {
         crate::log::warn("snooze.json 损坏，已自动从备份恢复");
@@ -206,11 +217,11 @@ fn undo_restore(data: &UndoData) {
     match data {
         UndoData::Agenda { key, idx, entry } => {
             if let Some(agenda) = crate::events::shared_agenda() {
-                let mut map = agenda.lock().unwrap();
-                let v = map.entry(key.clone()).or_default();
-                let pos = (*idx).min(v.len());
-                v.insert(pos, entry.clone());
-                crate::events::save(&map);
+                crate::events::edit_and_save(&agenda, |map| {
+                    let v = map.entry(key.clone()).or_default();
+                    let pos = (*idx).min(v.len());
+                    v.insert(pos, entry.clone());
+                });
             }
         }
         UndoData::Todos { items } => {
@@ -222,8 +233,10 @@ fn undo_restore(data: &UndoData) {
             }
         }
     }
-    crate::sidebar::sidebar_repaint();
-    crate::flyout::flyout_repaint();
+    // 本函数跑在 toast 线程：主面板/侧栏窗口属主线程，跨线程持锁直接绘制
+    // （UpdateLayeredWindow 为同步调用）可能互锁，投递到各自属主线程执行
+    crate::sidebar::post_repaint();
+    crate::flyout::post_repaint();
 }
 
 fn now_ms() -> i64 {
@@ -248,7 +261,7 @@ pub fn spawn() -> Sender<ToastMsg> {
 
 /// 屏幕缩放变化：可见时按新 sf 重摆重绘（toast 的绘制/尺寸均实时读 gdi::scale()）
 pub fn rescale() {
-    let mut guard = TOAST_UI.lock().unwrap();
+    let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         let f = &mut f.0;
         if !f.items.is_empty() {
@@ -307,7 +320,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     let mut g: gdi::Gp = std::ptr::null_mut();
     GdipGetImageGraphicsContext(bmp, &mut g);
 
-    *TOAST_UI.lock().unwrap() = Some(SendToast(Box::new(ToastUi {
+    *TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SendToast(Box::new(ToastUi {
         hwnd: hwnd as usize,
         mem_dc,
         scan0: bits as *mut u8,
@@ -325,7 +338,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
         // 收取提醒引擎投递 + 过期清理
         let mut pushed_loud = 0usize;
         {
-            let mut guard = TOAST_UI.lock().unwrap();
+            let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
                 while let Ok(m) = rx.try_recv() {
@@ -387,7 +400,7 @@ fn total_h(f: &ToastUi) -> f32 {
 unsafe fn remove_item(idx: usize) {
     let empty;
     {
-        let mut guard = TOAST_UI.lock().unwrap();
+        let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(f) = guard.as_mut() else { return };
         let f = &mut f.0;
         if idx >= f.items.len() {
@@ -410,7 +423,7 @@ unsafe fn remove_item(idx: usize) {
 unsafe fn hwnd_of() -> HWND {
     TOAST_UI
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map(|f| f.0.hwnd as HWND)
         .unwrap_or(std::ptr::null_mut())
@@ -564,7 +577,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
             let mut hover_btn = None;
             {
-                let guard = TOAST_UI.lock().unwrap();
+                let guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(f) = guard.as_ref() {
                     let f = &f.0;
                     let off = summary_off(f);
@@ -601,7 +614,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 }
             }
             {
-                let mut guard = TOAST_UI.lock().unwrap();
+                let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(f) = guard.as_mut() {
                     if f.0.hover_btn != hover_btn {
                         f.0.hover_btn = hover_btn;
@@ -620,7 +633,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             0
         }
         WM_MOUSELEAVE => {
-            let mut guard = TOAST_UI.lock().unwrap();
+            let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 if f.0.hover_btn.is_some() {
                     f.0.hover_btn = None;
@@ -635,7 +648,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             // 命中判定：先按钮，后卡片本体；4=汇总条（点击清除折叠计数）
             let mut hit: Option<(usize, u8)> = None;
             {
-                let guard = TOAST_UI.lock().unwrap();
+                let guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(f) = guard.as_ref() {
                     let f = &f.0;
                     let off = summary_off(f);
@@ -681,7 +694,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             if hit == Some((usize::MAX, 4)) {
                 let empty;
                 {
-                    let mut guard = TOAST_UI.lock().unwrap();
+                    let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let Some(f) = guard.as_mut() else { return 0 };
                     let f = &mut f.0;
                     f.dropped = 0;
@@ -703,7 +716,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 return 0;
             }
             if let Some((i, btn)) = hit {
-                let item = TOAST_UI.lock().unwrap().as_ref().map(|f| {
+                let item = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().map(|f| {
                     let it = &f.0.items[i];
                     (it.title.clone(), it.body.clone(), it.act.clone(), it.quiet)
                 });

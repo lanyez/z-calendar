@@ -25,12 +25,18 @@ pub fn spawn(tx: Sender<crate::toast::ToastMsg>) {
     std::thread::Builder::new()
         .name("reminder".into())
         .stack_size(128 * 1024)
-        .spawn(move || loop {
-            // 空转扫描（未发任何提醒）结束后修剪：加载日程/展开重复拉回的页面用完即还
-            if !scan(&tx) {
-                crate::trim_working_set();
+        .spawn(move || {
+            // 空转修剪低频兜底：每 15 轮（5 分钟）一次，高频修剪-换页互相打架。
+            // 注意 scan 必须每轮无条件执行（提醒宽限窗仅 2 分钟，漏轮=丢提醒）。
+            let mut scans: u32 = 0;
+            loop {
+                scans += 1;
+                let fired = scan(&tx);
+                if scans % 15 == 0 && !fired {
+                    crate::trim_working_set();
+                }
+                std::thread::sleep(std::time::Duration::from_secs(SCAN_SECS));
             }
-            std::thread::sleep(std::time::Duration::from_secs(SCAN_SECS));
         })
         .ok();
 }
@@ -118,39 +124,47 @@ fn save_done(map: &HashMap<String, i64>) {
     }
 }
 
-/// 消费到点的“稍后提醒”（toast 点击登记），逐条补发
+/// 消费到点的“稍后提醒”（toast 点击登记），逐条补发。
+/// 文件读-改-写与 toast 线程的 snooze_add 串行（同一把锁）；锁内不发通知，
+/// 避免 WinRT Toast 发送耗时期间占锁阻塞用户点击“稍后”。
 fn fire_snoozes(tx: &Sender<crate::toast::ToastMsg>, now: i64) -> bool {
-    let (list, healed) = crate::config::load_json_or_bak::<Vec<crate::toast::SnoozeEntry>>(&std::path::PathBuf::from(
-        crate::config::data_dir().join("snooze.json"),
-    ));
-    if healed {
-        crate::toast::notify("稍后提醒已恢复", "snooze.json 损坏，已自动从备份恢复");
-    }
-    let Some(list) = list else { return false };
-    let mut keep = Vec::new();
-    let mut changed = false;
-    let mut fired = false;
-    for e in list {
-        if e.t <= now {
-            fired = true;
-            log_remind(&e.title, &e.body);
-            // 系统通知中心可用则优先走系统 Toast（失败自动回退内置卡片）
-            let sys_ok = crate::config::use_system_toast_on()
-                && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
-            if !sys_ok {
-                if crate::config::use_system_toast_on() {
-                    crate::log::warn("系统通知不可用（未开启或发送失败），已回退内置提醒卡片");
-                }
-                let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone(), quiet: false });
-            }
-            changed = true;
-        } else {
-            keep.push(e);
+    let due: Vec<crate::toast::SnoozeEntry> = {
+        let _g = crate::toast::snooze_lock();
+        let (list, healed) = crate::config::load_json_or_bak::<Vec<crate::toast::SnoozeEntry>>(&std::path::PathBuf::from(
+            crate::config::data_dir().join("snooze.json"),
+        ));
+        if healed {
+            crate::toast::notify("稍后提醒已恢复", "snooze.json 损坏，已自动从备份恢复");
         }
-    }
-    if changed {
-        if let Ok(text) = serde_json::to_string(&keep) {
-            let _ = crate::config::write_file_atomic(&crate::config::data_dir().join("snooze.json"), &text);
+        let Some(list) = list else { return false };
+        let mut keep = Vec::new();
+        let mut due = Vec::new();
+        for e in list {
+            if e.t <= now {
+                due.push(e);
+            } else {
+                keep.push(e);
+            }
+        }
+        if !due.is_empty() {
+            if let Ok(text) = serde_json::to_string(&keep) {
+                let _ = crate::config::write_file_atomic(&crate::config::data_dir().join("snooze.json"), &text);
+            }
+        }
+        due
+    };
+    let mut fired = false;
+    for e in due {
+        fired = true;
+        log_remind(&e.title, &e.body);
+        // 系统通知中心可用则优先走系统 Toast（失败自动回退内置提醒卡片）
+        let sys_ok = crate::config::use_system_toast_on()
+            && crate::wnotify::show_reminder(&e.title, &e.body, &e.act, crate::config::remind_sound_on());
+        if !sys_ok {
+            if crate::config::use_system_toast_on() {
+                crate::log::warn("系统通知不可用（未开启或发送失败），已回退内置提醒卡片");
+            }
+            let _ = tx.send(crate::toast::ToastMsg { title: e.title.clone(), body: e.body.clone(), act: e.act.clone(), quiet: false });
         }
     }
     fired
@@ -177,61 +191,60 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
     let mut cands: Vec<Cand> = Vec::new();
     let today = chrono::Local::now().date_naive();
 
-    // 日程：带提醒的富条目（重复的展开到前后一天的 occurrence，覆盖“1天前”跨日提醒）
-    let (agenda, healed) = crate::config::load_json_or_bak::<crate::events::AgendaMap>(&std::path::PathBuf::from(
-        crate::config::data_dir().join("agenda.json"),
-    ));
-    if healed {
-        crate::toast::notify("日程数据已恢复", "agenda.json 损坏，已自动从备份恢复");
-    }
-    let agenda = agenda.unwrap_or_default();
-    for (key, items) in &agenda {
-        for (idx, e) in items.iter().enumerate() {
-            let crate::events::AgendaEntry::Rich(r) = e else { continue };
-            let Some(remind_min) = r.remind else { continue };
-            let Some(start) = crate::events::parse_start(&r.start) else { continue };
-            let dedup = item_dedup("a", key, idx, &r.id, &r.name, &r.start, r.remind, r.repeat);
-            match r.recur.as_deref() {
-                None => {
-                    let start_ms = local_ms(start);
-                    let end_ms = crate::events::parse_start(&r.end)
-                        .map(local_ms)
-                        .filter(|&e| e > start_ms)
-                        .unwrap_or(start_ms + 3600 * 1000);
-                    cands.push(Cand {
-                        dedup,
-                        title: "日程提醒".into(),
-                        body: body_text(&r.name, &r.start, r.all_day),
-                        fire0: start_ms - remind_min * 60_000,
-                        step: r.repeat.map(|m| m.max(1) * 60_000),
-                        boundary: if r.repeat.is_some() { end_ms } else { start_ms },
-                        act: crate::toast::Act::None,
-                    });
-                }
-                Some(rc) => {
-                    // 重复日程：生成窗口内各次出现，每次单独提醒（尊重截止日/仅此次）
-                    let t = start.time();
-                    let dur = crate::events::parse_start(&r.end)
-                        .map(|e| e - start)
-                        .filter(|d| *d > chrono::Duration::zero())
-                        .unwrap_or(chrono::Duration::hours(1));
-                    for off in [-1i64, 0, 1] {
-                        let od = today + chrono::Duration::days(off);
-                        if !crate::events::recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, start.date(), od) {
-                            continue;
-                        }
-                        let Some(ostart) = od.and_hms_opt(t.hour(), t.minute(), 0) else { continue };
-                        let ostart_ms = local_ms(ostart);
-                        let oend_ms = local_ms(ostart + dur);
+    // 日程：带提醒的富条目（重复的展开到前后一天的 occurrence，覆盖“1天前”跨日提醒）。
+    // 读进程内共享态（main 启动时注册）：此前每轮从磁盘重读 agenda.json 全量解析，
+    // 每 20 秒一次与“隐藏态低内存”目标相悖（解析器代码页反复换入），且可能读到
+    // 比 UI 内存态旧的落盘文件；内存态在 edit_and_save 中先更新后落盘，永远更新。
+    if let Some(shared) = crate::events::shared_agenda() {
+        let agenda = shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (key, items) in agenda.iter() {
+            for (idx, e) in items.iter().enumerate() {
+                let crate::events::AgendaEntry::Rich(r) = e else { continue };
+                let Some(remind_min) = r.remind else { continue };
+                let Some(start) = crate::events::parse_start(&r.start) else { continue };
+                let dedup = item_dedup("a", key, idx, &r.id, &r.name, &r.start, r.remind, r.repeat);
+                match r.recur.as_deref() {
+                    None => {
+                        let start_ms = local_ms(start);
+                        let end_ms = crate::events::parse_start(&r.end)
+                            .map(local_ms)
+                            .filter(|&e| e > start_ms)
+                            .unwrap_or(start_ms + 3600 * 1000);
                         cands.push(Cand {
-                            dedup: dedup.clone(),
+                            dedup,
                             title: "日程提醒".into(),
                             body: body_text(&r.name, &r.start, r.all_day),
-                            fire0: ostart_ms - remind_min * 60_000,
-                            step: None,
-                            boundary: oend_ms,
+                            fire0: start_ms - remind_min * 60_000,
+                            step: r.repeat.map(|m| m.max(1) * 60_000),
+                            boundary: if r.repeat.is_some() { end_ms } else { start_ms },
                             act: crate::toast::Act::None,
                         });
+                    }
+                    Some(rc) => {
+                        // 重复日程：生成窗口内各次出现，每次单独提醒（尊重截止日/仅此次）
+                        let t = start.time();
+                        let dur = crate::events::parse_start(&r.end)
+                            .map(|e| e - start)
+                            .filter(|d| *d > chrono::Duration::zero())
+                            .unwrap_or(chrono::Duration::hours(1));
+                        for off in [-1i64, 0, 1] {
+                            let od = today + chrono::Duration::days(off);
+                            if !crate::events::recur_occurs(r.recur_until.as_deref(), &r.skip_dates, rc, start.date(), od) {
+                                continue;
+                            }
+                            let Some(ostart) = od.and_hms_opt(t.hour(), t.minute(), 0) else { continue };
+                            let ostart_ms = local_ms(ostart);
+                            let oend_ms = local_ms(ostart + dur);
+                            cands.push(Cand {
+                                dedup: dedup.clone(),
+                                title: "日程提醒".into(),
+                                body: body_text(&r.name, &r.start, r.all_day),
+                                fire0: ostart_ms - remind_min * 60_000,
+                                step: None,
+                                boundary: oend_ms,
+                                act: crate::toast::Act::None,
+                            });
+                        }
                     }
                 }
             }
@@ -239,14 +252,8 @@ fn scan(tx: &Sender<crate::toast::ToastMsg>) -> bool {
     }
 
     // 待办：带提醒且未完成的（全天待办按当天 09:00 计，与全天日程一致；
-    // 重复的同样展开）
-    let (todos, healed) = crate::config::load_json_or_bak::<Vec<crate::sidebar::Todo>>(&std::path::PathBuf::from(
-        crate::config::data_dir().join("todo.json"),
-    ));
-    if healed {
-        crate::toast::notify("待办数据已恢复", "todo.json 损坏，已自动从备份恢复");
-    }
-    let todos = todos.unwrap_or_default();
+    // 重复的同样展开）。Arc 快照零拷贝（同日程：不再每轮磁盘解析 todo.json）
+    let todos = crate::sidebar::todos_snapshot();
     for (idx, td) in todos.iter().enumerate() {
         if td.done && td.recur.is_none() {
             continue;

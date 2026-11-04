@@ -53,7 +53,7 @@ pub fn spawn(clock: SharedClock) {
 /// 任务栏时钟所在显示器的工作区（提醒卡片等跟随弹窗定位用）；尚未定位到时钟时 None
 pub fn clock_work_area() -> Option<(i32, i32, i32, i32)> {
     let arc = CLOCK.get()?;
-    let ci = arc.lock().unwrap().clone()?;
+    let ci = arc.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()?;
     Some(ci.work)
 }
 
@@ -275,11 +275,11 @@ unsafe fn update_overlay() {
             MON_B.store(ci.mon.3, Ordering::Relaxed);
             CLK_VALID.store(true, Ordering::Relaxed);
             // 全屏（任务栏不可见）时对 flyout 报 None：弹窗摆放会藏到屏外
-            *clock.lock().unwrap() = if suspended { None } else { Some(ci) };
+            *clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = if suspended { None } else { Some(ci) };
         }
         None => {
             CLK_VALID.store(false, Ordering::Relaxed);
-            *clock.lock().unwrap() = None;
+            *clock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
     }
 }

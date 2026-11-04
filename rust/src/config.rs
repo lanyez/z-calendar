@@ -317,9 +317,18 @@ impl Config {
 
     pub fn save(&self) {
         if let Ok(text) = serde_json::to_string_pretty(self) {
+            CONFIG_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = write_file_atomic(&config_path(), &text);
         }
     }
+}
+
+/// 配置数据代次：每次 save +1。设置窗口绘制的配置快照缓存据此失效
+/// （此前设置窗内每次悬停移动都整体 clone 31 字段 Config）。
+static CONFIG_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub fn config_gen() -> u64 {
+    CONFIG_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 开机自启：写/删 HKCU\...\Run\Z日历

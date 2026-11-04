@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      # 项目按 windows-gnu 工具链开发（默认 host）；runner 自带 mingw-w64 供链接，
+      # rustup 的 self-contained 组件补齐 CRT（shcore 已改为动态加载，不再需要
+      # mingw-w64 完整发行版的 import lib）
+      - name: Install Rust (stable-gnu)
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+          rustc --version
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: rust/target
+          key: cargo-${{ runner.os }}-gnu-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-gnu-
+
+      - name: Check
+        run: cargo check
+
+      - name: Tests
+        run: cargo test
+
+      - name: Release build
+        run: cargo build --release
+
+      # tag 与 Cargo.toml version 必须一致（历史上出现过 1.0.8 tag 配 1.0.5 版本号）
+      - name: Tag/version consistency
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          if [ "$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: z-calendar-${{ github.sha }}
+          path: rust/target/release/z-calendar.exe

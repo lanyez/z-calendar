@@ -17,7 +17,7 @@ pub fn error(msg: &str) {
 }
 
 fn write(level: &str, msg: &str) {
-    let _g = LOG_LOCK.lock().unwrap();
+    let _g = LOG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = crate::config::data_dir();
     let path = dir.join("zcalendar.log");
     if let Ok(md) = std::fs::metadata(&path) {
