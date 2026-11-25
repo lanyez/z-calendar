@@ -5,6 +5,20 @@ shot*.png
 rust/target/
 rust/dbg*.log
 rust/*.log
+rust/prebuilt-resource.o.tmp
 shots/*
+# tools/ 下的临时实验脚本不入库；与机器路径无关的通用诊断/界面测试脚本除外
 tools/*
+!tools/bmp2png2.py
+!tools/capture-screen.ps1
+!tools/capture-window.ps1
+!tools/click.ps1
+!tools/crop-zoom.ps1
+!tools/date-menu-dismiss-test.py
+!tools/date-menu-test.py
+!tools/dialog-form-test.py
+!tools/mem.ps1
+!tools/mem_regions.py
+!tools/pixel-hist.ps1
+!tools/winspect.py
 z-calendar.exe

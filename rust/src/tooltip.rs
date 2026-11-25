@@ -6,19 +6,18 @@ use std::sync::Mutex;
 use winapi::shared::windef::{HWND, POINT};
 use winapi::um::winuser::*;
 
+use crate::gdi::Dib;
+
 static TIP_HWND: AtomicUsize = AtomicUsize::new(0);
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 static CLASS_DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static SURF: Mutex<Option<TipSurf>> = Mutex::new(None);
 static CACHE: std::sync::OnceLock<crate::gdi::Cache> = std::sync::OnceLock::new();
 
+/// 提示框的后台位图：按上限尺寸一次分配，sf 变化时重建
 struct TipSurf {
     sf: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: usize,
-    scan0: usize,
-    g: usize,
+    dib: Dib,
 }
 
 const PAD_X: f32 = 10.0;
@@ -26,6 +25,8 @@ const PAD_Y: f32 = 8.0;
 const LINE_H: f32 = 18.0;
 const MAX_W: f32 = 320.0;
 const MAX_LINES: usize = 8;
+/// 位图高度上限：内边距 + 最大行数（外加描边余量）
+const MAX_H: f32 = PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0;
 
 unsafe extern "system" fn tip_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -55,7 +56,7 @@ pub fn hide() {
 fn ensure_window() -> usize {
     unsafe {
         CLASS_DONE.get_or_init(|| {
-            let class_name: Vec<u16> = "zcal_tooltip\0".encode_utf16().collect();
+            let class_name = crate::wide("zcal_tooltip");
             let wc = WNDCLASSW {
                 style: 0,
                 lpfnWndProc: Some(tip_proc),
@@ -72,8 +73,8 @@ fn ensure_window() -> usize {
         });
         let mut h = TIP_HWND.load(Ordering::Relaxed) as HWND;
         if h.is_null() {
-            let class_name: Vec<u16> = "zcal_tooltip\0".encode_utf16().collect();
-            let title: Vec<u16> = "zcal\0".encode_utf16().collect();
+            let class_name = crate::wide("zcal_tooltip");
+            let title = crate::wide("zcal");
             h = CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 class_name.as_ptr(),
@@ -96,12 +97,44 @@ fn ensure_window() -> usize {
 
 /// 在屏幕坐标 (sx, sy) 附近浮出多行文本提示（自动折行，超长截断加省略号）
 pub fn show(text: &str, sx: i32, sy: i32) {
-    if text.trim().is_empty() {
-        return;
-    }
+    let Some((w, h)) = render(text) else { return };
     let hwnd = ensure_window();
     if hwnd == 0 {
         return;
+    }
+    let guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(tip) = guard.as_ref() else { return };
+    let sf = tip.sf;
+    let pw = (w * sf) as i32;
+    let ph = (h * sf) as i32;
+    // 提交到窗口并显示（不抢焦点）；位置按鼠标所在显示器工作区夹回
+    unsafe {
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let pt = POINT { x: sx, y: sy };
+        GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
+        let mut x = sx + 16;
+        let mut y = sy + 22;
+        if x + pw > mi.rcWork.right {
+            x = mi.rcWork.right - pw;
+        }
+        if y + ph > mi.rcWork.bottom {
+            y = sy - ph - 12;
+        }
+        if y < mi.rcWork.top {
+            y = mi.rcWork.top;
+        }
+        tip.dib.present_at(hwnd, x, y, tip.sf, w, h);
+        ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
+    }
+    VISIBLE.store(true, Ordering::Relaxed);
+}
+
+/// 把提示文本画进后台位图，返回内容尺寸（逻辑 px）。只画不提交——
+/// 界面自检据此在不显示窗口的情况下渲染（见 selftest 模块）
+fn render(text: &str) -> Option<(f32, f32)> {
+    if text.trim().is_empty() {
+        return None;
     }
     let sf = crate::gdi::scale();
     let pal = crate::theme::pal();
@@ -141,7 +174,7 @@ pub fn show(text: &str, sx: i32, sy: i32) {
         }
     }
 
-    // 分配/复用绘制表面（上限尺寸一次分配，sf 变化重建）
+    // 分配/复用绘制位图（上限尺寸一次分配，sf 变化重建：旧的随 TipSurf 被替换自动释放）
     {
         let mut guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let stale = match guard.as_ref() {
@@ -149,43 +182,13 @@ pub fn show(text: &str, sx: i32, sy: i32) {
             None => true,
         };
         if stale {
-            // 缩放变化重建表面：先释放旧 DIB/位图，避免每次重建泄漏 GDI 句柄
-            if let Some(old) = guard.take() {
-                let mut m = old.mem_dc;
-                let mut hb = old.hbmp;
-                let mut b = old.bmp as crate::gdi::Gp;
-                let mut gr = old.g as crate::gdi::Gp;
-                let mut s = old.scan0 as *mut u8;
-                unsafe { crate::gdi::free_dib(&mut m, &mut hb, &mut b, &mut gr, &mut s) };
-            }
-            let max_h = PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0;
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { crate::gdi::alloc_dib(MAX_W, max_h) };
-            let g = crate::gdi::graphics_from_image(bmp);
-            *guard = Some(TipSurf {
-                sf,
-                mem_dc,
-                hbmp,
-                bmp: bmp as usize,
-                scan0: scan0 as usize,
-                g: g as usize,
-            });
+            *guard = Some(TipSurf { sf, dib: Dib::alloc(MAX_W, MAX_H) });
         }
     }
     let guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let tip = match guard.as_ref() {
-        Some(t) => t,
-        None => return,
-    };
+    let tip = guard.as_ref()?;
     let cache = CACHE.get_or_init(crate::gdi::Cache::new);
-    let p = crate::gdi::Painter {
-        g: tip.g as crate::gdi::Gp,
-        cache,
-        sf: tip.sf,
-        w: MAX_W,
-        h: PAD_Y * 2.0 + LINE_H * MAX_LINES as f32 + 8.0,
-        dc: tip.mem_dc,
-        scan0: tip.scan0 as *mut u8,
-    };
+    let p = tip.dib.painter(cache, tip.sf, MAX_W, MAX_H);
     p.clear();
 
     let mut text_w: f32 = 0.0;
@@ -200,47 +203,16 @@ pub fn show(text: &str, sx: i32, sy: i32) {
         p.text(line, PAD_X, y, MAX_W - PAD_X * 2.0, LINE_H, crate::gdi::HALIGN_NEAR, crate::gdi::HALIGN_CENTER, 12.0, false, false, pal.row);
     }
     p.stroke_round(0.5, 0.5, w - 1.0, h - 1.0, 8.0, 1.0, crate::theme::ov(70));
+    Some((w, h))
+}
 
-    // ULW 到窗口并显示（不抢焦点）；位置按鼠标所在显示器工作区夹回
-    let pw = (w * sf) as i32;
-    let ph = (h * sf) as i32;
-    unsafe {
-        let mut mi: MONITORINFO = std::mem::zeroed();
-        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let pt = POINT { x: sx, y: sy };
-        GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut mi);
-        let mut x = sx + 16;
-        let mut y = sy + 22;
-        if x + pw > mi.rcWork.right {
-            x = mi.rcWork.right - pw;
-        }
-        if y + ph > mi.rcWork.bottom {
-            y = sy - ph - 12;
-        }
-        if y < mi.rcWork.top {
-            y = mi.rcWork.top;
-        }
-        let mut ppt = POINT { x, y };
-        let mut size = winapi::shared::windef::SIZE { cx: pw, cy: ph };
-        let mut src = POINT { x: 0, y: 0 };
-        let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-            BlendOp: 0,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: 1,
-        };
-        UpdateLayeredWindow(
-            hwnd as HWND,
-            std::ptr::null_mut(),
-            &mut ppt,
-            &mut size,
-            tip.mem_dc as winapi::shared::windef::HDC,
-            &mut src,
-            0,
-            &mut blend,
-            2,
-        );
-        ShowWindow(hwnd as HWND, SW_SHOWNOACTIVATE);
+/// 界面自检（见 selftest 模块）：渲染一段会折行 + 截断的提示并转储，窗口不显示
+#[cfg(feature = "selftest")]
+pub fn debug_render(dir: &std::path::Path) {
+    let text = "这是一条足够长的悬停提示文本，用来验证按字符贪心折行、超过最大行数后的省略号截断，以及圆角边框与文字的绘制是否都还正常（一二三四五六七八九十 再多写几个字让它折到下一行去）。";
+    let Some((w, h)) = render(text) else { return };
+    let guard = SURF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(tip) = guard.as_ref() {
+        crate::debug::save_frame(dir, "90-tooltip", &tip.dib, w, h, tip.sf);
     }
-    VISIBLE.store(true, Ordering::Relaxed);
 }

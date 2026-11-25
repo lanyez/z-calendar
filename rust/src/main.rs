@@ -4,15 +4,21 @@
 #![allow(non_snake_case)]
 
 mod almanac;
+mod clipboard;
+mod clock;
 mod config;
 mod ctxmenu;
+mod ctxmenu_date;
+mod debug;
 mod events;
 mod flyout;
 mod inputbox;
 mod gdi;
 mod history;
 mod ics;
+mod ime;
 mod log;
+mod menuwin;
 mod lunar;
 mod lunar_data;
 mod motto;
@@ -21,6 +27,8 @@ mod overlay;
 mod recur_menu;
 mod reminder;
 mod sidebar;
+#[cfg(feature = "selftest")]
+mod selftest;
 mod textedit;
 mod tooltip;
 mod theme;
@@ -33,7 +41,7 @@ mod weather;
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
 use winapi::um::winuser::{DispatchMessageW, GetMessageW, SetProcessDPIAware, TranslateMessage};
@@ -43,43 +51,34 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn SetProcessWorkingSetSize(hproc: winapi::um::winnt::HANDLE, min: usize, max: usize) -> i32;
-    fn GetCurrentProcess() -> winapi::um::winnt::HANDLE;
-}
 
-unsafe fn set_min_ws() {
-    SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+
+/// 修剪工作集：(-1, -1) 让系统尽快换出可分页内存（按需自动换回）
+fn set_min_ws() {
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::winbase::SetProcessWorkingSetSize;
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
 }
 
 /// 修剪工作集（供 flyout 在隐藏时调用）
 pub fn trim_working_set() {
-    unsafe {
-        set_min_ws();
-        compact_heap();
-    }
+    set_min_ws();
+    compact_heap();
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetProcessHeap() -> winapi::um::winnt::HANDLE;
-    fn HeapCompact(hheap: winapi::um::winnt::HANDLE, flags: u32) -> usize;
-}
+
 
 /// 压缩进程堆：合并空闲段并尝试反提交（长跑后堆段只增不减）
 fn compact_heap() {
+    use winapi::um::heapapi::{GetProcessHeap, HeapCompact};
     unsafe {
         HeapCompact(GetProcessHeap(), 0);
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use clock::now_ms_u64 as now_ms;
 
 /// 进程 DPI 感知：不声明时（DPI Unaware）DWM 会把整窗位图拉伸到当前显示缩放
 /// 比例，文字和图形整体发虚（125%/150% 缩放的 Win11 上尤其明显）。
@@ -124,7 +123,9 @@ fn main() {
     // 单实例：重复启动时通知已有实例弹出日历（或处理通知激活），然后退出
     let show_event: usize;
     unsafe {
-        let name: Vec<u16> = "z-calendar-show-event\0".encode_utf16().collect();
+        // CAL_INSTANCE=xxx：给单实例事件名加后缀，允许开发构建与已安装实例并行运行
+        // （配合 CAL_DATA_DIR 隔离数据，见 debug 模块）
+        let name = wide(&format!("z-calendar-show-event{}", crate::debug::value(crate::debug::INSTANCE)));
         use winapi::um::synchapi::{CreateEventW, OpenEventW, SetEvent};
         use winapi::um::winnt::EVENT_MODIFY_STATE;
         let existing = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
@@ -141,6 +142,12 @@ fn main() {
 
     gdi::startup();
 
+    // 界面自检：先铺一份样例数据（隔离的数据目录），再走正常启动流程
+    #[cfg(feature = "selftest")]
+    if selftest::requested() {
+        selftest::seed_sample_data();
+    }
+
     let config = config::Config::load();
     config::init_flags(&config);
     gdi::set_text_scale(config.ui_font_scale);
@@ -151,7 +158,7 @@ fn main() {
     history::purge_stale();
     // 时间格言：删除旧版本遗留的缓存（现改为每次点击日期都重新获取）
     motto::purge_stale();
-    let weather = if std::env::var("CAL_FAKE_WX").map(|v| v == "1").unwrap_or(false) {
+    let weather = if debug::flag(debug::FAKE_WX) {
         vec![weather::fake()]
     } else {
         let (located, custom) = weather::load_cache();
@@ -178,6 +185,10 @@ fn main() {
 
     // 提醒弹窗线程先起（日程/待办加载若触发数据自愈，通知才能送达）
     let toast_tx = toast::spawn();
+    // 配置在提醒线程之前加载：若发生过备份恢复，这里补发通知
+    if config::recovered_from_backup() {
+        toast::notify("配置已恢复", "config.json 损坏，已自动从备份恢复");
+    }
 
     let agenda = Arc::new(Mutex::new(flyout::load_agenda()));
     // 注册共享句柄：提醒卡片撤销恢复等无窗口上下文的模块读写同一份数据
@@ -194,9 +205,9 @@ fn main() {
     flyout::create_window(st.clone(), agenda.clone(), tray.clone());
     sidebar::create_window(st.clone(), agenda.clone());
     ctxmenu::create_window(st.clone(), tray.clone());
-    ctxmenu::ctxmenu_date::create_date_menu_window();
-    inputbox::create_window(agenda.clone());
-    recur_menu::create_window(agenda.clone());
+    ctxmenu_date::create_date_menu_window();
+    inputbox::create_window();
+    recur_menu::create_window();
     flyout::create_settings_window(st.clone(), tray);
     flyout::create_forecast_window(st.clone());
     overlay::spawn(clock);
@@ -207,11 +218,11 @@ fn main() {
     }
 
     // 调试：启动即显示设置窗口
-    if std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false) {
+    if debug::flag(debug::SETTINGS) {
         flyout::show_settings();
     }
     // 调试：验证通知中心就绪链路（AUMID + 开始菜单快捷方式），结果写 wnotify.log
-    if std::env::var("CAL_WNREADY").map(|v| v == "1").unwrap_or(false) {
+    if debug::flag(debug::WN_READY) {
         let ok = wnotify::ensure_ready();
         let lnk = wnotify::lnk_exists();
         let _ = std::fs::write(
@@ -221,7 +232,7 @@ fn main() {
         );
     }
     // 调试：发一条真实系统通知验证端到端链路（屏幕出现一次测试 Toast）
-    if std::env::var("CAL_WNSHOW").map(|v| v == "1").unwrap_or(false) {
+    if debug::flag(debug::WN_SHOW) {
         wnotify::ensure_ready();
         let act = toast::Act::TodoDone { id: "test".into(), date: "2026-10-7".into(), recur: false };
         let ok = wnotify::show_reminder("Z日历 · 通知中心测试", "系统 Toast 发送成功（可点按钮激活）", &act, true);
@@ -235,9 +246,7 @@ fn main() {
             .name("ws-trim".into())
             .spawn(|| {
                 std::thread::sleep(Duration::from_secs(3));
-                unsafe {
-                    SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
-                }
+                set_min_ws();
             })
             .ok();
     }
@@ -274,10 +283,17 @@ fn main() {
     }
 
     spawn_fetch(st.clone(), refresh_rx);
-    spawn_weather(st, weather_rx);
+    spawn_weather(st.clone(), weather_rx);
 
     // 提醒引擎：扫描日程/待办到期提醒，经 toast 弹窗通知
     reminder::spawn(toast_tx);
+
+    // 界面自检：各窗口渲染一帧并转储后直接退出（不进消息循环）
+    #[cfg(feature = "selftest")]
+    if let Some(dir) = selftest::dir() {
+        selftest::run(&dir, st.clone());
+        return;
+    }
 
     // 本实例即通知激活的启动目标（无其他实例在跑）：处理按钮参数后常驻
     if !toast_args.is_empty() {
@@ -391,9 +407,10 @@ fn spawn_weather(st: flyout::SharedState, rx: mpsc::Receiver<()>) {
                     }
                     v.extend(customs);
                     *st.weather.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(v);
-                    // 数据到达时刷新可见的天气面板（添加城市后的待聚焦 tab 即刻生效）
+                    // 数据到达时刷新可见的天气面板（添加城市后的待聚焦 tab 即刻生效）：
+                    // 投递到主线程，天气线程不跨线程直接绘制
                     if flyout::forecast_visible() {
-                        flyout::forecast_redraw();
+                        flyout::forecast_post_redraw();
                     }
                     // 主面板头部温度/预警角标随新数据刷新（隐藏时为无操作）
                     flyout::post_repaint();

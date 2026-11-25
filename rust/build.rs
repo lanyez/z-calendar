@@ -1,6 +1,7 @@
 // 构建时以 icon.png 为源自动生成图标并嵌入 exe：
 // 1) 等比居中到正方形画布，缩放多尺寸打包成 icon.ico（≤128 为 BMP 帧，256 为 PNG 帧减小体积）
 // 2) 32×32 RGBA 写入 OUT_DIR，托盘图标 include 使用（与 exe 图标同一来源，见 src/tray.rs）
+// 3) 资源编译（图标 + 取自 CARGO_PKG_VERSION 的版本信息）；见 main 末尾的说明
 use std::io::Cursor;
 use std::path::Path;
 
@@ -29,29 +30,82 @@ fn main() {
     let out = std::env::var("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out).join("tray_rgba.bin"), tray).expect("write tray_rgba.bin");
 
-    // 资源编译（exe 图标 + "Z日历" 版本信息）：优先现场编译（rc.exe / windres）。
-    // 二者都不可用时（如本机工具链缺失）回退链接随仓库携带的预编译资源对象：
-    // prebuilt-resource.o 由具备资源编译器的环境构建一次后从 OUT_DIR 复制而来，
-    // 内容与 icon.png + FileDescription 等价；更换 icon.png 后需在具备 windres
-    // 的环境重建一次并替换该文件。ZC_NO_RES=1 仍可显式跳过（仅类型检查用）。
+    // 资源编译（exe 图标 + 版本信息）：优先现场编译（rc.exe / windres）。
+    // 编译器不可用时回退链接随仓库携带的预编译资源对象 prebuilt-resource.o：
+    //   - 只允许调试类构建回退；release 构建直接报错（历史教训：发版构建一路
+    //     静默回退，exe 属性里的版本号停在该对象生成时的 1.0.0，与 Cargo.toml
+    //     的版本和 git tag 三处对不上）。确有需要时设 ZC_ALLOW_PREBUILT_RES=1。
+    //   - 现场编译成功时把产物同步回 prebuilt-resource.o（windres 输出是确定性的，
+    //     内容不变不写盘），换图标或改版本号后不必再手工重建这个文件。
+    // ZC_NO_RES=1 仍可显式跳过资源（仅类型检查用）。
+    // 资源编译走哪条分支取决于这些环境变量（含 PATH 里有没有 windres）：任一变化都重跑本脚本，
+    // 否则装好 MinGW 后 cargo 仍会沿用上一次"回退"的缓存结果
+    for name in ["WINDRES", "AR", "PATH", "ZC_NO_RES", "ZC_ALLOW_PREBUILT_RES"] {
+        println!("cargo:rerun-if-env-changed={}", name);
+    }
     if std::env::var("ZC_NO_RES").is_err() {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+        let prebuilt = Path::new(&manifest).join("prebuilt-resource.o");
         let compiled = winresource::WindowsResource::new()
             .set_icon("icon.ico")
             .set("FileDescription", "Z日历")
             .compile();
-        if let Err(e) = compiled {
-            let pre = std::env::var("CARGO_MANIFEST_DIR")
-                .map(|d| format!("{}\\prebuilt-resource.o", d))
-                .unwrap_or_default();
-            if std::path::Path::new(&pre).exists() {
-                println!("cargo:warning=rc/windres 不可用（{}），改用预编译资源对象", e);
+        match compiled {
+            Ok(()) => sync_prebuilt(&Path::new(&out).join("resource.o"), &prebuilt),
+            Err(e) => {
+                if !prebuilt.exists() {
+                    panic!("windows 资源编译失败且无预编译资源对象：{}", e);
+                }
+                if std::env::var("PROFILE").as_deref() == Ok("release")
+                    && std::env::var("ZC_ALLOW_PREBUILT_RES").is_err()
+                {
+                    panic!(
+                        "release 构建需要资源编译器，但 rc/windres 不可用：{}。\
+                         请把 MinGW-w64 的 bin 目录加入 PATH（或设置 WINDRES / AR 环境变量）后重新构建；\
+                         确要链接预编译资源对象请设 ZC_ALLOW_PREBUILT_RES=1",
+                        e
+                    );
+                }
+                println!("cargo:warning=rc/windres 不可用（{}），改用预编译资源对象 prebuilt-resource.o（其中 FileVersion={}，Cargo.toml 版本={}）",
+                    e,
+                    std::fs::read(&prebuilt).ok().and_then(|b| embedded_file_version(&b)).unwrap_or_else(|| "?".into()),
+                    std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
                 println!("cargo:rerun-if-changed=prebuilt-resource.o");
-                println!("cargo:rustc-link-arg={}", pre);
-            } else {
-                panic!("windows 资源编译失败且无预编译资源对象：{}", e);
+                println!("cargo:rustc-link-arg={}", prebuilt.display());
             }
         }
     }
+}
+
+/// 现场编译成功后，把资源对象同步到随仓库携带的 prebuilt-resource.o。
+/// 先写临时文件再改名，避免并发构建读到半截对象；内容相同则不写（不产生无意义的改动）。
+fn sync_prebuilt(fresh: &Path, prebuilt: &Path) {
+    let (Ok(fresh), Ok(old)) = (std::fs::read(fresh), std::fs::read(prebuilt)) else {
+        return;
+    };
+    if fresh == old {
+        return;
+    }
+    let tmp = prebuilt.with_extension("o.tmp");
+    if std::fs::write(&tmp, &fresh).is_ok() {
+        let _ = std::fs::rename(&tmp, prebuilt);
+    }
+}
+
+/// 读出 COFF 资源对象里固化的 FileVersion（UTF-16 字符串，键后按 2 字节对齐）
+fn embedded_file_version(bytes: &[u8]) -> Option<String> {
+    let key: Vec<u8> = "FileVersion\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let at = bytes.windows(key.len()).position(|w| w == key)?;
+    let mut j = at + key.len();
+    while j + 1 < bytes.len() && bytes[j] == 0 && bytes[j + 1] == 0 {
+        j += 2;
+    }
+    let units: Vec<u16> = bytes[j..]
+        .chunks_exact(2)
+        .take_while(|c| *c != [0, 0])
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16(&units).ok().filter(|s| !s.is_empty())
 }
 
 /// 非正方形图片等比缩放后居中放到正方形透明画布上（contain，不裁剪不变形）

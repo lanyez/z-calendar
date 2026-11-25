@@ -3,10 +3,9 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use winapi::shared::windef::{HWND, POINT, RECT};
+use winapi::shared::windef::{HWND, POINT};
 use winapi::shared::minwindef::{LRESULT, UINT, WPARAM, LPARAM};
 use winapi::um::winuser::*;
-use winapi::um::wingdi::BLENDFUNCTION;
 
 use crate::flyout::SharedState;
 use crate::gdi;
@@ -33,11 +32,8 @@ struct CityUi {
     sf: f32,
     w: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    /// 后台位图（隐藏时释放，显示前重建；见 gdi::Dib）
+    surf: gdi::Dib,
     cache: gdi::Cache,
     st: SharedState,
     text: String,
@@ -76,47 +72,7 @@ fn rect_hit(x: f32, y: f32, r: &gdi::RectF) -> bool {
 // ---------------------------------------------------------------------------
 // imm32：IME 组合串读取（与 inputbox 相同方式）
 // ---------------------------------------------------------------------------
-#[link(name = "imm32")]
-extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
-}
 
-#[link(name = "user32")]
-extern "system" {
-    fn SetFocus(hwnd: HWND) -> HWND;
-    fn SetForegroundWindow(hwnd: HWND) -> i32;
-}
-
-#[link(name = "gdiplus")]
-extern "system" {
-    fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
-}
-
-const GCS_COMPSTR: i32 = 0x0008;
-const GCS_RESULTSTR: i32 = 0x0800;
-
-unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
-    let himc = ImmGetContext(hwnd);
-    if himc.is_null() {
-        return None;
-    }
-    let len = ImmGetCompositionStringW(himc, mode, std::ptr::null_mut(), 0);
-    let mut out = None;
-    if len >= 0 {
-        let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
-        if got >= 0 {
-            let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
-            out = Some(String::from_utf16_lossy(slice));
-        }
-    }
-    ImmReleaseContext(hwnd, himc);
-    out
-}
 
 // ---------------------------------------------------------------------------
 // 窗口创建 / 打开 / 关闭
@@ -238,15 +194,15 @@ unsafe extern "system" fn cp_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPAR
             let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                if lp as i32 & GCS_RESULTSTR != 0 {
-                    if let Some(s) = unsafe { read_ime(hwnd, GCS_RESULTSTR) } {
+                if lp as i32 & crate::ime::RESULT != 0 {
+                    if let Some(s) = unsafe { crate::ime::composition_string(hwnd, crate::ime::RESULT) } {
                         f.undo.snapshot(&f.text, f.caret, f.sel, "ins");
                         crate::textedit::insert(&mut f.text, &mut f.caret, &mut f.sel, &s);
                         f.comp.clear();
                         on_text_changed(f, hwnd);
                     }
-                } else if lp as i32 & GCS_COMPSTR != 0 {
-                    f.comp = unsafe { read_ime(hwnd, GCS_COMPSTR) }.unwrap_or_default();
+                } else if lp as i32 & crate::ime::COMP != 0 {
+                    f.comp = unsafe { crate::ime::composition_string(hwnd, crate::ime::COMP) }.unwrap_or_default();
                     f.redraw();
                 }
             }
@@ -546,10 +502,7 @@ pub fn close() {
         // 隐藏即释放绘制位图（与 inputbox/flyout 一致；下次 open 的 redraw 惰性重建）
         let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(f) = guard.as_mut() {
-            let ui = &mut f.0;
-            unsafe {
-                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-            }
+            f.0.surf.release();
         }
     }
 }
@@ -590,11 +543,7 @@ pub fn create(st: SharedState) {
             sf: gdi::scale(),
             w: CP_W,
             h: CP_H,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: gdi::Cache::new(),
             st,
             text: String::new(),
@@ -617,12 +566,7 @@ pub fn create(st: SharedState) {
             hot_rects: Vec::new(),
             row_rects: Vec::new(),
         });
-        let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(ui.w, ui.h);
-        ui.mem_dc = mem_dc;
-        ui.hbmp = hbmp;
-        ui.bmp = bmp;
-        ui.scan0 = scan0;
-        GdipGetImageGraphicsContext(ui.bmp, &mut ui.g);
+        ui.surf = gdi::Dib::alloc(ui.w, ui.h);
         CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendCp(ui));
     }
 }
@@ -636,65 +580,17 @@ impl CityUi {
         // 屏幕缩放/界面字号变化：按新 sf 重建位图（本窗口未接入 rescale 链，靠
         // 打开时 open() 的 SetWindowPos(新物理尺寸) + 此处失配检测自愈；
         // ulw 与鼠标坐标换算都取 self.sf，同步后整体对齐）
-        if (self.sf - gdi::scale()).abs() > 0.001 || self.bmp.is_null() {
-            unsafe {
-                gdi::free_dib(&mut self.mem_dc, &mut self.hbmp, &mut self.bmp, &mut self.g, &mut self.scan0);
-                let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(self.w, self.h);
-                self.mem_dc = mem_dc;
-                self.hbmp = hbmp;
-                self.bmp = bmp;
-                self.scan0 = scan0;
-            }
+        if (self.sf - gdi::scale()).abs() > 0.001 || !self.surf.is_alloc() {
             self.sf = gdi::scale();
+            self.surf = gdi::Dib::alloc(self.w, self.h);
         }
-        if self.g.is_null() {
-            unsafe {
-                GdipGetImageGraphicsContext(self.bmp, &mut self.g);
-            }
-        }
-        let cache_ptr: *const gdi::Cache = &self.cache;
-        unsafe {
-            GdipSetSmoothingMode(self.g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(self.g, gdi::text_hint());
-        }
-        let p = gdi::Painter {
-            g: self.g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         self.paint(&p);
         self.ulw();
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = winapi::shared::windef::SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, self.w, self.h);
     }
 
     /// 输入框行（含占位符/文本/闪烁光标）：整窗 paint 与光标闪烁的局部重绘
@@ -741,25 +637,11 @@ impl CityUi {
     /// 光标闪烁的局部重绘：仅擦写输入框带（y 44~80，含描边外扩）后重画该行 +
     /// ULW，跳过热门城市/搜索结果列表与标题的整窗重绘
     fn redraw_input(&mut self) {
-        if self.bmp.is_null() || self.g.is_null() {
+        if !self.surf.is_alloc() {
             self.redraw();
             return;
         }
-        let cache_ptr: *const gdi::Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = gdi::Painter {
-            g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         p.fill_rect(14.0, 44.0, CP_W - 28.0, 36.0, crate::theme::pal().popup);
         self.paint_input(&p);
         self.ulw();
@@ -845,4 +727,29 @@ impl CityUi {
             );
         }
     }
+}
+
+/// 界面自检（见 selftest 模块）：热门城市页与搜索结果页各渲染一帧并转储，窗口不显示
+#[cfg(feature = "selftest")]
+pub fn debug_render(st: SharedState, dir: &std::path::Path) {
+    use crate::debug::save_frame;
+    if CP_HWND.load(Ordering::Relaxed) == 0 {
+        create(st);
+    }
+    let mut guard = CP_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(f) = guard.as_mut() else { return };
+    let f = &mut f.0;
+    f.redraw();
+    save_frame(dir, "70-wxcity-hot", &f.surf, f.w, f.h, f.sf);
+    f.text = "北京".into();
+    f.caret = 2;
+    f.results = vec![
+        crate::weather::CityHit { name: "北京".into(), province: "北京".into(), url: String::new() },
+        crate::weather::CityHit { name: "北碚".into(), province: "重庆".into(), url: String::new() },
+    ];
+    f.status = "正在添加 北京…".into();
+    f.redraw();
+    save_frame(dir, "71-wxcity-results", &f.surf, f.w, f.h, f.sf);
+    f.redraw_input();
+    save_frame(dir, "72-wxcity-input-redraw", &f.surf, f.w, f.h, f.sf);
 }

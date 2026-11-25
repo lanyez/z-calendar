@@ -234,7 +234,7 @@ fn fetch_station_table() -> Option<Vec<(String, String)>> {
             return None;
         }
         let obj = serde_json::json!({ "ts": now_ms(), "st": table });
-        let _ = std::fs::write(station_table_path(), obj.to_string());
+        let _ = crate::config::write_file_atomic(&station_table_path(), &obj.to_string());
         Some(table)
     })();
     if result.is_none() {
@@ -595,7 +595,8 @@ pub fn save_cache(located: Option<&Weather>, custom: &[Weather]) {
         "located": located.map(save_one),
         "custom": custom.iter().map(save_one).collect::<Vec<_>>(),
     });
-    let _ = std::fs::write(path, obj.to_string());
+    // 缓存文件：原子写（不保留备份，损坏即视为无缓存、重新拉取）
+    let _ = crate::config::write_file_atomic(&path, &obj.to_string());
 }
 
 /// 上次成功缓存中的（站号, 定位城市）：城市未变时跳过字典解析
@@ -606,12 +607,7 @@ fn prev_station() -> Option<(String, String)> {
     Some((l.get("station")?.as_str()?.into(), l.get("city")?.as_str()?.into()))
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::clock::now_ms_u64 as now_ms;
 
 // ---------------------------------------------------------------------------
 // 城市搜索与站号解析（nmc.cn essearch autocomplete → cma 省字典）：
@@ -957,6 +953,7 @@ mod tests {
 
     // 真实网络拉取验证（需联网）
     #[test]
+    #[ignore = "需要联网；显式运行：cargo test -- --ignored"]
     fn fetch_real_network() {
         let w = super::fetch();
         println!("weather = {:?}", w);
@@ -968,6 +965,7 @@ mod tests {
 
     // 诊断：热门城市全链路（搜索 → 名称校正 → 站号解析；需联网）
     #[test]
+    #[ignore = "需要联网；显式运行：cargo test -- --ignored"]
     fn diag_hot_cities() {
         // (城市, 期望站号)；西安专门验证“首条为安溪”时的名称校正
         let expect = [
@@ -1015,6 +1013,7 @@ mod tests {
 
     // 真实网络：城市搜索 → 站号解析（需联网）
     #[test]
+    #[ignore = "需要联网；显式运行：cargo test -- --ignored"]
     fn search_real_network() {
         let hits = super::search_cities("广州");
         assert!(!hits.is_empty(), "no hits");

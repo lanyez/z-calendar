@@ -277,8 +277,9 @@ static UIA_B: AtomicI32 = AtomicI32::new(0);
 /// 保证拼出的矩形 4 边来自同一轮定位（4 个独立原子量的非原子组会撕出"左新右旧"）
 static UIA_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// overlay 线程每秒读取：UIA 最近一次定位到的时钟矩形（屏幕坐标；进程未声明
-/// DPI 感知，与 GetWindowRect 返回的坐标系同为虚拟化坐标，二者可直接混用）
+/// overlay 线程每秒读取：UIA 最近一次定位到的时钟矩形（屏幕坐标）。进程为
+/// Per-Monitor V2 感知（见 main::set_dpi_aware），UIA 的 BoundingRectangle 与
+/// GetWindowRect 返回的同为物理像素，二者可直接混用
 pub fn snapshot_rect() -> Option<RECT> {
     if !UIA_VALID.load(Ordering::Relaxed) {
         return None;
@@ -432,7 +433,7 @@ const FULLTREE_PROBE_AT: u32 = 30;
 static UIA_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 unsafe fn scan_tick(uia: *mut c_void, st: &mut ScanState) {
-    let logging = *UIA_LOG.get_or_init(|| std::env::var("CAL_UIA_LOG").map(|v| v == "1").unwrap_or(false));
+    let logging = *UIA_LOG.get_or_init(|| crate::debug::flag(crate::debug::UIA_LOG));
     let mut log: Vec<String> = Vec::new();
     let found = locate(uia, st, &mut log);
     match found {

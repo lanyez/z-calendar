@@ -4,14 +4,14 @@
 //! 开始/结束为两步选择：先选日期（月历），再选时间（时/分列表）；全天日程只选日期
 //! 分层窗口 + GDI+ 自绘，支持中文 IME 与剪贴板粘贴；打开时主日历保持显示
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::winuser::*;
 
-use crate::events::{self, AgendaEntry, AgendaMap, RichEvent};
+use crate::events::{self, AgendaEntry, RichEvent};
 use crate::gdi::{self, Cache, Painter};
 
 const DL_W: f32 = 400.0;
@@ -79,7 +79,6 @@ fn priority_badge(p: u8) -> Option<(&'static str, u32)> {
 
 static IB_HWND: AtomicUsize = AtomicUsize::new(0);
 static IB_UI: Mutex<Option<SendIb>> = Mutex::new(None);
-static IB_AGENDA: Mutex<Option<Arc<Mutex<AgendaMap>>>> = Mutex::new(None);
 
 struct SendIb(Box<DialogUi>);
 unsafe impl Send for SendIb {}
@@ -154,11 +153,8 @@ struct DialogUi {
     hwnd: usize,
     sf: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    /// 后台位图（隐藏时释放，显示前重建；见 gdi::Dib）
+    surf: gdi::Dib,
     cache: Cache,
     kind: Kind,
     date: NaiveDate,
@@ -207,37 +203,6 @@ struct DialogUi {
     edit_todo: Option<(usize, bool, String, Vec<String>, Vec<String>)>,
 }
 
-#[link(name = "gdiplus")]
-extern "system" {
-    fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
-}
-
-#[link(name = "imm32")]
-extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
-}
-
-#[link(name = "user32")]
-extern "system" {
-    fn SetFocus(hwnd: HWND) -> HWND;
-    fn OpenClipboard(hwnd: HWND) -> i32;
-    fn CloseClipboard() -> i32;
-    fn GetClipboardData(fmt: u32) -> *mut core::ffi::c_void;
-    fn GlobalLock(h: usize) -> *mut u16;
-    fn GlobalSize(h: usize) -> usize;
-    fn GlobalUnlock(h: usize) -> i32;
-    fn SetForegroundWindow(hwnd: HWND) -> i32;
-    fn KillTimer(hwnd: HWND, id: usize) -> i32;
-    fn SendMessageW(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT;
-    fn ScreenToClient(hwnd: HWND, pt: *mut POINT) -> i32;
-}
-
-const GCS_COMPSTR: i32 = 0x0008;
-const GCS_RESULTSTR: i32 = 0x0800;
 
 pub fn hwnd() -> usize {
     IB_HWND.load(Ordering::Relaxed)
@@ -274,9 +239,8 @@ fn dialog_h(kind: Kind, time_on: bool, recur_rows: usize) -> f32 {
     y + SAVE_H + 8.0
 }
 
-pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
+pub fn create_window() {
     unsafe {
-        *IB_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(agenda);
         let cls = crate::wide("z-calendar-input");
         let hinstance = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null_mut());
         let mut wc: WNDCLASSW = std::mem::zeroed();
@@ -311,11 +275,7 @@ pub fn create_window(agenda: Arc<Mutex<AgendaMap>>) {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             h: 386.0,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: Cache::new(),
             kind: Kind::Agenda,
             date: chrono::Local::now().date_naive(),
@@ -463,90 +423,10 @@ enum Prefill {
     Todo { gi: usize, done: bool, id: String, text: String, priority: u8, time_on: bool, start: NaiveDateTime, end: NaiveDateTime, remind: Option<i64>, repeat: Option<i64>, recur: Option<String>, until: Option<String>, skips: Vec<String>, done_dates: Vec<String>, occ: Option<NaiveDate>, note: String, color: Option<u8> },
 }
 
+/// 在指定位置附近打开弹窗（复用已创建的窗口；清空上次输入）
 fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
+    let Some(h) = fill(date, kind, pre) else { return };
     unsafe {
-        let h = IB_HWND.load(Ordering::Relaxed);
-        if h == 0 {
-            return;
-        }
-        let h = h as HWND;
-        {
-            let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(f) = guard.as_mut() {
-                let f = &mut f.0;
-                f.kind = kind;
-                f.date = date;
-                f.todo_text.clear();
-                f.agenda_name.clear();
-                f.note.clear();
-                f.note_caret = 0;
-                f.note_sel = None;
-                f.note_focus = false;
-                f.color = None;
-                f.comp.clear();
-                f.priority = 0;
-                f.time_on = false;
-                f.all_day = false;
-                f.a_start = date_at(date, 9, 0);
-                f.a_end = date_at(date, 10, 0);
-                f.remind = None;
-                f.repeat = None;
-                f.recur = None;
-                f.until_on = false;
-                f.until_dt = date_at(date, 0, 0);
-                f.scope_series = true;
-                f.scope_date = None;
-                f.caret_on = true;
-                f.caret = 0;
-                f.sel = None;
-                f.pick = None;
-                f.drop = None;
-                f.hover = None;
-                f.edit_agenda = None;
-                f.edit_todo = None;
-                match pre {
-                    Prefill::New => {}
-                    Prefill::Agenda { key, idx, id, name, all_day, start, end, remind, repeat, recur, until, skips, occ, note, color } => {
-                        f.edit_agenda = Some((key, idx, id, skips));
-                        f.agenda_name = name;
-                        f.note = note;
-                        f.color = color;
-                        f.all_day = all_day;
-                        f.a_start = start;
-                        f.a_end = end;
-                        f.remind = remind;
-                        f.repeat = repeat;
-                        f.recur = recur;
-                        f.until_on = until.is_some();
-                        f.until_dt = until
-                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
-                            .and_then(|d| d.and_hms_opt(0, 0, 0))
-                            .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
-                        f.scope_date = occ;
-                    }
-                    Prefill::Todo { gi, done, id, text, priority, time_on, start, end, remind, repeat, recur, until, skips, done_dates, occ, note, color } => {
-                        f.edit_todo = Some((gi, done, id, done_dates, skips));
-                        f.todo_text = text;
-                        f.note = note;
-                        f.color = color;
-                        f.priority = priority;
-                        f.time_on = time_on;
-                        f.a_start = start;
-                        f.a_end = end;
-                        f.remind = remind;
-                        f.repeat = repeat;
-                        f.recur = recur;
-                        f.until_on = until.is_some();
-                        f.until_dt = until
-                            .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
-                            .and_then(|d| d.and_hms_opt(0, 0, 0))
-                            .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
-                        f.scope_date = occ;
-                    }
-                }
-                f.h = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
-            }
-        }
         // 工作区钳制（鼠标所在显示器，物理像素）
         let mon = MonitorFromPoint(POINT { x: at_x, y: at_y }, MONITOR_DEFAULTTONEAREST);
         let (wa_l, wa_t, wa_r, wa_b) = if !mon.is_null() {
@@ -575,6 +455,93 @@ fn open_with(at_x: i32, at_y: i32, date: NaiveDate, kind: Kind, pre: Prefill) {
         redraw();
         SetTimer(h, 1, 500, None); // 光标闪烁
     }
+}
+
+/// 把弹窗状态重置为给定类型 / 日期并预填，返回窗口句柄（窗口未创建时 None）。
+/// 只填状态、不碰窗口——界面自检据此在不显示弹窗的情况下渲染（见 selftest 模块）
+fn fill(date: NaiveDate, kind: Kind, pre: Prefill) -> Option<HWND> {
+    let h = IB_HWND.load(Ordering::Relaxed) as HWND;
+    if h.is_null() {
+        return None;
+    }
+    {
+        let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = guard.as_mut() {
+            let f = &mut f.0;
+            f.kind = kind;
+            f.date = date;
+            f.todo_text.clear();
+            f.agenda_name.clear();
+            f.note.clear();
+            f.note_caret = 0;
+            f.note_sel = None;
+            f.note_focus = false;
+            f.color = None;
+            f.comp.clear();
+            f.priority = 0;
+            f.time_on = false;
+            f.all_day = false;
+            f.a_start = date_at(date, 9, 0);
+            f.a_end = date_at(date, 10, 0);
+            f.remind = None;
+            f.repeat = None;
+            f.recur = None;
+            f.until_on = false;
+            f.until_dt = date_at(date, 0, 0);
+            f.scope_series = true;
+            f.scope_date = None;
+            f.caret_on = true;
+            f.caret = 0;
+            f.sel = None;
+            f.pick = None;
+            f.drop = None;
+            f.hover = None;
+            f.edit_agenda = None;
+            f.edit_todo = None;
+            match pre {
+                Prefill::New => {}
+                Prefill::Agenda { key, idx, id, name, all_day, start, end, remind, repeat, recur, until, skips, occ, note, color } => {
+                    f.edit_agenda = Some((key, idx, id, skips));
+                    f.agenda_name = name;
+                    f.note = note;
+                    f.color = color;
+                    f.all_day = all_day;
+                    f.a_start = start;
+                    f.a_end = end;
+                    f.remind = remind;
+                    f.repeat = repeat;
+                    f.recur = recur;
+                    f.until_on = until.is_some();
+                    f.until_dt = until
+                        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
+                    f.scope_date = occ;
+                }
+                Prefill::Todo { gi, done, id, text, priority, time_on, start, end, remind, repeat, recur, until, skips, done_dates, occ, note, color } => {
+                    f.edit_todo = Some((gi, done, id, done_dates, skips));
+                    f.todo_text = text;
+                    f.note = note;
+                    f.color = color;
+                    f.priority = priority;
+                    f.time_on = time_on;
+                    f.a_start = start;
+                    f.a_end = end;
+                    f.remind = remind;
+                    f.repeat = repeat;
+                    f.recur = recur;
+                    f.until_on = until.is_some();
+                    f.until_dt = until
+                        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .unwrap_or_else(|| date_at(start.date() + chrono::Duration::days(30), 0, 0));
+                    f.scope_date = occ;
+                }
+            }
+            f.h = dialog_h(f.kind, f.time_on, f.recur_extra_rows());
+        }
+    }
+    Some(h)
 }
 
 fn redraw() {
@@ -608,54 +575,18 @@ unsafe fn resize_keep_center(hwnd: HWND, old_h: f32, new_h: f32) {
 
 impl DialogUi {
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            // 隐藏时位图已释放压缩内存：显示前重建。
-            // 必须按最大高度分配：弹窗高度随表单内容动态增长（ULW 直接提交新高度）
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(DL_W, H_MAX) };
-            self.mem_dc = mem_dc;
-            self.hbmp = hbmp;
-            self.bmp = bmp;
-            self.scan0 = scan0;
+        // 隐藏时位图已释放压缩内存：显示前重建。
+        // 必须按最大高度分配：弹窗高度随表单内容动态增长（ULW 直接提交新高度）
+        if !self.surf.is_alloc() {
+            self.surf = gdi::Dib::alloc(DL_W, H_MAX);
         }
-        if self.g.is_null() {
-            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
-        }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: DL_W, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
+        let p = self.surf.painter(&self.cache, self.sf, DL_W, self.h);
         self.paint(&p);
         self.ulw();
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: gdi::phys(DL_W) as i32, cy: gdi::phys(self.h) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, DL_W, self.h);
     }
 
     fn hit_add(regions: &mut Vec<(gdi::RectF, DlAction)>, x: f32, y: f32, w: f32, h: f32, a: DlAction) {
@@ -947,7 +878,7 @@ impl DialogUi {
 
     /// 绘制器（点击定位光标时复用当前后台位图；仅窗口可见时有效）
     fn painter(&self) -> Painter {
-        Painter { g: self.g, cache: &self.cache, sf: self.sf, w: DL_W, h: self.h, dc: self.mem_dc, scan0: self.scan0 }
+        self.surf.painter(&self.cache, self.sf, DL_W, self.h)
     }
 
     /// 点击落点 → 光标 char 下标（按折行布局逐行定位）
@@ -1543,11 +1474,14 @@ fn confirm() {
                 note,
                 color,
             };
+            // 编辑模式：(打开弹窗时的全局下标, 原条目 id)。弹窗开着时列表可能已被别处
+            // 增删，下标会漂移——保存时按 id 重新定位（见 sidebar::locate_todo）
+            let edit_at = edit.as_ref().map(|(gi, _, id, _, _)| (*gi, id.clone()));
             drop(guard);
             if scope_only {
                 // 仅这一天：系列条目追加例外（可顺带更新截止日），编辑结果另存为独立待办
-                if let Some((gi, ..)) = edit {
-                    crate::sidebar::todo_patch_recur(gi, until_store, Some(scope_date));
+                if let Some((gi, id)) = &edit_at {
+                    crate::sidebar::todo_patch_recur_by_id(id, *gi, until_store, Some(scope_date));
                 }
                 let mut single = todo;
                 single.recur = None;
@@ -1557,8 +1491,8 @@ fn confirm() {
                 single.done_dates = Vec::new();
                 single.id = String::new();
                 crate::sidebar::add_todo_full(single);
-            } else if let Some((gi, ..)) = edit {
-                crate::sidebar::update_todo_at(gi, todo);
+            } else if let Some((gi, id)) = edit_at {
+                crate::sidebar::update_todo_by_id(&id, gi, todo);
             } else {
                 crate::sidebar::add_todo_full(todo);
             }
@@ -1588,15 +1522,16 @@ fn confirm() {
                 note,
                 color,
             });
-            let agenda = IB_AGENDA.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            if let Some(agenda) = agenda {
+            if let Some(agenda) = events::shared_agenda() {
                 events::edit_and_save(&agenda, |map| match edit {
-                    Some((old_key, idx, ..)) => {
+                    Some((old_key, idx, id, ..)) => {
+                        // 弹窗开着时列表可能已被别处增删，下标会漂移：按 id 重新定位
+                        let (at_key, at_idx) = events::locate_entry_by_id(map, &id, &old_key, idx);
                         if scope_only {
                             // 仅这一天：系列条目追加例外（可顺带更新截止日），编辑结果另存为独立日程
                             let scope = f.scope_date.unwrap_or(f.date);
-                            if let Some(v) = map.get_mut(&old_key) {
-                                if let Some(AgendaEntry::Rich(sr)) = v.get_mut(idx) {
+                            if let Some(v) = map.get_mut(&at_key) {
+                                if let Some(AgendaEntry::Rich(sr)) = v.get_mut(at_idx) {
                                     if !events::recur_skipped(&sr.skip_dates, scope) {
                                         sr.skip_dates.push(crate::ics::key_of_date(scope));
                                     }
@@ -1612,19 +1547,19 @@ fn confirm() {
                             map.entry(key).or_default().push(entry);
                         } else {
                             // 编辑保存：同日期原位替换；改了日期则移动到新日期
-                            if old_key == key {
+                            if at_key == key {
                                 if let Some(v) = map.get_mut(&key) {
-                                    if idx < v.len() {
-                                        v[idx] = entry;
+                                    if at_idx < v.len() {
+                                        v[at_idx] = entry;
                                     }
                                 }
                             } else {
-                                if let Some(v) = map.get_mut(&old_key) {
-                                    if idx < v.len() {
-                                        v.remove(idx);
+                                if let Some(v) = map.get_mut(&at_key) {
+                                    if at_idx < v.len() {
+                                        v.remove(at_idx);
                                     }
                                     if v.is_empty() {
-                                        map.remove(&old_key);
+                                        map.remove(&at_key);
                                     }
                                 }
                                 map.entry(key).or_default().push(entry);
@@ -1656,10 +1591,7 @@ fn confirm() {
 fn free_surface() {
     let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
-        let ui = &mut f.0;
-        unsafe {
-            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-        }
+        f.0.surf.release();
     }
 }
 
@@ -1682,9 +1614,7 @@ pub fn rescale(sf: f32) {
     if let Some(f) = guard.as_mut() {
         let ui = &mut f.0;
         ui.sf = sf;
-        unsafe {
-            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-        }
+        ui.surf.release();
         if vis {
             unsafe {
                 SetWindowPos(
@@ -1702,48 +1632,6 @@ pub fn rescale(sf: f32) {
     }
 }
 
-unsafe fn read_ime(hwnd: HWND, mode: i32) -> Option<String> {
-    let himc = ImmGetContext(hwnd);
-    if himc.is_null() {
-        return None;
-    }
-    let len = ImmGetCompositionStringW(himc, mode, std::ptr::null_mut(), 0);
-    let mut out = None;
-    if len >= 0 {
-        let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
-        if got >= 0 {
-            let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
-            out = Some(String::from_utf16_lossy(slice));
-        }
-    }
-    ImmReleaseContext(hwnd, himc);
-    out
-}
-
-unsafe fn read_clipboard(hwnd: usize) -> Option<String> {
-    if OpenClipboard(hwnd as HWND) == 0 {
-        return None;
-    }
-    let h = GetClipboardData(13); // CF_UNICODETEXT
-    let mut out = None;
-    if !h.is_null() {
-        let ptr = GlobalLock(h as usize);
-        if !ptr.is_null() {
-            // 扫 NUL 终止符以分配大小为上界：异常数据（无终止符）时不越界读
-            let cap = GlobalSize(h as usize) / 2;
-            let mut len = 0usize;
-            while len < cap && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            out = Some(String::from_utf16_lossy(slice));
-            GlobalUnlock(h as usize);
-        }
-    }
-    CloseClipboard();
-    out
-}
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -1853,20 +1741,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 0x43 if ctrl => {
                                     if let Some(t) = crate::textedit::sel_text(&pk.text, pk.caret, pk.sel) {
                                         unsafe {
-                                            crate::textedit::set_clipboard(f.hwnd, &t);
+                                            crate::clipboard::set_text(f.hwnd, &t);
                                         }
                                     }
                                 }
                                 0x58 if ctrl => {
                                     if let Some(t) = crate::textedit::sel_text(&pk.text, pk.caret, pk.sel) {
                                         unsafe {
-                                            crate::textedit::set_clipboard(f.hwnd, &t);
+                                            crate::clipboard::set_text(f.hwnd, &t);
                                         }
                                         crate::textedit::delete_sel(&mut pk.text, &mut pk.caret, &mut pk.sel);
                                     }
                                 }
                                 0x56 if ctrl => {
-                                    if let Some(t) = unsafe { read_clipboard(f.hwnd) } {
+                                    if let Some(t) = unsafe { crate::clipboard::read_text(f.hwnd) } {
                                         crate::textedit::insert(&mut pk.text, &mut pk.caret, &mut pk.sel, &t);
                                         pk.hint = None;
                                     }
@@ -1937,7 +1825,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                     0x56 => {
                         // Ctrl+V 粘贴（替换选区，插入光标处）
                         if ctrl {
-                            if let Some(t) = unsafe { read_clipboard(hwnd_id) } {
+                            if let Some(t) = unsafe { crate::clipboard::read_text(hwnd_id) } {
                                 crate::textedit::insert(text, caret, sel, &t);
                                 f.redraw();
                             }
@@ -1955,7 +1843,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if ctrl {
                             if let Some(t) = crate::textedit::sel_text(text, *caret, *sel) {
                                 unsafe {
-                                    crate::textedit::set_clipboard(hwnd_id, &t);
+                                    crate::clipboard::set_text(hwnd_id, &t);
                                 }
                             }
                         }
@@ -1965,7 +1853,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         if ctrl {
                             if let Some(t) = crate::textedit::sel_text(text, *caret, *sel) {
                                 unsafe {
-                                    crate::textedit::set_clipboard(hwnd_id, &t);
+                                    crate::clipboard::set_text(hwnd_id, &t);
                                 }
                                 crate::textedit::delete_sel(text, caret, sel);
                                 f.redraw();
@@ -2021,8 +1909,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
             let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
                 let f = &mut f.0;
-                if lp as i32 & GCS_RESULTSTR != 0 {
-                    if let Some(s) = read_ime(hwnd, GCS_RESULTSTR) {
+                if lp as i32 & crate::ime::RESULT != 0 {
+                    if let Some(s) = crate::ime::composition_string(hwnd, crate::ime::RESULT) {
                         if f.drop.is_some() {
                             if let Some(pk) = f.pick.as_ref() {
                                 f.pick_undo.snapshot(&pk.text, pk.caret, pk.sel, "ins");
@@ -2039,8 +1927,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             f.comp.clear();
                         }
                     }
-                } else if lp as i32 & GCS_COMPSTR != 0 {
-                    let s = read_ime(hwnd, GCS_COMPSTR).unwrap_or_default();
+                } else if lp as i32 & crate::ime::COMP != 0 {
+                    let s = crate::ime::composition_string(hwnd, crate::ime::COMP).unwrap_or_default();
                     if f.drop.is_some() {
                         if let Some(pk) = f.pick.as_mut() {
                             pk.comp = s;
@@ -2392,4 +2280,68 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// 界面自检（见 selftest 模块）：各表单状态各渲染一帧并转储，弹窗不显示
+#[cfg(feature = "selftest")]
+pub fn debug_render(dir: &std::path::Path) {
+    use crate::debug::save_frame;
+    let today = chrono::Local::now().date_naive();
+    let pick = || PickEdit {
+        text: "10-8 9:30".into(),
+        comp: String::new(),
+        caret: 9,
+        sel: None,
+        hint: None,
+    };
+    let render = |name: &str, setup: &dyn Fn(&mut DialogUi)| {
+        let mut guard = IB_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = guard.as_mut() {
+            let ui = &mut f.0;
+            setup(ui);
+            ui.h = dialog_h(ui.kind, ui.time_on, ui.recur_extra_rows());
+            ui.redraw();
+            save_frame(dir, name, &ui.surf, DL_W, ui.h, ui.sf);
+        }
+    };
+    fill(today, Kind::Agenda, Prefill::New);
+    render("60-input-agenda", &|ui: &mut DialogUi| {
+        ui.agenda_name = "项目评审".into();
+        ui.remind = Some(15);
+    });
+    render("61-input-agenda-repeat", &|ui: &mut DialogUi| {
+        ui.drop = Some(Drop::List { list: 1, anchor: 230.0 });
+    });
+    render("62-input-agenda-date", &|ui: &mut DialogUi| {
+        ui.drop = Some(Drop::Date { row: 0, y: today.year(), m: today.month(), anchor: 150.0 });
+        ui.pick = Some(pick());
+    });
+    render("63-input-agenda-time", &|ui: &mut DialogUi| {
+        ui.drop = Some(Drop::Time { row: 0, h_off: 9, m_off: 20, anchor: 150.0 });
+        ui.pick = Some(pick());
+    });
+    render("64-input-agenda-recurring", &|ui: &mut DialogUi| {
+        ui.drop = None;
+        ui.pick = None;
+        ui.recur = Some("w".into());
+        ui.scope_date = Some(today);
+        ui.until_on = true;
+        ui.color = Some(2);
+        ui.note = "第一行备注，足够长以验证折行；然后换行\n第二行".into();
+        ui.note_caret = 4;
+    });
+    fill(today, Kind::Todo, Prefill::New);
+    render("65-input-todo", &|ui: &mut DialogUi| {
+        ui.todo_text = "交周报".into();
+        ui.time_on = true;
+        ui.priority = 2;
+        ui.a_start = date_at(today, 14, 30);
+        ui.a_end = date_at(today, 15, 0);
+    });
+    render("66-input-todo-priority", &|ui: &mut DialogUi| {
+        ui.drop = Some(Drop::List { list: 2, anchor: 200.0 });
+    });
+    // 回到日程表单：确认从待办状态切换后不残留
+    fill(today, Kind::Agenda, Prefill::New);
+    render("67-input-agenda-again", &|_ui: &mut DialogUi| {});
 }

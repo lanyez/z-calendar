@@ -1,6 +1,8 @@
 //! GDI+ 平面 API 封装（最小子集）+ 绘制助手
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use winapi::um::wingdi::{DeleteDC, DeleteObject, SelectObject};
+use winapi::um::winuser::{GetDC, GetWindowRect, ReleaseDC, UpdateLayeredWindow};
 use std::sync::Mutex;
 
 pub type Gp = *mut winapi::ctypes::c_void;
@@ -45,7 +47,7 @@ pub fn dpi_scale() -> f32 {
 
 /// 调试覆盖 CAL_SF=… 生效时为 true：缩放轮询停用，避免真实 DPI 覆盖调试值
 pub fn scale_overridden() -> bool {
-    *OVERRIDE.get_or_init(|| std::env::var("CAL_SF").is_ok())
+    *OVERRIDE.get_or_init(|| crate::debug::is_set(crate::debug::SF))
 }
 
 pub fn set_scale(s: f32) {
@@ -63,11 +65,9 @@ pub fn primary_scale() -> f32 {
 }
 
 unsafe fn detect_scale() -> f32 {
-    if let Ok(v) = std::env::var("CAL_SF") {
-        if let Ok(f) = v.parse::<f32>() {
-            if f > 0.0 {
-                return f;
-            }
+    if let Some(f) = crate::debug::parse::<f32>(crate::debug::SF) {
+        if f > 0.0 {
+            return f;
         }
     }
     use winapi::shared::windef::POINT;
@@ -152,86 +152,169 @@ pub fn work_area_of_point(x: i32, y: i32) -> (i32, i32, i32, i32) {
             }
         }
         let mut wa: winapi::shared::windef::RECT = std::mem::zeroed();
-        SystemParametersInfoW_gdi(0x0030, 0, &mut wa as *mut _ as *mut winapi::ctypes::c_void, 0);
+        winapi::um::winuser::SystemParametersInfoW(0x0030, 0, &mut wa as *mut _ as *mut winapi::ctypes::c_void, 0);
         (wa.left, wa.top, wa.right, wa.bottom)
     }
 }
 
-#[link(name = "user32")]
-extern "system" {
-    #[link_name = "SystemParametersInfoW"]
-    fn SystemParametersInfoW_gdi(action: u32, param: u32, data: *mut winapi::ctypes::c_void, init: u32) -> i32;
+// ---------- 后台位图（所有分层窗口共用） ----------
+
+/// 分层窗口的后台位图：内存 DC + 32bpp DIBSection + 绑定同一像素缓冲的 GDI+
+/// Bitmap/Graphics。此前 9 个文件各抄了一遍"分配 / 按缩放重建 / 释放 / 取绘制器 /
+/// UpdateLayeredWindow 提交"，泄漏与缩放失配类问题要逐处修；现在只此一份实现。
+/// 惯用法：隐藏时 `release()` 压缩内存，显示前 `alloc` 重建。
+///
+/// 句柄是进程级资源，不绑定线程；每个窗口的 Dib 由属主窗口的锁串行使用
+pub struct Dib {
+    mem_dc: usize,
+    hbmp: usize,
+    bmp: Gp,
+    scan0: *mut u8,
+    g: Gp,
 }
 
-// ---------- 后台位图生命周期（隐藏时释放以压缩提交内存，显示时重建） ----------
+unsafe impl Send for Dib {}
 
-/// 为分层窗口分配后台位图（物理尺寸 = 逻辑 × sf）：
-/// 内存 DC + 32bpp DIBSection + 绑定 scan0 的 GDI+ Bitmap。
-/// 返回 (mem_dc, hbmp, bmp, scan0)；Graphics 由调用方 GdipGetImageGraphicsContext 获取。
-pub unsafe fn alloc_dib(logical_w: f32, logical_h: f32) -> (usize, usize, Gp, *mut u8) {
-    use winapi::shared::windef::HDC;
-    use winapi::um::wingdi::{CreateCompatibleDC, CreateDIBSection, SelectObject, BI_RGB, BITMAPINFO, BITMAPINFOHEADER};
-    let w_px = phys(logical_w) as i32;
-    let h_px = phys(logical_h) as i32;
-    let hdc = GetDC(std::ptr::null_mut());
-    let mem_dc = CreateCompatibleDC(hdc) as usize;
-    let mut bmi: BITMAPINFO = std::mem::zeroed();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = w_px;
-    bmi.bmiHeader.biHeight = -h_px;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-    SelectObject(mem_dc as HDC, hbmp as *mut winapi::ctypes::c_void);
-    ReleaseDC(std::ptr::null_mut(), hdc);
-    let mut bmp: Gp = std::ptr::null_mut();
-    GdipCreateBitmapFromScan0(w_px, h_px, w_px * 4, PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
-    (mem_dc, hbmp as usize, bmp, bits as *mut u8)
+impl Dib {
+    /// 未分配的空位图
+    pub const fn empty() -> Dib {
+        Dib {
+            mem_dc: 0,
+            hbmp: 0,
+            bmp: std::ptr::null_mut(),
+            scan0: std::ptr::null_mut(),
+            g: std::ptr::null_mut(),
+        }
+    }
+
+    /// 按逻辑尺寸分配（物理尺寸 = 逻辑 × scale()）；Graphics 一并创建。
+    /// 需 GDI+ 已初始化（startup）
+    pub fn alloc(logical_w: f32, logical_h: f32) -> Dib {
+        use winapi::shared::windef::HDC;
+        use winapi::um::wingdi::{CreateCompatibleDC, CreateDIBSection, BI_RGB, BITMAPINFO, BITMAPINFOHEADER};
+        unsafe {
+            let w_px = phys(logical_w) as i32;
+            let h_px = phys(logical_h) as i32;
+            let hdc = GetDC(std::ptr::null_mut());
+            let mem_dc = CreateCompatibleDC(hdc) as usize;
+            let mut bmi: BITMAPINFO = std::mem::zeroed();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w_px;
+            bmi.bmiHeader.biHeight = -h_px; // 自上而下
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+            let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
+            SelectObject(mem_dc as HDC, hbmp as *mut winapi::ctypes::c_void);
+            ReleaseDC(std::ptr::null_mut(), hdc);
+            let mut bmp: Gp = std::ptr::null_mut();
+            GdipCreateBitmapFromScan0(w_px, h_px, w_px * 4, PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
+            let mut g: Gp = std::ptr::null_mut();
+            GdipGetImageGraphicsContext(bmp, &mut g);
+            Dib {
+                mem_dc,
+                hbmp: hbmp as usize,
+                bmp,
+                scan0: bits as *mut u8,
+                g,
+            }
+        }
+    }
+
+    pub fn is_alloc(&self) -> bool {
+        !self.bmp.is_null()
+    }
+
+    /// 释放全部句柄（幂等；离开作用域时由 Drop 自动调用）。
+    /// DIBSection 句柄必须显式记录并删除：它不会随 DC 删除，漏删会在每次
+    /// 显示/隐藏循环中泄漏
+    pub fn release(&mut self) {
+        use winapi::shared::windef::{HDC, HGDIOBJ};
+        unsafe {
+            if !self.g.is_null() {
+                GdipDeleteGraphics(self.g);
+                self.g = std::ptr::null_mut();
+            }
+            if !self.bmp.is_null() {
+                GdipDisposeImage(self.bmp);
+                self.bmp = std::ptr::null_mut();
+            }
+            if self.mem_dc != 0 {
+                DeleteDC(self.mem_dc as HDC);
+                self.mem_dc = 0;
+            }
+            if self.hbmp != 0 {
+                DeleteObject(self.hbmp as HGDIOBJ);
+                self.hbmp = 0;
+            }
+            self.scan0 = std::ptr::null_mut();
+        }
+    }
+
+    /// 像素缓冲（BGRA 预乘、自上而下；整窗 alpha 缩放、帧转储用）。未分配时为 null
+    pub fn pixels(&self) -> *mut u8 {
+        self.scan0
+    }
+
+    /// 取绘制器（抗锯齿 + 与主题匹配的文本渲染提示）。w / h 为绘制与裁剪用的逻辑
+    /// 尺寸——位图可能比它大（按最大高度分配的弹窗、只显示内容大小的提示框）
+    pub fn painter(&self, cache: &Cache, sf: f32, w: f32, h: f32) -> Painter {
+        unsafe {
+            GdipSetSmoothingMode(self.g, SMOOTH_ANTI_ALIAS);
+            GdipSetTextRenderingHint(self.g, text_hint());
+        }
+        Painter {
+            g: self.g,
+            cache: cache as *const Cache,
+            sf,
+            w,
+            h,
+            dc: self.mem_dc,
+            scan0: self.scan0,
+        }
+    }
+
+    /// 提交到分层窗口：窗口尺寸 = (w × sf, h × sf)，位置保持不变
+    pub fn present(&self, hwnd: usize, sf: f32, w: f32, h: f32) {
+        use winapi::shared::windef::RECT;
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd as winapi::shared::windef::HWND, &mut r);
+            self.present_at(hwnd, r.left, r.top, sf, w, h);
+        }
+    }
+
+    /// 提交到分层窗口并摆到指定屏幕坐标（位置以物理像素计）
+    pub fn present_at(&self, hwnd: usize, x: i32, y: i32, sf: f32, w: f32, h: f32) {
+        use winapi::shared::windef::{HWND, POINT, SIZE};
+        use winapi::um::wingdi::BLENDFUNCTION;
+        unsafe {
+            let mut ppt = POINT { x, y };
+            let mut size = SIZE { cx: (w * sf) as i32, cy: (h * sf) as i32 };
+            let mut src = POINT { x: 0, y: 0 };
+            let mut blend = BLENDFUNCTION {
+                BlendOp: 0, // AC_SRC_OVER
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: 1, // AC_SRC_ALPHA
+            };
+            UpdateLayeredWindow(hwnd as HWND, std::ptr::null_mut(), &mut ppt, &mut size, self.mem_dc as winapi::shared::windef::HDC, &mut src, 0, &mut blend, 2);
+        }
+    }
 }
 
-/// 释放后台位图。幂等；显示后 redraw 前需重新 alloc_dib 并重新获取 Graphics。
-/// hbmp 必须记录：DIBSection 句柄不会随 DC 删除，漏删会在每次显示/隐藏循环中泄漏。
-pub unsafe fn free_dib(mem_dc: &mut usize, hbmp: &mut usize, bmp: &mut Gp, g: &mut Gp, scan0: &mut *mut u8) {
-    if !g.is_null() {
-        GdipDeleteGraphics(*g);
-        *g = std::ptr::null_mut();
+impl Drop for Dib {
+    fn drop(&mut self) {
+        self.release();
     }
-    if !bmp.is_null() {
-        GdipDisposeImage(*bmp);
-        *bmp = std::ptr::null_mut();
-    }
-    if *mem_dc != 0 {
-        DeleteDC(*mem_dc as winapi::shared::windef::HDC);
-        *mem_dc = 0;
-    }
-    if *hbmp != 0 {
-        DeleteObject(*hbmp as *mut winapi::ctypes::c_void);
-        *hbmp = 0;
-    }
-    *scan0 = std::ptr::null_mut();
-}
-
-#[link(name = "gdi32")]
-extern "system" {
-    fn DeleteDC(hdc: winapi::shared::windef::HDC) -> i32;
-    fn DeleteObject(obj: *mut winapi::ctypes::c_void) -> i32;
-}
-
-#[link(name = "user32")]
-extern "system" {
-    fn GetDC(hwnd: winapi::shared::windef::HWND) -> winapi::shared::windef::HDC;
-    fn ReleaseDC(hwnd: winapi::shared::windef::HWND, hdc: winapi::shared::windef::HDC) -> i32;
 }
 
 /// 文本渲染模式，默认 ClearType。调试钩子 CAL_TEXT_HINT=0~5 可覆盖（对比渲染效果用）。
 pub fn text_hint() -> i32 {
     static HINT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *HINT.get_or_init(|| {
-        std::env::var("CAL_TEXT_HINT")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
+        crate::debug::parse::<i32>(crate::debug::TEXT_HINT)
             .filter(|&v| (0..=5).contains(&v))
             .unwrap_or(TEXT_HINT_CLEAR_TYPE)
     })
@@ -311,7 +394,7 @@ unsafe fn gdi_font(px: i32, bold: bool, face: u8) -> usize {
         FACE_EMOJI => "Segoe UI Emoji".to_string(),
         _ => font_family(),
     };
-    let face = wide(&face_name);
+    let face = crate::wide(&face_name);
     let hfont = CreateFontW(
         -px,
         0,
@@ -417,17 +500,12 @@ extern "system" {
     fn GdipMeasureString(graphics: Gp, text: *const u16, len: i32, font: Gp, layout: *const RectF, format: Gp, bounding: *mut RectF, codepoints: *mut i32, lines: *mut i32) -> i32;
     fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut Gp) -> i32;
     fn GdipGetImageGraphicsContext(image: Gp, graphics: *mut Gp) -> i32;
+    fn GdipSetSmoothingMode(graphics: Gp, mode: i32) -> i32;
+    fn GdipSetTextRenderingHint(graphics: Gp, mode: i32) -> i32;
     fn GdipDisposeImage(image: Gp) -> i32;
 }
 
-/// 由位图取 Graphics（tooltip 等独立小窗复用）
-pub fn graphics_from_image(bmp: Gp) -> Gp {
-    let mut g: Gp = std::ptr::null_mut();
-    unsafe {
-        GdipGetImageGraphicsContext(bmp, &mut g);
-    }
-    g
-}
+
 
 pub fn startup() {
     unsafe {
@@ -451,9 +529,7 @@ pub const fn argb_a(a: u8, rgb: u32) -> u32 {
     argb(a, (rgb >> 16) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+
 
 thread_local! {
     // 文本绘制的高频小分配复用缓冲（绘制都在主线程）
@@ -484,13 +560,13 @@ unsafe impl Sync for Cache {}
 impl Cache {
     pub fn new() -> Cache {
         unsafe {
-            let n1 = wide(&font_family());
+            let n1 = crate::wide(&font_family());
             let mut family_yahei: Gp = std::ptr::null_mut();
             if GdipCreateFontFamilyFromName(n1.as_ptr(), std::ptr::null_mut(), &mut family_yahei) != 0 {
-                let n2 = wide("Microsoft YaHei");
+                let n2 = crate::wide("Microsoft YaHei");
                 GdipCreateFontFamilyFromName(n2.as_ptr(), std::ptr::null_mut(), &mut family_yahei);
             }
-            let n3 = wide("Segoe MDL2 Assets");
+            let n3 = crate::wide("Segoe MDL2 Assets");
             let mut family_mdl2: Gp = std::ptr::null_mut();
             GdipCreateFontFamilyFromName(n3.as_ptr(), std::ptr::null_mut(), &mut family_mdl2);
             let mut format: Gp = std::ptr::null_mut();
@@ -512,10 +588,10 @@ impl Cache {
     /// 字体族设置变化后重建 GDI+ 字体族并作废旧字体（单 UI 线程调用）
     unsafe fn rebuild_family(&self) {
         let name = font_family();
-        let n = wide(&name);
+        let n = crate::wide(&name);
         let mut fam: Gp = std::ptr::null_mut();
         if GdipCreateFontFamilyFromName(n.as_ptr(), std::ptr::null_mut(), &mut fam) != 0 {
-            let n2 = wide("Microsoft YaHei");
+            let n2 = crate::wide("Microsoft YaHei");
             GdipCreateFontFamilyFromName(n2.as_ptr(), std::ptr::null_mut(), &mut fam);
         }
         let old = self.family_yahei.swap(fam as usize, Ordering::Relaxed);

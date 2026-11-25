@@ -45,21 +45,26 @@ pub fn year_ganzhi_name(date: NaiveDate) -> String {
     format!("{}{}年", GANZHI_NAMES[idx], ZODIACS[idx % 12])
 }
 
+/// 日期所属的月支（0=子 … 11=亥）：取"最近一个已到达的节"所在月份。
+/// 每月上旬的节（立春/惊蛰/清明/立夏/芒种/小暑/立秋/白露/寒露/立冬/大雪/小寒）
+/// 已到则属当月，否则归上一个月；1 月未到小寒即上一年 12 月（大雪后）的子月。
+/// 各节都落在每月 4~8 号，"上一个月的节"必然已经过，无需跨年查表。
+/// 对应关系：1月(小寒后)=丑 2月(立春后)=寅 … 12月(大雪后)=子。
+fn month_branch(date: NaiveDate) -> usize {
+    let mut m = date.month() as i32;
+    if date.day() < term_day(date.year(), date.month()) {
+        m -= 1;
+    }
+    (m.rem_euclid(12)) as usize
+}
+
 /// 月干支序号（按节气定月，正月建寅）
 pub fn month_ganzhi(date: NaiveDate) -> usize {
     let y = date.year();
     if !in_range(y) {
         return 0;
     }
-    // 找到日期所属的节（当月节之前算上月）
-    let mut m_branch = 0usize;
-    for m in (1..=12).rev() {
-        let jie = term_day(y, m as u32);
-        if date.month() == m && date.day() >= jie {
-            m_branch = (m % 12) as usize; // 1月(小寒后)=丑 2月(立春后)=寅 ... 12月(大雪后)=子
-            break;
-        }
-    }
+    let m_branch = month_branch(date);
     let gy = ganzhi_year(date);
     let year_stem = ((gy - 4).rem_euclid(60) % 10) as usize;
     // 年上起月：甲己丙作首、乙庚戊为头、丙辛庚起、丁壬壬、戊癸甲
@@ -201,6 +206,61 @@ mod tests {
         assert_eq!(year_ganzhi_name(date), "丙午马年");
         assert_eq!(month_ganzhi_name(date), "丁酉");
         assert_eq!(day_ganzhi_name(date), "甲午");
+    }
+
+    /// 月支必须跟"最近一个已到达的节"走。此前当月节未到时月支一律停在 0（子月），
+    /// 每月 1 号到节前一日（全年约 15%）的月干支、十二值日、宜忌全错。
+    #[test]
+    fn month_ganzhi_before_jie_belongs_to_previous_month() {
+        let name = |y: i32, m: u32, day: u32| month_ganzhi_name(d(y, m, day));
+        // 白露 9/7：前一天仍是申月（丙午年：寅月庚寅起，申月丙申）
+        assert_eq!(name(2026, 9, 6), "丙申");
+        assert_eq!(name(2026, 9, 7), "丁酉");
+        // 惊蛰 3/5 前：仍属寅月
+        assert_eq!(name(2026, 3, 4), "庚寅");
+        assert_eq!(name(2026, 3, 5), "辛卯");
+        // 立春 2/4 前：年柱还是乙巳，丑月为己丑
+        assert_eq!(name(2026, 2, 3), "己丑");
+        // 大雪 12/7 前：亥月（丙午年十月建己亥）
+        assert_eq!(name(2026, 12, 5), "己亥");
+        // 小寒 1/5 前：上一年 12 月的子月
+        assert_eq!(name(2026, 1, 3), "戊子");
+        assert_eq!(name(2026, 1, 5), "己丑");
+        // 跨年样本：2024-01-01 在癸卯年大雪之后、小寒之前，为甲子月
+        assert_eq!(name(2024, 1, 1), "甲子");
+    }
+
+    /// 十二值日 = (日支 − 月支) mod 12：节前换月支后值日随之正确
+    #[test]
+    fn jianzhi_follows_month_branch_across_jie() {
+        // 2026-09-06 癸未日（未）在申月 → 闭；次日甲申日（申）进入酉月 → 仍为闭
+        assert_eq!(JIANZHI_NAMES[jianzhi(d(2026, 9, 6))], "闭");
+        assert_eq!(JIANZHI_NAMES[jianzhi(d(2026, 9, 7))], "闭");
+        assert_eq!(JIANZHI_NAMES[jianzhi(d(2026, 9, 17))], "收");
+    }
+
+    /// 全年逐日：月支的序号连续且只在"节"当天切换；每月节前的日子与上个月支相同
+    #[test]
+    fn month_branch_switches_only_on_jie_day() {
+        for year in [1950, 1984, 2024, 2026, 2099] {
+            let mut date = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+            let mut switches = 0;
+            let mut prev = month_branch(date);
+            while date.year() == year {
+                let cur = month_branch(date);
+                if cur != prev {
+                    switches += 1;
+                    // 切换日必是当月的"节"；月支顺序前进一位
+                    assert_eq!(date.day(), term_day(date.year(), date.month()), "{date}");
+                    assert_eq!((cur + 12 - prev) % 12, 1, "{date}");
+                    prev = cur;
+                }
+                assert_eq!(month_ganzhi(date) % 12, cur, "{date}");
+                date = date.succ_opt().unwrap();
+            }
+            // 12 个月的节各切换一次（年初已在子月，小寒切丑、大雪切子）
+            assert_eq!(switches, 12, "{year}");
+        }
     }
 
     #[test]

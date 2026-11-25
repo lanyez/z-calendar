@@ -38,9 +38,7 @@ static SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 const WH_MOUSE_LL: i32 = 14;
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
+
 
 pub fn spawn(clock: SharedClock) {
     std::thread::Builder::new()
@@ -91,20 +89,22 @@ unsafe extern "system" fn hook_proc(n_code: i32, wp: WPARAM, lp: LPARAM) -> LRES
                 if x >= ml && x < mr && y >= mt && y < mb {
                     return CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp);
                 }
-                crate::ctxmenu::close();
+                // 收起只 PostMessage：钩子回调里不能跨线程 ShowWindow（同步调用会拖住
+                // 钩子线程 = 全系统鼠标输入停顿，反复超时钩子会被系统摘除）
+                crate::ctxmenu::post_close();
                 return 1;
             }
         }
         // 日期右键菜单打开时：菜单内左键放行给菜单窗口；菜单外左键收起菜单并吞掉
         // （右键不拦截，右键其它日期格仍由主面板的 WM_RBUTTONDOWN 切换菜单）
         if msg == WM_LBUTTONDOWN {
-            if let Some((ml, mt, mr, mb)) = crate::ctxmenu::ctxmenu_date::date_menu_rect() {
+            if let Some((ml, mt, mr, mb)) = crate::ctxmenu_date::date_menu_rect() {
                 let info = &*(lp as *const MSLLHOOKSTRUCT);
                 let (x, y) = (info.pt.x, info.pt.y);
                 if x >= ml && x < mr && y >= mt && y < mb {
                     return CallNextHookEx(std::ptr::null_mut(), n_code, wp, lp);
                 }
-                crate::ctxmenu::ctxmenu_date::date_menu_close();
+                crate::ctxmenu_date::date_menu_post_close();
                 return 1;
             }
         }
@@ -150,7 +150,7 @@ unsafe fn find_clock() -> Option<ClockInfo> {
     let tray = FindWindowExW(
         std::ptr::null_mut(),
         std::ptr::null_mut(),
-        wide("Shell_TrayWnd").as_ptr(),
+        crate::wide("Shell_TrayWnd").as_ptr(),
         std::ptr::null(),
     );
     if tray.is_null() || IsWindowVisible(tray) == 0 {
@@ -164,11 +164,11 @@ unsafe fn find_clock() -> Option<ClockInfo> {
 
 /// Win10 经典链：Shell_TrayWnd → TrayNotifyWnd → TrayClockWClass
 unsafe fn find_clock_classic(tray: HWND) -> Option<ClockInfo> {
-    let tn = FindWindowExW(tray, std::ptr::null_mut(), wide("TrayNotifyWnd").as_ptr(), std::ptr::null());
+    let tn = FindWindowExW(tray, std::ptr::null_mut(), crate::wide("TrayNotifyWnd").as_ptr(), std::ptr::null());
     if tn.is_null() {
         return None;
     }
-    let clk = FindWindowExW(tn, std::ptr::null_mut(), wide("TrayClockWClass").as_ptr(), std::ptr::null());
+    let clk = FindWindowExW(tn, std::ptr::null_mut(), crate::wide("TrayClockWClass").as_ptr(), std::ptr::null());
     if clk.is_null() || IsWindowVisible(clk) == 0 {
         return None;
     }
@@ -316,7 +316,7 @@ mod tests {
             }
 
             // 任务栏窗口不是桌面壳
-            let tray = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
+            let tray = FindWindowW(crate::wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
             if !tray.is_null() {
                 assert!(!is_desktop_window(tray), "taskbar is not the desktop shell window");
             }

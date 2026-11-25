@@ -8,7 +8,6 @@ use serde::Deserialize;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 分类字母 → 显示名（顺序即设置下拉顺序）
 pub const TYPES: &[(char, &str)] = &[('d', "名人名言"), ('a', "文学"), ('i', "互联网"), ('k', "科普")];
@@ -47,9 +46,7 @@ static INFLIGHT: AtomicBool = AtomicBool::new(false);
 static GEN: AtomicU64 = AtomicU64::new(0);
 static LAST_FAIL_MS: AtomicU64 = AtomicU64::new(0);
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+use crate::clock::now_ms_u64 as now_ms;
 
 /// 侧栏显示时调用：本轮槽位作废，触发重新拉取
 pub fn on_sidebar_show() {
@@ -162,6 +159,7 @@ mod tests {
 
     // 真实网络拉取验证（需联网）
     #[test]
+    #[ignore = "需要联网；显式运行：cargo test -- --ignored"]
     fn fetch_real_network() {
         for c in ["d", "a", "i", "k"] {
             let m = super::fetch_quote(c);
@@ -172,6 +170,7 @@ mod tests {
 
     /// 每次打开侧栏都重新拉取（需联网）；全程不落盘
     #[test]
+    #[ignore = "需要联网；显式运行：cargo test -- --ignored"]
     fn refreshes_every_show() {
         let cache = crate::config::data_dir().join("motto.json");
         let _ = std::fs::remove_file(&cache);

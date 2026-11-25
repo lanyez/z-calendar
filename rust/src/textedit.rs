@@ -257,45 +257,187 @@ pub fn caret_at_x_approx(text: &str, w: f32) -> usize {
     pos
 }
 
-/// 写剪贴板（CF_UNICODETEXT）。成功后内存归系统所有；失败释放并返回 false
-pub unsafe fn set_clipboard(hwnd: usize, s: &str) -> bool {
-    use winapi::shared::ntdef::HANDLE;
-    use winapi::shared::windef::HWND;
-    use winapi::um::winbase::{GlobalAlloc, GlobalFree, GMEM_MOVEABLE};
-    use winapi::um::winuser::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData, CF_UNICODETEXT};
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GlobalLock(h: usize) -> *mut u16;
-        fn GlobalUnlock(h: usize) -> i32;
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (文本, 光标, 选区锚点)
+    type Edit = (String, usize, Option<usize>);
+
+    fn ed(s: &str, caret: usize, sel: Option<usize>) -> Edit {
+        (s.to_string(), caret, sel)
     }
-    if s.is_empty() {
-        return false;
+
+    #[test]
+    fn insert_replaces_selection_and_moves_caret() {
+        let mut e = ed("甲乙丙", 3, Some(0));
+        insert(&mut e.0, &mut e.1, &mut e.2, "新");
+        assert_eq!(e, ed("新", 1, None));
+        let mut e = ed("甲丙", 1, None);
+        insert(&mut e.0, &mut e.1, &mut e.2, "乙");
+        assert_eq!(e, ed("甲乙丙", 2, None), "光标落在插入内容之后");
+        // 选区方向无关：光标在前、锚点在后同样整段替换
+        let mut e = ed("甲乙丙", 1, Some(3));
+        insert(&mut e.0, &mut e.1, &mut e.2, "X");
+        assert_eq!(e, ed("甲X", 2, None));
     }
-    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        if OpenClipboard(hwnd as HWND) == 0 {
-            return false;
+
+    #[test]
+    fn deletions_handle_selection_and_bounds() {
+        let mut e = ed("甲乙丙", 2, None);
+        backspace(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲丙", 1, None));
+        delete_fwd(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲", 1, None));
+        // 有选区时 Backspace / Delete 都只删选区
+        let mut e = ed("甲乙丙", 2, Some(1));
+        backspace(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲丙", 1, None));
+        let mut e = ed("甲乙丙", 1, Some(2));
+        delete_fwd(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲丙", 1, None));
+        // 边界：行首退格、行尾删除、越界下标都不 panic、不改文本
+        let mut e = ed("甲", 0, None);
+        backspace(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲", 0, None));
+        let mut e = ed("甲", 1, None);
+        delete_fwd(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("甲", 1, None));
+        let mut e = ed("", 0, None);
+        backspace(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("", 0, None));
+        // 下标按字符计：emoji（UTF-16 代理对）算一个字符
+        let mut e = ed("a😀b", 2, None);
+        backspace(&mut e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("ab", 1, None));
+    }
+
+    #[test]
+    fn selection_range_and_text() {
+        assert_eq!(sel_range("abc", 2, None), (2, 2));
+        assert_eq!(sel_range("abc", 3, Some(1)), (1, 3), "锚点在前");
+        assert_eq!(sel_range("abc", 1, Some(3)), (1, 3), "光标在前");
+        assert_eq!(sel_range("abc", 99, Some(99)), (3, 3), "越界下标夹紧到文本长度");
+        assert_eq!(sel_text("abc", 3, Some(1)).as_deref(), Some("bc"));
+        assert_eq!(sel_text("abc", 2, None), None);
+        assert_eq!(sel_text("中😀文", 2, Some(0)).as_deref(), Some("中😀"));
+    }
+
+    #[test]
+    fn caret_movement_clamps_and_shift_extends() {
+        let mut e = ed("abcd", 1, None);
+        move_caret(&e.0, &mut e.1, &mut e.2, 2, false);
+        assert_eq!(e, ed("abcd", 3, None));
+        move_caret(&e.0, &mut e.1, &mut e.2, -10, true);
+        assert_eq!(e, ed("abcd", 0, Some(3)), "越界夹紧，Shift 以原位置为锚点");
+        move_caret(&e.0, &mut e.1, &mut e.2, 1, false);
+        assert_eq!(e, ed("abcd", 1, None), "不带 Shift 清选区");
+        move_caret(&e.0, &mut e.1, &mut e.2, 100, false);
+        assert_eq!(e.1, 4);
+        home_end(&e.0, &mut e.1, &mut e.2, false, false);
+        assert_eq!(e.1, 0);
+        home_end(&e.0, &mut e.1, &mut e.2, true, false);
+        assert_eq!(e.1, 4);
+        select_all(&e.0, &mut e.1, &mut e.2);
+        assert_eq!(e, ed("abcd", 4, Some(0)));
+    }
+
+    #[test]
+    fn word_movement_skips_separators_then_consumes_a_run() {
+        // Ctrl+→：先跳过非字母数字（", " 一并跳过），再吃掉一段字母数字
+        let mut e = ed("foo, bar", 0, None);
+        for pos in [3, 8] {
+            move_word(&e.0, &mut e.1, &mut e.2, true, false);
+            assert_eq!(e.1, pos);
         }
-        EmptyClipboard();
-        let h = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) as usize;
-        let ok = if h != 0 {
-            let p = GlobalLock(h);
-            if !p.is_null() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
-                GlobalUnlock(h);
-                // 成功后所有权移交系统，不再 GlobalFree
-                !SetClipboardData(CF_UNICODETEXT, h as HANDLE).is_null() || {
-                    GlobalFree(h as HANDLE);
-                    false
-                }
-            } else {
-                GlobalFree(h as HANDLE);
-                false
-            }
-        } else {
-            false
-        };
-        CloseClipboard();
-        ok
+        // Ctrl+←：镜像（停在下一个词的开头）
+        for pos in [5, 0] {
+            move_word(&e.0, &mut e.1, &mut e.2, false, false);
+            assert_eq!(e.1, pos);
+        }
+        // Shift 扩展选区
+        let mut e = ed("foo bar", 0, None);
+        move_word(&e.0, &mut e.1, &mut e.2, true, true);
+        assert_eq!(e, ed("foo bar", 3, Some(0)));
+    }
+
+    #[test]
+    fn line_helpers_and_vertical_movement_keep_column() {
+        let text = "ab\ncde\nf";
+        assert_eq!((line_start(text, 0), line_end(text, 0)), (0, 2));
+        assert_eq!((line_start(text, 5), line_end(text, 5)), (3, 6));
+        assert_eq!((line_start(text, 8), line_end(text, 8)), (7, 8), "最后一行行尾 = 文本末尾");
+        let mut e = ed(text, 1, None);
+        move_line(&e.0, &mut e.1, &mut e.2, true, false);
+        assert_eq!(e.1, 4, "第 1 列 → 下一行第 1 列");
+        move_line(&e.0, &mut e.1, &mut e.2, true, false);
+        assert_eq!(e.1, 8, "短行夹到行尾");
+        move_line(&e.0, &mut e.1, &mut e.2, true, false);
+        assert_eq!(e.1, 8, "已是最后一行不动");
+        move_line(&e.0, &mut e.1, &mut e.2, false, false);
+        assert_eq!(e.1, 4);
+        move_line(&e.0, &mut e.1, &mut e.2, false, true);
+        assert_eq!(e, ed(text, 1, Some(4)), "Shift 扩展选区");
+    }
+
+    #[test]
+    fn undo_redo_coalesce_and_capacity() {
+        let mut u = Undo::new(4);
+        let mut e = ed("", 0, None);
+        // 连续字符输入合并为一步；非输入类操作各自独立
+        u.snapshot(&e.0, e.1, e.2, "ins");
+        insert(&mut e.0, &mut e.1, &mut e.2, "a");
+        u.snapshot(&e.0, e.1, e.2, "ins");
+        insert(&mut e.0, &mut e.1, &mut e.2, "b");
+        u.snapshot(&e.0, e.1, e.2, "");
+        insert(&mut e.0, &mut e.1, &mut e.2, "c");
+        assert_eq!(e.0, "abc");
+        assert!(u.undo(&mut e.0, &mut e.1, &mut e.2));
+        assert_eq!(e.0, "ab", "撤销独立的一步");
+        assert!(u.undo(&mut e.0, &mut e.1, &mut e.2));
+        assert_eq!(e.0, "", "合并的连续输入一次撤销到位");
+        assert!(!u.undo(&mut e.0, &mut e.1, &mut e.2), "栈空");
+        assert!(u.redo(&mut e.0, &mut e.1, &mut e.2));
+        assert!(u.redo(&mut e.0, &mut e.1, &mut e.2));
+        assert_eq!(e.0, "abc");
+        assert!(!u.redo(&mut e.0, &mut e.1, &mut e.2));
+        // 撤销后再编辑：重做栈作废
+        assert!(u.undo(&mut e.0, &mut e.1, &mut e.2));
+        u.snapshot(&e.0, e.1, e.2, "ins");
+        insert(&mut e.0, &mut e.1, &mut e.2, "d");
+        assert_eq!(e.0, "abd");
+        assert!(!u.redo(&mut e.0, &mut e.1, &mut e.2));
+        // 光标与选区随快照恢复
+        let mut e = ed("xyz", 3, None);
+        u.snapshot(&e.0, e.1, e.2, "");
+        select_all(&e.0, &mut e.1, &mut e.2);
+        assert!(u.undo(&mut e.0, &mut e.1, &mut e.2));
+        assert_eq!(e, ed("xyz", 3, None));
+        // 容量：只保留最近 cap 个快照
+        let mut u = Undo::new(2);
+        let mut e = ed("", 0, None);
+        for ch in "abcd".chars() {
+            u.snapshot(&e.0, e.1, e.2, "");
+            insert(&mut e.0, &mut e.1, &mut e.2, &ch.to_string());
+        }
+        assert_eq!(e.0, "abcd");
+        for want in ["abc", "ab"] {
+            assert!(u.undo(&mut e.0, &mut e.1, &mut e.2));
+            assert_eq!(e.0, want);
+        }
+        assert!(!u.undo(&mut e.0, &mut e.1, &mut e.2), "更早的快照已被淘汰");
+    }
+
+    #[test]
+    fn caret_at_x_is_approximate_by_char_class() {
+        // 点击落点 → 字符下标：CJK 13px / ASCII 6.8px 的粗估
+        assert_eq!(caret_at_x_approx("中a中", 0.0), 0);
+        assert_eq!(caret_at_x_approx("中a中", 5.0), 0, "未过第一个字符的 midpoint");
+        assert_eq!(caret_at_x_approx("中a中", 7.0), 1, "过了第一个字符的 midpoint");
+        assert_eq!(caret_at_x_approx("中a中", 17.0), 2);
+        assert_eq!(caret_at_x_approx("中a中", 100.0), 3, "越过行尾落在末尾");
+        assert_eq!(caret_at_x_approx("", 50.0), 0);
     }
 }

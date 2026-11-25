@@ -236,12 +236,13 @@ unsafe fn vtbl_of(obj: usize) -> usize {
 /// 读取快捷方式目标路径（比对是否指向当前 exe，避免每次启动重写文件）
 unsafe fn shortcut_target_is(path: &std::path::Path, exe: &std::path::Path) -> bool {
     unsafe {
-        let mut obj: usize = 0;
-        let hr = CoCreateInstance(&CLSID_SHELL_LINK, 0, CLSCTX_INPROC_SERVER, &IID_ISHELL_LINK_W, &mut obj);
-        if hr != 0 || obj == 0 {
-            LAST_FAIL.store(3, Ordering::Relaxed);
-            return false;
-        }
+        let obj = match co_create(&CLSID_SHELL_LINK, &IID_ISHELL_LINK_W) {
+            Ok(obj) => obj,
+            Err(_) => {
+                LAST_FAIL.store(3, Ordering::Relaxed);
+                return false;
+            }
+        };
         let mut ok = false;
         let vt = vtbl_of(obj) as *const ShellLinkVtbl;
         // Load
@@ -267,10 +268,6 @@ unsafe fn shortcut_target_is(path: &std::path::Path, exe: &std::path::Path) -> b
 
 const CLSCTX_INPROC_SERVER: u32 = 1;
 
-#[link(name = "ole32")]
-extern "system" {
-    fn CoCreateInstance(clsid: *const Guid, outer: usize, ctx: u32, iid: *const Guid, out: *mut usize) -> i32;
-}
 
 /// QI 到 IPersistFile
 unsafe fn qi_persist_file(obj: usize) -> usize {
@@ -288,11 +285,9 @@ unsafe fn qi_persist_file(obj: usize) -> usize {
 /// 创建/刷新带 AUMID 属性的开始菜单快捷方式
 unsafe fn create_shortcut(path: &std::path::Path, exe: &std::path::Path) -> bool {
     unsafe {
-        let mut obj: usize = 0;
-        let hr = CoCreateInstance(&CLSID_SHELL_LINK, 0, CLSCTX_INPROC_SERVER, &IID_ISHELL_LINK_W, &mut obj);
-        if hr != 0 || obj == 0 {
+        let Ok(obj) = co_create(&CLSID_SHELL_LINK, &IID_ISHELL_LINK_W) else {
             return false;
-        }
+        };
         let mut ok = false;
         let vt = vtbl_of(obj) as *const ShellLinkVtbl;
         let wexe: Vec<u16> = exe.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
@@ -312,7 +307,7 @@ unsafe fn create_shortcut(path: &std::path::Path, exe: &std::path::Path) -> bool
                     let psvt = vtbl_of(ps_local) as *const PropertyStoreVtbl;
                     // CoTaskMemAlloc 分配的宽字符串（进程内一次性写入，几十字节不释放）
                     let aumid: Vec<u16> = AUMID.encode_utf16().chain(std::iter::once(0)).collect();
-                    let buf = CoTaskMemAlloc((aumid.len() * 2) as usize) as *mut u16;
+                    let buf = winapi::um::combaseapi::CoTaskMemAlloc(aumid.len() * 2) as *mut u16;
                     if !buf.is_null() {
                         std::ptr::copy_nonoverlapping(aumid.as_ptr(), buf, aumid.len());
                         let pv = PropVariant { vt: VT_LPWSTR, r1: 0, r2: 0, r3: 0, ptr: buf as usize };
@@ -344,10 +339,18 @@ unsafe fn create_shortcut(path: &std::path::Path, exe: &std::path::Path) -> bool
     }
 }
 
-#[link(name = "ole32")]
-extern "system" {
-    fn CoTaskMemAlloc(size: usize) -> *mut winapi::ctypes::c_void;
+/// 以 usize 承载 COM 对象指针的 CoCreateInstance（本模块的 COM 调用都按虚表槽位手写，
+/// 对象指针一律存为 usize）。失败返回 HRESULT
+unsafe fn co_create(clsid: &Guid, iid: &Guid) -> Result<usize, i32> {
+    let mut obj: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+    let hr = winapi::um::combaseapi::CoCreateInstance(clsid, std::ptr::null_mut(), CLSCTX_INPROC_SERVER, iid, &mut obj);
+    if hr == 0 {
+        Ok(obj as usize)
+    } else {
+        Err(hr)
+    }
 }
+
 
 // ---------------- Toast 发送（WinRT） ----------------
 
@@ -495,16 +498,16 @@ pub fn dispatch(args: &str) {
             let mut it = rest.splitn(2, '|');
             let id = it.next().unwrap_or("");
             let date = it.next().unwrap_or("");
+            // dispatch 可能跑在第二实例唤醒线程：重绘由 complete_todo_by_id 内部投递到
+            // 主面板与侧栏的属主线程
             crate::sidebar::complete_todo_by_id(id, date);
-            // dispatch 可能跑在第二实例唤醒线程：重绘投递到侧栏属主线程
-            crate::sidebar::post_repaint();
         } else if let Some(rest) = a.strip_prefix("zcal:snooze:") {
             let mut it = rest.splitn(3, '|');
             let title = uri_decode(it.next().unwrap_or(""));
             let body = uri_decode(it.next().unwrap_or(""));
             let act_json = uri_decode(it.next().unwrap_or(""));
             let act: crate::toast::Act = serde_json::from_str(&act_json).unwrap_or(crate::toast::Act::None);
-            let t = crate::toast::now_ms_pub() + crate::toast::SNOOZE_MS_PUB;
+            let t = crate::clock::now_ms() + crate::toast::SNOOZE_MS_PUB;
             crate::toast::snooze_add_entry(crate::toast::SnoozeEntry { t, title, body, act });
         } else if a.contains("zcal:default") {
             crate::flyout::request_show();

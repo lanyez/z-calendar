@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::wingdi::CreateRectRgn;
 use winapi::um::winuser::*;
 
-use crate::config::{apply_autostart, Config};
+use crate::config::{apply_autostart, Config, Toggle};
+use crate::debug;
 use crate::gdi::{self, Cache, Painter};
 use crate::ics::{DayInfo, DayType, HolidayMap};
 use crate::lunar;
@@ -72,6 +73,8 @@ const WM_APP_ICS_DONE: UINT = 0x8000 + 3;
 /// 后台线程请求重绘（toast 线程/通知激活线程不能直接持 UI 锁绘制：
 /// UpdateLayeredWindow 是跨线程同步调用，会与主线程消息处理互锁）
 const WM_APP_REPAINT: UINT = 0x8000 + 4;
+/// 天气线程请求重绘天气面板（同上：绘制回到主线程执行）
+const WM_APP_FC_REPAINT: UINT = 0x8000 + 5;
 
 static FLYOUT_HWND: AtomicUsize = AtomicUsize::new(0);
 
@@ -272,11 +275,7 @@ struct Ui {
     sf: f32,
     w: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    surf: gdi::Dib,
     cache: Cache,
     st: SharedState,
     tray: Arc<Mutex<Option<tray::Tray>>>,
@@ -338,8 +337,8 @@ struct Ui {
     kind_menu_open: bool,
     /// 双击日期格检测：上次单击格子的（时刻, 客户区物理x, y, 日期）
     last_cell_click: Option<(std::time::Instant, i32, i32, NaiveDate)>,
-    dumped: bool,
-    dump_path: String,
+    /// 调试：首帧转储（CAL_DUMP*，见 debug 模块）
+    dump: debug::FrameDump,
 }
 
 
@@ -350,7 +349,7 @@ static SETTINGS_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SAction {
     Tab(usize),
-    Toggle(u8),
+    Toggle(Toggle),
     WeekDropdown,
     WeekPick(usize),
     MottoDropdown,
@@ -408,11 +407,7 @@ struct SettingsUi {
     sf: f32,
     w: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    surf: gdi::Dib,
     cache: Cache,
     st: SharedState,
     tray: Arc<Mutex<Option<tray::Tray>>>,
@@ -435,8 +430,8 @@ struct SettingsUi {
     /// 设置窗内悬停移动高频重绘，不再每次整体 clone Config
     cfg_snap: Config,
     cfg_gen: u64,
-    dumped: bool,
-    dump_path: String,
+    /// 调试：首帧转储（CAL_DUMP*，见 debug 模块）
+    dump: debug::FrameDump,
 }
 
 static SETTINGS_UI: Mutex<Option<SendSettings>> = Mutex::new(None);
@@ -482,15 +477,11 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             sf: gdi::scale(),
             w: SETTINGS_W,
             h: SETTINGS_H,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: Cache::new(),
             st,
             tray,
-            tab: std::env::var("CAL_TAB").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            tab: debug::parse(debug::TAB).unwrap_or(0),
             regions: Vec::new(),
             hover: None,
             week_menu_open: false,
@@ -503,8 +494,7 @@ pub fn create_settings_window(st: SharedState, tray: Arc<Mutex<Option<tray::Tray
             ics_status: None,
             cfg_snap: Config::default(),
             cfg_gen: 0,
-            dumped: false,
-            dump_path: std::env::var("CAL_DUMP2").unwrap_or_default(),
+            dump: debug::FrameDump::from_env(debug::DUMP_SETTINGS),
         });
         // 后台位图不在创建时分配：show_settings→redraw 惰性分配，隐藏即释放
         SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendSettings(sui));
@@ -538,21 +528,14 @@ fn settings_position() -> (i32, i32) {
     (x, y)
 }
 
-#[link(name = "user32")]
-extern "system" {
-    fn SystemParametersInfoW(action: u32, param: u32, data: *mut winapi::ctypes::c_void, init: u32) -> i32;
-}
 
 /// 打开系统自带“日期与时间”设置
 pub fn open_date_time_settings() {
     unsafe {
-        #[link(name = "shell32")]
-        extern "system" {
-            fn ShellExecuteW(hwnd: HWND, op: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
-        }
+
         let op = crate::wide("open");
         let target = crate::wide("ms-settings:dateandtime");
-        ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), target.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 1);
+        winapi::um::shellapi::ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), target.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 1);
     }
 }
 
@@ -641,10 +624,7 @@ fn hide_settings() {
 fn free_settings_surface() {
     let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(sui) = guard.as_mut() {
-        let ui = &mut sui.0;
-        unsafe {
-            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-        }
+        sui.0.surf.release();
     }
 }
 
@@ -658,74 +638,22 @@ impl SettingsUi {
     }
 
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            // 隐藏时位图已释放压缩内存：显示前重建
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
-            self.mem_dc = mem_dc;
-            self.hbmp = hbmp;
-            self.bmp = bmp;
-            self.scan0 = scan0;
+        // 隐藏时位图已释放压缩内存：显示前重建
+        if !self.surf.is_alloc() {
+            self.surf = gdi::Dib::alloc(self.w, self.h);
         }
-        if self.g.is_null() {
-            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
-        }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter {
-            g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         let mut regions: Vec<(gdi::RectF, SAction)> = Vec::new();
         p.clear();
         self.paint(&p, &mut regions);
         self.regions = regions;
         self.ulw();
 
-        if !self.dumped && !self.dump_path.is_empty() {
-            self.dumped = true;
-            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
-            if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
-                unsafe {
-                    PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
-                }
-            }
-        }
+        self.dump.take(self.hwnd, self.surf.pixels(), (self.w * self.sf) as i32, (self.h * self.sf) as i32);
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, self.w, self.h);
     }
 
     fn paint(&mut self, p: &Painter, regions: &mut Vec<(gdi::RectF, SAction)>) {
@@ -794,12 +722,12 @@ impl SettingsUi {
         let last_ics = cfg.last_ics_update;
 
         if self.tab == 0 {
-            let rows: [(u8, &str, bool); 5] = [
-                (0, "开机自启", cfg.autostart),
-                (1, "自动更新假期数据（每天检查）", cfg.auto_update),
-                (8, "显示系统托盘图标", cfg.show_tray),
-                (17, "提醒走系统通知中心（失败自动回退）", cfg.use_system_toast),
-                (18, "弹窗淡入淡出动画", cfg.fade_anim),
+            let rows: [(Toggle, &str, bool); 5] = [
+                (Toggle::Autostart, "开机自启", cfg.autostart),
+                (Toggle::AutoUpdate, "自动更新假期数据（每天检查）", cfg.auto_update),
+                (Toggle::ShowTray, "显示系统托盘图标", cfg.show_tray),
+                (Toggle::UseSystemToast, "提醒走系统通知中心（失败自动回退）", cfg.use_system_toast),
+                (Toggle::FadeAnim, "弹窗淡入淡出动画", cfg.fade_anim),
             ];
             let mut y = py + 54.0;
             for (idx, name, on) in rows {
@@ -960,14 +888,14 @@ impl SettingsUi {
                 y += 20.0;
             }
         } else if self.tab == 1 {
-            let rows: [(u8, &str, bool); 7] = [
-                (2, "显示农历/节日信息", cfg.show_lunar),
-                (3, "显示调休安排", cfg.show_adjust),
-                (4, "显示非当前月日期", cfg.show_other_month),
-                (5, "使用12小时制", cfg.hour12),
-                (6, "显示周数", cfg.show_week_num),
-                (7, "显示天气预报", cfg.show_weather),
-                (9, "提醒提示音", crate::config::remind_sound_on()),
+            let rows: [(Toggle, &str, bool); 7] = [
+                (Toggle::ShowLunar, "显示农历/节日信息", cfg.show_lunar),
+                (Toggle::ShowAdjust, "显示调休安排", cfg.show_adjust),
+                (Toggle::ShowOtherMonth, "显示非当前月日期", cfg.show_other_month),
+                (Toggle::Hour12, "使用12小时制", cfg.hour12),
+                (Toggle::ShowWeekNum, "显示周数", cfg.show_week_num),
+                (Toggle::ShowWeather, "显示天气预报", cfg.show_weather),
+                (Toggle::RemindSound, "提醒提示音", crate::config::remind_sound_on()),
             ];
             let mut y = py + 54.0;
             for (idx, name, on) in rows {
@@ -1116,133 +1044,45 @@ impl SettingsUi {
                 self.tab = *i;
                 self.redraw();
             }
-            SAction::Toggle(idx) => {
-                let on = {
-                    let mut cfg = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match idx {
-                        0 => {
-                            cfg.autostart = !cfg.autostart;
-                            cfg.autostart
-                        }
-                        1 => {
-                            cfg.auto_update = !cfg.auto_update;
-                            cfg.auto_update
-                        }
-                        2 => {
-                            cfg.show_lunar = !cfg.show_lunar;
-                            cfg.show_lunar
-                        }
-                        3 => {
-                            cfg.show_adjust = !cfg.show_adjust;
-                            cfg.show_adjust
-                        }
-                        4 => {
-                            cfg.show_other_month = !cfg.show_other_month;
-                            cfg.show_other_month
-                        }
-                        5 => {
-                            cfg.hour12 = !cfg.hour12;
-                            crate::config::set_hour12(cfg.hour12);
-                            cfg.hour12
-                        }
-                        6 => {
-                            cfg.show_week_num = !cfg.show_week_num;
-                            cfg.show_week_num
-                        }
-                        7 => {
-                            cfg.show_weather = !cfg.show_weather;
-                            cfg.show_weather
-                        }
-                        8 => {
-                            cfg.show_tray = !cfg.show_tray;
-                            cfg.show_tray
-                        }
-                        9 => {
-                            // 提醒提示音（设置位走原子缓存，弹窗线程读取）
-                            let v = !crate::config::remind_sound_on();
-                            crate::config::set_remind_sound(v);
-                            cfg.remind_sound = v;
-                            v
-                        }
-                        17 => {
-                            // 系统通知中心开关（原子缓存供提醒线程读取）
-                            cfg.use_system_toast = !cfg.use_system_toast;
-                            crate::config::set_use_system_toast(cfg.use_system_toast);
-                            cfg.use_system_toast
-                        }
-                        18 => {
-                            // 弹窗淡入淡出动画开关
-                            cfg.fade_anim = !cfg.fade_anim;
-                            crate::config::set_fade_anim(cfg.fade_anim);
-                            cfg.fade_anim
-                        }
-                        10 => {
-                            cfg.sidebar_date = !cfg.sidebar_date;
-                            cfg.sidebar_date
-                        }
-                        11 => {
-                            cfg.sidebar_almanac = !cfg.sidebar_almanac;
-                            cfg.sidebar_almanac
-                        }
-                        12 => {
-                            cfg.sidebar_events = !cfg.sidebar_events;
-                            cfg.sidebar_events
-                        }
-                        13 => {
-                            cfg.sidebar_agenda = !cfg.sidebar_agenda;
-                            cfg.sidebar_agenda
-                        }
-                        14 => {
-                            cfg.sidebar_history = !cfg.sidebar_history;
-                            cfg.sidebar_history
-                        }
-                        15 => {
-                            cfg.sidebar_motto = !cfg.sidebar_motto;
-                            cfg.sidebar_motto
-                        }
-                        16 => {
-                            cfg.sidebar_todo = !cfg.sidebar_todo;
-                            cfg.sidebar_todo
-                        }
-                        19 => {
-                            cfg.sidebar_reminds = !cfg.sidebar_reminds;
-                            cfg.sidebar_reminds
-                        }
-                        _ => cfg.show_weather,
-                    }
-                };
+            SAction::Toggle(t) => {
+                let t = *t;
+                let on = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).toggle(t);
                 self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save();
-                if (10..=16).contains(idx) || *idx == 19 {
+                // 侧栏卡片开关：侧栏同屏时立即重绘
+                if t.is_sidebar_card() {
                     crate::sidebar::sidebar_repaint();
                 }
                 // 日历相关开关（农历/调休/非本月/12小时制/周数/天气）：主面板同屏时
                 // 立即重绘——面板自身只靠鼠标悬停/翻页触发整窗重绘，否则要等
                 // 鼠标移入日历才可见（flyout_repaint 对隐藏面板无操作）
-                if matches!(idx, 2..=7) {
+                if t.is_calendar_pref() {
                     flyout_repaint();
                 }
-                if *idx == 0 {
-                    apply_autostart(on);
-                    if let Some(t) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
-                        t.autostart_item.set_checked(on);
+                match t {
+                    Toggle::Autostart => {
+                        apply_autostart(on);
+                        if let Some(tr) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                            tr.autostart_item.set_checked(on);
+                        }
                     }
-                }
-                if *idx == 7 {
-                    let _ = self.st.weather_tx.send(());
-                }
-                if *idx == 8 {
-                    if let Some(t) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
-                        t.set_visible(on);
+                    Toggle::ShowWeather => {
+                        let _ = self.st.weather_tx.send(());
                     }
-                }
-                if *idx == 17 && on {
+                    Toggle::ShowTray => {
+                        if let Some(tr) = self.tray.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                            tr.set_visible(on);
+                        }
+                    }
                     // 开启时后台确保 AUMID 与开始菜单快捷方式就绪（不阻塞 UI）
-                    std::thread::Builder::new()
-                        .name("lnk".into())
-                        .spawn(|| {
-                            crate::wnotify::ensure_ready();
-                        })
-                        .ok();
+                    Toggle::UseSystemToast if on => {
+                        std::thread::Builder::new()
+                            .name("lnk".into())
+                            .spawn(|| {
+                                crate::wnotify::ensure_ready();
+                            })
+                            .ok();
+                    }
+                    _ => {}
                 }
                 self.redraw();
             }
@@ -1601,7 +1441,7 @@ unsafe extern "system" fn settings_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         }
         WM_LBUTTONUP => {
             // 拖动提交 / 原地点击切换（后者延后到锁外执行，handle_action 会操作托盘等）
-            let mut click_toggle: Option<u8> = None;
+            let mut click_toggle: Option<Toggle> = None;
             {
                 let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(sui) = guard.as_mut() {
@@ -1720,7 +1560,7 @@ fn forecast_sync_height(f: &mut ForecastUi) {
     if (f.h - want).abs() > f32::EPSILON {
         f.h = want;
         unsafe {
-            gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
+            f.surf.release();
             let mut r: RECT = std::mem::zeroed();
             GetWindowRect(f.hwnd as HWND, &mut r);
             SetWindowPos(
@@ -1775,15 +1615,11 @@ struct ForecastUi {
     sf: f32,
     w: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    surf: gdi::Dib,
     cache: Cache,
     st: SharedState,
-    dumped: bool,
-    dump_path: String,
+    /// 调试：首帧转储（CAL_DUMP*，见 debug 模块）
+    dump: debug::FrameDump,
     /// “更新”链接热区（面板坐标系，paint 时更新）
     link_rect: gdi::RectF,
     link_hover: bool,
@@ -1815,8 +1651,8 @@ pub fn forecast_visible() -> bool {
 }
 
 /// “更新中…”5 秒窗口是否刚到期：到期后补一次重绘把链接文案换回“更新”（并清
-/// 状态，只补画一次）。天气数据本身每小时才更新，新数据到达由天气线程直接
-/// forecast_redraw，悬停/点击由面板自身消息触发——定时器不再无条件驱动重绘。
+/// 状态，只补画一次）。天气数据本身每小时才更新，新数据到达由天气线程经
+/// WM_APP_FC_REPAINT 投递重绘，悬停/点击由面板自身消息触发——定时器不再无条件驱动重绘。
 fn forecast_refresh_expired() -> bool {
     let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match guard.as_mut() {
@@ -1869,15 +1705,10 @@ pub fn create_forecast_window(st: SharedState) {
             sf: gdi::scale(),
             w: FC_W,
             h: FC_H,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: Cache::new(),
             st,
-            dumped: false,
-            dump_path: std::env::var("CAL_DUMP3").unwrap_or_default(),
+            dump: debug::FrameDump::from_env(debug::DUMP_FORECAST),
             link_rect: gdi::RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             link_hover: false,
             close_hover: false,
@@ -1891,18 +1722,13 @@ pub fn create_forecast_window(st: SharedState) {
             pending_city: None,
             refreshing: None,
         });
-        let (f_mem_dc, f_hbmp, f_bmp, f_scan0) = gdi::alloc_dib(fui.w, fui.h);
-        fui.mem_dc = f_mem_dc;
-        fui.hbmp = f_hbmp;
-        fui.bmp = f_bmp;
-        fui.scan0 = f_scan0;
-        GdipGetImageGraphicsContext(fui.bmp, &mut fui.g);
+        fui.surf = gdi::Dib::alloc(fui.w, fui.h);
 
         // 初始绘制仅服务于 CAL_DUMP3 首帧转储（调试时绘制后立即释放；正常路径由
         // forecast_open→redraw 惰性分配）
-        if !fui.dump_path.is_empty() {
+        if fui.dump.enabled() {
             fui.redraw();
-            gdi::free_dib(&mut fui.mem_dc, &mut fui.hbmp, &mut fui.bmp, &mut fui.g, &mut fui.scan0);
+            fui.surf.release();
         }
         FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(SendFc(fui));
     }
@@ -1938,7 +1764,7 @@ pub fn forecast_open(main_hwnd: usize) {
         let want_h = fc_height_for(&w);
         if (f.h - want_h).abs() > f32::EPSILON {
             f.h = want_h;
-            gdi::free_dib(&mut f.mem_dc, &mut f.hbmp, &mut f.bmp, &mut f.g, &mut f.scan0);
+            f.surf.release();
         }
         let panel_h = f.h;
         // 天气面板与日期侧栏同屏：侧栏开着时锚定其左缘（向左串联），二者不再互斥
@@ -1998,9 +1824,7 @@ pub fn forecast_close() {
             let ui = &mut f.0;
             // 下次打开默认回到定位城市 tab（添加城市后由 pending_city 覆盖）
             ui.active = 0;
-            unsafe {
-                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-            }
+            ui.surf.release();
         }
         crate::trim_working_set();
     }
@@ -2090,6 +1914,7 @@ pub fn settings_repaint_if_visible() {
     }
 }
 
+/// 重绘天气面板（仅主线程调用：窗口属主线程）
 pub fn forecast_redraw() {
     let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
@@ -2097,65 +1922,33 @@ pub fn forecast_redraw() {
     }
 }
 
+/// 供后台线程（天气线程）请求重绘天气面板：投递到主线程，不跨线程持 FORECAST_UI
+/// 锁绘制。此前天气线程直接调 forecast_redraw——UpdateLayeredWindow 是跨线程同步
+/// 调用，主线程此时若正好在等这把锁（鼠标停在该窗口上），两边互锁
+pub fn forecast_post_redraw() {
+    let h = FORECAST_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            PostMessageW(h as HWND, WM_APP_FC_REPAINT, 0, 0);
+        }
+    }
+}
+
 impl ForecastUi {
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            // 隐藏时位图已释放压缩内存：显示前重建
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
-            self.mem_dc = mem_dc;
-            self.hbmp = hbmp;
-            self.bmp = bmp;
-            self.scan0 = scan0;
+        // 隐藏时位图已释放压缩内存：显示前重建
+        if !self.surf.is_alloc() {
+            self.surf = gdi::Dib::alloc(self.w, self.h);
         }
-        if self.g.is_null() {
-            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
-        }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         self.paint(&p);
         self.ulw();
 
-        if !self.dumped && !self.dump_path.is_empty() {
-            self.dumped = true;
-            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
-            if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
-                unsafe {
-                    PostMessageW(hwnd() as HWND, WM_CLOSE, 0, 0);
-                }
-            }
-        }
+        self.dump.take(hwnd(), self.surf.pixels(), (self.w * self.sf) as i32, (self.h * self.sf) as i32);
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, self.w, self.h);
     }
 
     fn paint(&mut self, p: &Painter) {
@@ -2351,6 +2144,13 @@ unsafe extern "system" fn forecast_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp
         WM_ERASEBKGND => 1,
         // 点击面板不改变激活状态：主面板不会因失焦隐藏，点击消息正常送达本面板
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        // 天气线程的数据到达通知：回到属主线程重绘（面板已收起则不动）
+        WM_APP_FC_REPAINT => {
+            if forecast_visible() {
+                forecast_redraw();
+            }
+            0
+        }
         WM_MOUSEMOVE => {
             let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
@@ -2512,35 +2312,20 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
         // 屏幕/压在任务栏上，不设区域就会吞掉任务栏上的点击
         set_flyout_region(hwnd);
 
-        let page = match std::env::var("CAL_PAGE").as_deref() {
-            Ok("agenda") => Page::Agenda,
+        let page = match debug::value(debug::PAGE).as_str() {
+            "agenda" => Page::Agenda,
             _ => Page::Calendar,
         };
-        let _settings_open = std::env::var("CAL_SETTINGS").map(|v| v == "1").unwrap_or(false);
-        let _settings_tab: usize = std::env::var("CAL_TAB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
         let today = Local::now().date_naive();
-        let view_y = std::env::var("CAL_YM")
-            .ok()
-            .and_then(|v| v.split('-').next().and_then(|x| x.parse().ok()))
-            .unwrap_or(today.year());
-        let view_m = std::env::var("CAL_YM")
-            .ok()
-            .and_then(|v| v.split('-').nth(1).and_then(|x| x.parse().ok()))
-            .unwrap_or(today.month());
+        let (y, m) = debug::view_month();
+        let (view_y, view_m) = (y.unwrap_or(today.year()), m.unwrap_or(today.month()));
 
         let mut ui = Box::new(Ui {
             hwnd: hwnd as usize,
             sf: gdi::scale(),
             w: WIN_W,
             h: WIN_H,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: Cache::new(),
             st,
             tray,
@@ -2583,10 +2368,9 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
             draft_kind: 0,
             kind_menu_open: false,
             last_cell_click: None,
-            dumped: false,
-            dump_path: std::env::var("CAL_DUMP").unwrap_or_default(),
+            dump: debug::FrameDump::from_env(debug::DUMP_MAIN),
         });
-        if std::env::var("CAL_PAGE").as_deref() == Ok("monthpick") {
+        if debug::value(debug::PAGE) == "monthpick" {
             ui.month_pick = Some(MonthPick { year: view_y });
         }
         // 后台位图不再启动时常驻：显示时 perform_show→redraw 惰性分配，隐藏即释放。
@@ -2595,9 +2379,9 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<crate::events::AgendaMap
         {
             let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(sui) = guard.as_mut() {
-                if !sui.0.dump_path.is_empty() {
+                if sui.0.dump.enabled() {
                     sui.0.redraw();
-                    free_surface(&mut sui.0);
+                    sui.0.surf.release();
                 }
             }
         }
@@ -2758,7 +2542,7 @@ fn perform_show(hwnd: HWND) {
             ui.redraw();
         }
         // 调试：CAL_SIDEBAR=1 弹出日历时自动打开日期侧边栏
-        if std::env::var("CAL_SIDEBAR").map(|v| v == "1").unwrap_or(false) {
+        if debug::flag(debug::SIDEBAR) {
             crate::sidebar::sidebar_show(ui.selected);
         }
     }
@@ -2777,7 +2561,7 @@ fn perform_hide(hwnd: HWND) {
                     if crate::config::fade_anim_on() {
                         sui.0.fade_out();
                     }
-                    free_surface(&mut sui.0);
+                    sui.0.surf.release();
                 }
             }
             None => was_shown = false,
@@ -2847,7 +2631,7 @@ fn rescale_all(sf: f32) {
         if let Some(sui) = guard.as_mut() {
             let ui = &mut sui.0;
             ui.sf = sf;
-            free_surface(ui);
+            ui.surf.release();
             shown = ui.shown;
         } else {
             shown = false;
@@ -2867,9 +2651,7 @@ fn rescale_all(sf: f32) {
         if let Some(sui) = guard.as_mut() {
             let ui = &mut sui.0;
             ui.sf = sf;
-            unsafe {
-                gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-            }
+            ui.surf.release();
             if settings_vis {
                 unsafe {
                     SetWindowPos(
@@ -2898,28 +2680,11 @@ fn rescale_all(sf: f32) {
 // ================= 绘制 =================
 impl Ui {
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            // 隐藏时位图已释放压缩内存：显示前重建
-            unsafe { create_dib(self); }
+        // 隐藏时位图已释放压缩内存：显示前重建
+        if !self.surf.is_alloc() {
+            self.surf = gdi::Dib::alloc(self.w, self.h);
         }
-        if self.g.is_null() {
-            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
-        }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter {
-            g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         let mut regions: Vec<(gdi::RectF, Action)> = Vec::new();
         p.clear();
         self.paint_frame(&p);
@@ -2929,66 +2694,21 @@ impl Ui {
         }        self.regions = regions;
         self.ulw();
 
-        if !self.dumped && !self.dump_path.is_empty() {
-            self.dumped = true;
-            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
-            if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
-                unsafe {
-                    PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
-                }
-            }
-        }
+        self.dump.take(self.hwnd, self.surf.pixels(), (self.w * self.sf) as i32, (self.h * self.sf) as i32);
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, self.w, self.h);
     }
 
     /// 每秒局部重绘：时钟文字区域 bg 擦写 + 重画后整窗 ULW，
     /// 省掉日历网格等上百个元素的整窗重绘（头部以外像素不变）
     fn redraw_clock(&mut self) {
-        if self.bmp.is_null() || self.g.is_null() {
+        if !self.surf.is_alloc() {
             self.redraw();
             return;
         }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter {
-            g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         let hour12 = self.st.config.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hour12;
         let now = Local::now();
         let left = 24.0; // panel_x0(10) + pad(14)
@@ -3013,25 +2733,11 @@ impl Ui {
     /// 后重画 + ULW，跳过 30 天日程解析与整窗重绘（列表/头部像素不变）。
     /// 擦写范围避开面板底部左右圆角（x ≥ 24、y 上界 WIN_H-30）。
     fn redraw_input(&mut self) {
-        if self.bmp.is_null() || self.g.is_null() || self.page != Page::Agenda {
+        if !self.surf.is_alloc() || self.page != Page::Agenda {
             self.redraw();
             return;
         }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter {
-            g,
-            cache: cache_ptr,
-            sf: self.sf,
-            w: self.w,
-            h: self.h,
-            dc: self.mem_dc,
-            scan0: self.scan0,
-        };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         // 覆盖“滚轮查看更多”提示带 / 输入条 / 添加按钮 / 下拉向上展开区
         p.fill_rect(24.0, WIN_H - 148.0, WIN_W - 14.0 - 24.0, 118.0, BG());
         // 命中区域几何与整窗重绘时一致，丢弃本次生成的 regions 即可
@@ -3048,16 +2754,17 @@ impl Ui {
     fn fade_in(&mut self) {
         let (w, h) = ((self.w * self.sf) as i32, (self.h * self.sf) as i32);
         let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
-        if self.scan0.is_null() || n == 0 {
+        let scan0 = self.surf.pixels();
+        if scan0.is_null() || n == 0 {
             unsafe {
                 ShowWindow(self.hwnd as HWND, SW_SHOW);
                 SetForegroundWindow(self.hwnd as HWND);
             }
             return;
         }
-        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(self.scan0, n) }.to_vec();
+        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(scan0, n) }.to_vec();
         unsafe {
-            alpha_mul(self.scan0, w, h, 0.25);
+            alpha_mul(scan0, w, h, 0.25);
         }
         self.ulw();
         unsafe {
@@ -3067,8 +2774,8 @@ impl Ui {
         for t in [0.55f32, 0.85, 1.0] {
             std::thread::sleep(std::time::Duration::from_millis(28));
             unsafe {
-                std::ptr::copy_nonoverlapping(pristine.as_ptr(), self.scan0, n);
-                alpha_mul(self.scan0, w, h, t);
+                std::ptr::copy_nonoverlapping(pristine.as_ptr(), scan0, n);
+                alpha_mul(scan0, w, h, t);
             }
             self.ulw();
         }
@@ -3078,14 +2785,15 @@ impl Ui {
     fn fade_out(&mut self) {
         let (w, h) = ((self.w * self.sf) as i32, (self.h * self.sf) as i32);
         let n = (w.max(0) as usize) * (h.max(0) as usize) * 4;
-        if self.scan0.is_null() || n == 0 {
+        let scan0 = self.surf.pixels();
+        if scan0.is_null() || n == 0 {
             return;
         }
-        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(self.scan0, n) }.to_vec();
+        let pristine: Vec<u8> = unsafe { std::slice::from_raw_parts(scan0, n) }.to_vec();
         for t in [0.55f32, 0.25, 0.0] {
             unsafe {
-                std::ptr::copy_nonoverlapping(pristine.as_ptr(), self.scan0, n);
-                alpha_mul(self.scan0, w, h, t);
+                std::ptr::copy_nonoverlapping(pristine.as_ptr(), scan0, n);
+                alpha_mul(scan0, w, h, t);
             }
             self.ulw();
             std::thread::sleep(std::time::Duration::from_millis(26));
@@ -4211,34 +3919,6 @@ fn draw_cloud(p: &Painter, cx: f32, cy: f32, s: f32) {
     p.fill_round(cx - 10.0 * s, cy + 2.0 * s, 21.0 * s, 5.0 * s, 3.5 * s, CLOUD());
 }
 
-fn save_bmp(scan0: *const u8, w: i32, h: i32, path: &str) {
-    let stride = (w as usize) * 4;
-    let data_size = stride * h as usize;
-    let file_size = 54 + data_size;
-    let mut buf = Vec::with_capacity(file_size);
-    buf.extend_from_slice(b"BM");
-    buf.extend_from_slice(&(file_size as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&54u32.to_le_bytes());
-    buf.extend_from_slice(&40u32.to_le_bytes());
-    buf.extend_from_slice(&w.to_le_bytes());
-    buf.extend_from_slice(&h.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&32u16.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&(data_size as u32).to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    unsafe {
-        for row in (0..h as usize).rev() {
-            let src = std::slice::from_raw_parts(scan0.add(row * stride), stride);
-            buf.extend_from_slice(src);
-        }
-    }
-    let _ = std::fs::write(path, buf);
-}
 
 pub fn load_agenda() -> crate::events::AgendaMap {
     crate::events::load()
@@ -4700,27 +4380,7 @@ impl Ui {
 }
 
 // ================= 窗口过程 =================
-unsafe fn create_dib(ui: &mut Ui) {
-    let (mem_dc, hbmp, bmp, scan0) = gdi::alloc_dib(ui.w, ui.h);
-    ui.mem_dc = mem_dc;
-    ui.hbmp = hbmp;
-    ui.bmp = bmp;
-    ui.scan0 = scan0;
-}
 
-/// 释放后台位图（隐藏时调用压缩内存；下次 redraw 自动重建）
-fn free_surface(ui: &mut Ui) {
-    unsafe {
-        gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-    }
-}
-
-#[link(name = "gdiplus")]
-extern "system" {
-    fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
-}
 
 fn x_of(lp: LPARAM) -> i32 {
     ((lp as usize) & 0xFFFF) as u16 as i16 as i32
@@ -4813,7 +4473,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             ui.redraw_input();
                         }
                         // 近一周天气面板：仅“更新中…”5 秒窗口到期时补一次重绘
-                        //（数据到达由天气线程直接 forecast_redraw，悬停/点击由面板消息各自触发）
+                        //（数据到达由天气线程经 WM_APP_FC_REPAINT 投递，悬停/点击由面板消息各自触发）
                         if forecast_visible() && forecast_refresh_expired() {
                             fc_repaint = true;
                         }
@@ -4876,7 +4536,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 // 菜单需要屏幕坐标：客户区坐标 + 窗口原点
                 let mut r: RECT = std::mem::zeroed();
                 GetWindowRect(hwnd, &mut r);
-                crate::ctxmenu::ctxmenu_date::date_menu_toggle(r.left + x_of(lp), r.top + y_of(lp), d);
+                crate::ctxmenu_date::date_menu_toggle(r.left + x_of(lp), r.top + y_of(lp), d);
             } else {
                 // 日程页行右键：行菜单（复制/多选）
                 {
@@ -5300,7 +4960,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                                 ui.redraw();
                             } else {
                                 ui.shown = false;
-                                free_surface(ui);
+                                ui.surf.release();
                                 hide = true;
                             }
                         }
@@ -5352,7 +5012,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             if ctrl && ui.page == Page::Agenda {
                                 if let Some(t) = crate::textedit::sel_text(&ui.draft, ui.draft_caret, ui.draft_sel) {
                                     unsafe {
-                                        crate::textedit::set_clipboard(ui.hwnd, &t);
+                                        crate::clipboard::set_text(ui.hwnd, &t);
                                     }
                                 }
                             }
@@ -5362,7 +5022,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                             if ctrl && ui.page == Page::Agenda {
                                 if let Some(t) = crate::textedit::sel_text(&ui.draft, ui.draft_caret, ui.draft_sel) {
                                     unsafe {
-                                        crate::textedit::set_clipboard(ui.hwnd, &t);
+                                        crate::clipboard::set_text(ui.hwnd, &t);
                                     }
                                     ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
                                     crate::textedit::delete_sel(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel);
@@ -5486,14 +5146,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                 let ui = &mut sui.0;
                 if ui.page == Page::Agenda {
                     if lp as u32 & 0x0800 != 0 {
-                        if let Some(s) = read_ime_string(hwnd, 0x0800) {
+                        if let Some(s) = crate::ime::composition_string(hwnd, crate::ime::RESULT) {
                             ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "ins");
                             crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &s);
                             ui.comp.clear();
                             ui.clear_hint();
                         }
                     } else if lp as u32 & 0x0008 != 0 {
-                        ui.comp = read_ime_string(hwnd, 0x0008).unwrap_or_default();
+                        ui.comp = crate::ime::composition_string(hwnd, crate::ime::COMP).unwrap_or_default();
                     }
                     ui.redraw();
                 }
@@ -5553,7 +5213,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
                         let ui = &mut sui.0;
                         if ui.shown {
                             ui.shown = false;
-                            free_surface(ui);
+                            ui.surf.release();
                             hide = true;
                         }
                     }
@@ -5601,61 +5261,91 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
     }
 }
 
-unsafe fn read_ime_string(hwnd: HWND, mode: i32) -> Option<String> {
-    let himc = ImmGetContext(hwnd);
-    if himc.is_null() {
-        return None;
-    }
-    let len = ImmGetCompositionStringW(himc, mode, std::ptr::null_mut(), 0);
-    let mut out = None;
-    if len >= 0 {
-        let mut buf = vec![0u8; (len + 2) as usize];
-        let got = ImmGetCompositionStringW(himc, mode, buf.as_mut_ptr() as *mut winapi::ctypes::c_void, len);
-        if got >= 0 {
-            let slice = std::slice::from_raw_parts::<u16>(buf.as_ptr() as *const u16, (len as usize) / 2);
-            out = Some(String::from_utf16_lossy(slice));
-        }
-    }
-    ImmReleaseContext(hwnd, himc);
-    out
-}
 
-#[link(name = "imm32")]
-extern "system" {
-    fn ImmGetContext(hwnd: HWND) -> *mut winapi::ctypes::c_void;
-    fn ImmReleaseContext(hwnd: HWND, himc: *mut winapi::ctypes::c_void) -> i32;
-    fn ImmGetCompositionStringW(himc: *mut winapi::ctypes::c_void, index: i32, buf: *mut winapi::ctypes::c_void, len: i32) -> i32;
-}
-
-unsafe fn paste_clipboard(ui: &mut Ui) {
-    if OpenClipboard(ui.hwnd as HWND) == 0 {
-        return;
+/// Ctrl+V：剪贴板文本替换选区、插入光标处
+fn paste_clipboard(ui: &mut Ui) {
+    if let Some(t) = unsafe { crate::clipboard::read_text(ui.hwnd) } {
+        ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
+        crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &t);
     }
-    let h = GetClipboardData(13);
-    if !h.is_null() {
-        let ptr = GlobalLock(h as usize);
-        if !ptr.is_null() {
-            // 扫 NUL 终止符以分配大小为上界：异常数据（无终止符）时不越界读
-            let cap = GlobalSize(h as usize) / 2;
-            let mut len = 0usize;
-            while len < cap && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let text = String::from_utf16_lossy(slice);
-            ui.draft_undo.snapshot(&ui.draft, ui.draft_caret, ui.draft_sel, "");
-            crate::textedit::insert(&mut ui.draft, &mut ui.draft_caret, &mut ui.draft_sel, &text);
-            ui.clear_hint();
-            GlobalUnlock(h as usize);
-        }
-    }
-    CloseClipboard();
     ui.redraw();
 }
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn GlobalLock(h: usize) -> *mut u16;
-    fn GlobalSize(h: usize) -> usize;
-    fn GlobalUnlock(h: usize) -> i32;
+/// 界面自检（见 selftest 模块）：本模块三个窗口的各主要状态各渲染一帧并转储。
+/// 窗口全程隐藏——直接取后台位图
+#[cfg(feature = "selftest")]
+pub fn debug_render(dir: &std::path::Path) {
+    use crate::debug::save_frame;
+    {
+        let mut guard = UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sui) = guard.as_mut() {
+            let ui = &mut sui.0;
+            let today = Local::now().date_naive();
+            ui.view_y = today.year();
+            ui.view_m = today.month();
+            ui.selected = today;
+            ui.redraw();
+            save_frame(dir, "10-flyout-calendar", &ui.surf, ui.w, ui.h, ui.sf);
+            // 局部重绘（只擦写时钟区）后的整窗应与整窗重绘一致
+            ui.redraw_clock();
+            save_frame(dir, "11-flyout-calendar-clock-redraw", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.hover = Some(Action::Cell(today));
+            ui.preview = Some(today);
+            ui.redraw();
+            save_frame(dir, "12-flyout-hover-preview", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.hover = None;
+            ui.preview = None;
+            ui.month_pick = Some(MonthPick { year: ui.view_y });
+            ui.redraw();
+            save_frame(dir, "13-flyout-monthpick", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.month_pick = None;
+            ui.page = Page::Agenda;
+            ui.redraw();
+            save_frame(dir, "14-flyout-agenda", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.draft = "明天 9:30 例会".into();
+            ui.draft_caret = ui.draft.chars().count();
+            ui.kind_menu_open = true;
+            ui.redraw();
+            save_frame(dir, "15-flyout-agenda-kind-menu", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.kind_menu_open = false;
+            ui.redraw_input();
+            save_frame(dir, "16-flyout-agenda-input-redraw", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.row_menu = Some((0, 0, 60.0, 120.0));
+            ui.redraw();
+            save_frame(dir, "17-flyout-agenda-row-menu", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.row_menu = None;
+            ui.multi = Some((vec![true, false], vec![false, true, false]));
+            ui.redraw();
+            save_frame(dir, "18-flyout-agenda-multi", &ui.surf, ui.w, ui.h, ui.sf);
+            ui.multi = None;
+            ui.draft.clear();
+            ui.page = Page::Calendar;
+        }
+    }
+    for tab in 0..3 {
+        let mut guard = SETTINGS_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(sui) = guard.as_mut() {
+            let ui = &mut sui.0;
+            ui.tab = tab;
+            ui.hover = None;
+            ui.redraw();
+            save_frame(dir, &format!("20-settings-tab{tab}"), &ui.surf, ui.w, ui.h, ui.sf);
+            if tab == 0 {
+                ui.theme_menu_open = true;
+                ui.hover = Some(SAction::Toggle(Toggle::AutoUpdate));
+                ui.redraw();
+                save_frame(dir, "21-settings-tab0-dropdown", &ui.surf, ui.w, ui.h, ui.sf);
+                ui.theme_menu_open = false;
+                ui.hover = None;
+            }
+        }
+    }
+    {
+        let mut guard = FORECAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(f) = guard.as_mut() {
+            let ui = &mut f.0;
+            ui.redraw();
+            save_frame(dir, "30-forecast", &ui.surf, ui.w, ui.h, ui.sf);
+        }
+    }
 }

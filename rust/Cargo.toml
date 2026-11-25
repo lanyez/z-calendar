@@ -1,6 +1,6 @@
 [package]
 name = "z-calendar"
-version = "1.0.5"
+version = "1.0.9"
 edition = "2021"
 description = "Z日历 - 替换 Windows 任务栏时钟点击弹出的日历（法定节假日/农历/节气）"
 
@@ -13,6 +13,7 @@ winapi = { version = "0.3", features = [
     "winuser", "windef", "minwindef", "ntdef", "libloaderapi", "synchapi",
     "errhandlingapi", "winbase", "processthreadsapi", "handleapi", "winnt", "wingdi", "minwinbase",
     "playsoundapi", "combaseapi", "objbase", "oaidl", "oleauto", "wtypes",
+    "heapapi", "shellapi",
 ] }
 # Windows 通知中心（Toast）：仅启用通知与 XML 两个特性，静态链接、无运行时依赖
 windows = { version = "0.58", default-features = false, features = [
@@ -29,6 +30,12 @@ chrono = "0.4"
 [build-dependencies]
 winresource = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+# 界面自检（默认关闭，不进发布包）：CAL_SELFTEST=<dir> 把各类窗口各渲染一帧转储后退出。
+# 用于界面重构后的无人值守回归，见 src/selftest.rs
+default = []
+selftest = []
 
 [profile.release]
 opt-level = "s"

@@ -55,7 +55,8 @@ pub fn load_cache() -> HolidayMap {
 pub fn save_cache(map: &HolidayMap) {
     let path = crate::config::data_dir().join("holidays.json");
     if let Ok(text) = serde_json::to_string(&CacheFile { holidays: map.clone() }) {
-        let _ = std::fs::write(path, text);
+        // 缓存文件：原子写（不保留备份，损坏时下次拉取即自愈）
+        let _ = crate::config::write_file_atomic(&path, &text);
     }
 }
 
@@ -154,9 +155,8 @@ fn add_event(
             DayType::Xiu
         } else if desc.contains('班') {
             DayType::Ban
-        } else if desc.contains('休') {
-            DayType::Xiu
         } else {
+            // 无类型标记（含 DESCRIPTION 带"休"）：默认按休
             DayType::Xiu
         }
     });
@@ -215,5 +215,85 @@ fn fetch_map_once(url: &str) -> Option<HolidayMap> {
         None
     } else {
         Some(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// chinese-days holidays.ics 的形态：日期值、CRLF、折行的 SUMMARY
+    const SAMPLE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20261001\r\nDTEND;VALUE=DATE:20261008\r\nSUMMARY:国庆节(休)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20261010\r\nDTEND;VALUE=DATE:20261011\r\nSUMMARY:国庆节(班)\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nDTSTART:20260926T000000\r\nDTEND:20260927T000000\r\nSUMMARY:\r\n  中秋节(休)\r\nDESCRIPTION:休\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nDTSTART;VALUE=DATE:20261011\r\nSUMMARY:缺结束日(休)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn d(y: i32, m: u32, dd: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, dd).unwrap()
+    }
+
+    #[test]
+    fn parses_multi_day_holiday_workday_and_folded_lines() {
+        let map = parse_ics(SAMPLE);
+        let first = map.get(&key_of_date(d(2026, 10, 1))).expect("国庆首日");
+        assert_eq!(first.name, "国庆节");
+        assert!(first.ty == DayType::Xiu);
+        assert_eq!((first.idx, first.len), (0, 7));
+        let last = map.get(&key_of_date(d(2026, 10, 7))).unwrap();
+        assert_eq!((last.idx, last.len), (6, 7));
+        // DTEND 为排他结束日：10-8 不在假期内
+        assert!(!map.contains_key(&key_of_date(d(2026, 10, 8))));
+
+        let ban = map.get(&key_of_date(d(2026, 10, 10))).unwrap();
+        assert_eq!(ban.name, "国庆节");
+        assert!(ban.ty == DayType::Ban);
+        assert_eq!((ban.idx, ban.len), (0, 1));
+
+        // 折行的 SUMMARY（续行以空格开头）被拼回；日期时间形态的 DTSTART 取前 8 位
+        let mid = map.get(&key_of_date(d(2026, 9, 26))).unwrap();
+        assert_eq!(mid.name, "中秋节");
+        assert!(mid.ty == DayType::Xiu);
+        assert_eq!((mid.idx, mid.len), (0, 1));
+
+        // 缺 DTEND：按单日处理
+        let one = map.get(&key_of_date(d(2026, 10, 11))).unwrap();
+        assert_eq!((one.idx, one.len), (0, 1));
+        assert_eq!(map.len(), 7 + 1 + 1 + 1);
+    }
+
+    #[test]
+    fn type_falls_back_to_description_then_defaults_to_xiu() {
+        let mk = |summary: &str, desc: &str| {
+            format!("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261010\nSUMMARY:{summary}\nDESCRIPTION:{desc}\nEND:VEVENT\n")
+        };
+        let ty = |text: &str| parse_ics(text).get(&key_of_date(d(2026, 10, 10))).unwrap().ty;
+        // 括号后缀决定类型，全角括号同样识别，名称去掉后缀
+        let m = parse_ics(&mk("春节（休）", ""));
+        assert_eq!(m.get(&key_of_date(d(2026, 10, 10))).unwrap().name, "春节");
+        assert!(ty(&mk("春节（休）", "")) == DayType::Xiu);
+        assert!(ty(&mk("调休(班)", "")) == DayType::Ban);
+        // 无后缀：看 DESCRIPTION
+        assert!(ty(&mk("调休", "班")) == DayType::Ban);
+        assert!(ty(&mk("假日", "休")) == DayType::Xiu);
+        // 都没有：默认休
+        assert!(ty(&mk("假日", "")) == DayType::Xiu);
+        // 既无类型也无名称：补默认名
+        let m = parse_ics("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261010\nEND:VEVENT\n");
+        assert_eq!(m.get(&key_of_date(d(2026, 10, 10))).unwrap().name, "节假日");
+    }
+
+    #[test]
+    fn empty_or_foreign_input_yields_empty_map() {
+        assert!(parse_ics("").is_empty());
+        assert!(parse_ics("<html>not an ics</html>").is_empty());
+        // 缺 DTSTART 的事件丢弃
+        assert!(parse_ics("BEGIN:VEVENT\nSUMMARY:无开始(休)\nEND:VEVENT\n").is_empty());
+        // 非法日期
+        assert!(parse_ics("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20261399\nSUMMARY:x(休)\nEND:VEVENT\n").is_empty());
+    }
+
+    #[test]
+    fn mirrors_are_tried_only_for_default_cdn() {
+        let (host, path) = split_host_path("https://cdn.jsdelivr.net/npm/chinese-days/dist/holidays.ics").unwrap();
+        assert_eq!((host, path), ("cdn.jsdelivr.net", "/npm/chinese-days/dist/holidays.ics"));
+        assert!(split_host_path("http://cdn.jsdelivr.net/x").is_none(), "非 https 前缀");
+        assert!(split_host_path("https://example.com").is_none(), "无路径");
     }
 }

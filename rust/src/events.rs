@@ -126,21 +126,33 @@ pub fn load() -> AgendaMap {
     }
 }
 
-/// 落盘已序列化的快照（备份轮转 + 原子写）
+/// 落盘已序列化的快照（备份轮转 + 原子写，整段串行）
 fn commit(text: &str) {
     let path = crate::config::data_dir().join("agenda.json");
-    crate::config::backup_file(&path);
-    let _ = crate::config::write_file_atomic(&path, text);
+    let _ = crate::config::write_with_backup(&path, text);
 }
 
-/// 锁内变更 + 序列化（纯 CPU），锁外落盘：磁盘 IO（杀软扫描重命名时可达百
-/// 毫秒）不再握着数据锁阻塞并发读者（toast 撤销线程 / 输入弹窗线程）；且变更
-/// 与序列化在同一把锁内完成，消除“改完-解锁-再锁保存”两锁间隙里其他线程
-/// 读到未落盘状态的窗口。
+/// 提交串行锁：包住"修改 + 序列化 + 落盘"整段。数据锁仍只在修改与序列化时持有
+/// （读者不被磁盘 IO 阻塞），但落盘必须按修改顺序进行——两个线程并发保存时，
+/// 先改完的那个若落盘较慢（杀软扫描、磁盘抖动），后改完的新快照会先落盘、
+/// 再被旧快照覆盖：内存里两条都在，重启后丢一条
+static COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 锁内变更 + 序列化（纯 CPU），数据锁外落盘。
 pub fn edit_and_save<R>(
     agenda: &std::sync::Arc<std::sync::Mutex<AgendaMap>>,
     edit: impl FnOnce(&mut AgendaMap) -> R,
 ) -> R {
+    edit_with(agenda, edit, commit)
+}
+
+/// 同 edit_and_save，落盘动作由调用方给出（测试用内存替身验证提交顺序）
+fn edit_with<R>(
+    agenda: &std::sync::Arc<std::sync::Mutex<AgendaMap>>,
+    edit: impl FnOnce(&mut AgendaMap) -> R,
+    commit: impl FnOnce(&str),
+) -> R {
+    let _c = COMMIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (r, text) = {
         let mut map = agenda.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let r = edit(&mut map);
@@ -563,6 +575,23 @@ pub fn agenda_remove_at(map: &mut AgendaMap, key: &str, idx: usize) -> bool {
         }
     }
     removed
+}
+
+/// 编辑保存时按 id 重新定位条目：返回 (key, 下标)。
+/// 先看打开编辑弹窗时记下的位置（绝大多数编辑不改列表），再全表查找（弹窗打开
+/// 期间条目被移动过）；旧条目无 id 或已被删除时回退到原位置。
+/// 此前保存只用打开弹窗那一刻的下标：弹窗开着时在别处增删了条目，就会改到另一条。
+pub fn locate_entry_by_id(map: &AgendaMap, id: &str, at_key: &str, at_idx: usize) -> (String, usize) {
+    if !id.is_empty() {
+        let has_id = |e: &AgendaEntry| matches!(e, AgendaEntry::Rich(r) if r.id == id);
+        if let Some(i) = map.get(at_key).and_then(|v| v.iter().position(has_id)) {
+            return (at_key.to_string(), i);
+        }
+        if let Some(found) = map.iter().find_map(|(k, v)| v.iter().position(has_id).map(|i| (k.clone(), i))) {
+            return found;
+        }
+    }
+    (at_key.to_string(), at_idx)
 }
 
 /// 「仅删除/修改这一天」：给重复日程条目追加例外日期。返回是否追加。
@@ -1195,6 +1224,82 @@ mod tests {
         assert!(keys.contains(&crate::ics::key_of_date(start + Duration::days(2))));
         assert!(!keys.contains(&crate::ics::key_of_date(start)));
         assert!(!keys.contains(&crate::ics::key_of_date(start + Duration::days(3))));
+    }
+
+    /// 回归：并发保存时落盘按修改顺序进行。先改完的线程若落盘较慢，其旧快照
+    /// 不得覆盖后改完的新快照（此前锁外落盘无序，重启后会丢一条）
+    #[test]
+    fn concurrent_edits_commit_in_order() {
+        let agenda = std::sync::Arc::new(std::sync::Mutex::new(AgendaMap::new()));
+        let disk = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let push = |m: &mut AgendaMap, text: &str| {
+            m.entry("k".into()).or_default().push(AgendaEntry::Legacy(text.into()));
+        };
+        // 线程 1：先改，但落盘慢（60ms）
+        let (a1, d1) = (agenda.clone(), disk.clone());
+        let t1 = std::thread::spawn(move || {
+            edit_with(
+                &a1,
+                |m| push(m, "slow"),
+                |t| {
+                    std::thread::sleep(std::time::Duration::from_millis(60));
+                    *d1.lock().unwrap() = t.to_string();
+                },
+            )
+        });
+        // 线程 2：后改（等线程 1 已进入落盘阶段再启动），落盘快
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (a2, d2) = (agenda.clone(), disk.clone());
+        let t2 = std::thread::spawn(move || {
+            edit_with(
+                &a2,
+                |m| push(m, "fast"),
+                |t| {
+                    *d2.lock().unwrap() = t.to_string();
+                },
+            )
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let d = disk.lock().unwrap();
+        assert!(d.contains("slow") && d.contains("fast"), "最后落盘的快照应包含两次修改：{d}");
+    }
+
+    /// 编辑定位：按 id 找条目；旧条目无 id 或已被删除时回退到原位置
+    #[test]
+    fn locate_entry_follows_id_when_index_drifts() {
+        let rich = |id: &str, name: &str| {
+            AgendaEntry::Rich(RichEvent {
+                id: id.into(),
+                name: name.into(),
+                all_day: false,
+                start: "2026-11-4 09:00".into(),
+                end: "2026-11-4 10:00".into(),
+                remind: None,
+                repeat: None,
+                recur: None,
+                recur_until: None,
+                skip_dates: vec![],
+                note: None,
+                color: None,
+            })
+        };
+        let mut map = AgendaMap::new();
+        map.insert("2026-11-4".into(), vec![rich("a", "甲"), rich("b", "乙")]);
+        map.insert("2026-11-5".into(), vec![rich("c", "丙")]);
+        // 正常：原位置就是它
+        assert_eq!(locate_entry_by_id(&map, "b", "2026-11-4", 1), ("2026-11-4".to_string(), 1));
+        // 弹窗打开期间前面插了一条：下标漂移，按 id 仍能找对
+        map.get_mut("2026-11-4").unwrap().insert(0, rich("x", "新"));
+        assert_eq!(locate_entry_by_id(&map, "b", "2026-11-4", 1), ("2026-11-4".to_string(), 2));
+        // 期间被移动到别的日期：全表查找
+        let moved = map.get_mut("2026-11-4").unwrap().remove(2);
+        assert!(matches!(&moved, AgendaEntry::Rich(r) if r.id == "b"));
+        map.entry("2026-11-6".into()).or_default().push(moved);
+        assert_eq!(locate_entry_by_id(&map, "b", "2026-11-4", 1), ("2026-11-6".to_string(), 0));
+        // 旧条目无 id / 已被删除：回退原位置
+        assert_eq!(locate_entry_by_id(&map, "", "2026-11-5", 0), ("2026-11-5".to_string(), 0));
+        assert_eq!(locate_entry_by_id(&map, "gone", "2026-11-5", 0), ("2026-11-5".to_string(), 0));
     }
 }
 

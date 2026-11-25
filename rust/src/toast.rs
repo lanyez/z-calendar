@@ -3,14 +3,14 @@
 //! 提醒线程到点补发）。点击卡片其他区域打开日历。
 //! 独立线程拥有窗口；提醒引擎通过 channel 投递 ToastMsg。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use crate::gdi::{Cache, Painter};
 use crate::gdi;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
-use winapi::um::wingdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, SelectObject};
+use winapi::shared::windef::{HWND, RECT};
 use winapi::um::winuser::*;
 
 const TOAST_W: f32 = 300.0;
@@ -19,6 +19,8 @@ const GAP: f32 = 10.0;
 const MAX_ITEMS: usize = 3;
 /// 溢出折叠汇总条高度（“还有 N 条较早提醒”）
 const SUMMARY_H: f32 = 30.0;
+/// 位图最大高度（逻辑 px）：汇总条 + 最多 MAX_ITEMS 张卡片
+const MAX_H: f32 = SUMMARY_H + GAP + (ITEM_H + GAP) * MAX_ITEMS as f32;
 const SHOW_MS: i64 = 10_000;
 const MARGIN: i32 = 12;
 /// 稍后提醒的间隔（毫秒）
@@ -100,9 +102,6 @@ pub struct SnoozeEntry {
 /// 稍后提醒间隔（通知中心激活补提用）
 pub const SNOOZE_MS_PUB: i64 = SNOOZE_MS;
 
-pub fn now_ms_pub() -> i64 {
-    now_ms()
-}
 
 /// 登记一条稍后提醒（通知中心「稍后10分钟」按钮与内置卡片共用）
 pub fn snooze_add_entry(entry: SnoozeEntry) {
@@ -176,11 +175,8 @@ fn undo_rect(item_y: f32) -> (f32, f32, f32, f32) {
 
 struct ToastUi {
     hwnd: usize,
-    mem_dc: usize,
-    /// 后台 DIBSection 像素指针（GDI ClearType 文本路径用）
-    scan0: *mut u8,
-    bmp: gdi::Gp,
-    g: gdi::Gp,
+    /// 后台位图：按最大高度一次分配，进程生命周期内复用
+    surf: gdi::Dib,
     cache: Cache,
     items: Vec<Item>,
     /// 超出 MAX_ITEMS 被折叠的较早提醒条数（顶部汇总条展示，点击清除）
@@ -194,6 +190,8 @@ unsafe impl Send for SendToast {}
 
 /// 仅在 toast 线程访问（事件循环与窗口过程同线程）
 static TOAST_UI: Mutex<Option<SendToast>> = Mutex::new(None);
+/// 提醒窗口句柄（创建后写入；其他线程只借它 PostMessage，不碰窗口）
+static TOAST_HWND: AtomicUsize = AtomicUsize::new(0);
 
 /// 全局投递口（spawn 时登记）；数据自愈等任意线程可发通知
 static TOAST_TX: OnceLock<Sender<ToastMsg>> = OnceLock::new();
@@ -239,12 +237,7 @@ fn undo_restore(data: &UndoData) {
     crate::flyout::post_repaint();
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
+use crate::clock::now_ms;
 
 /// 启动弹窗线程，返回提醒投递口
 pub fn spawn() -> Sender<ToastMsg> {
@@ -259,8 +252,22 @@ pub fn spawn() -> Sender<ToastMsg> {
     tx
 }
 
-/// 屏幕缩放变化：可见时按新 sf 重摆重绘（toast 的绘制/尺寸均实时读 gdi::scale()）
+/// 主线程（rescale_all）请求按新缩放重摆重绘。只投递消息：提醒窗口属 toast 线程，
+/// 此前主线程在这里持 TOAST_UI 锁跨线程 SetWindowPos——toast 线程此刻若正好在等
+/// 这把锁，两边互锁（主线程死锁）。绘制始终回到属主线程执行
+const WM_APP_RESCALE: UINT = WM_APP + 0x10;
+
 pub fn rescale() {
+    let h = TOAST_HWND.load(Ordering::Relaxed) as HWND;
+    if !h.is_null() {
+        unsafe {
+            PostMessageW(h, WM_APP_RESCALE, 0, 0);
+        }
+    }
+}
+
+/// 屏幕缩放变化：可见时按新 sf 重摆重绘（toast 的绘制/尺寸均实时读 gdi::scale()）
+fn rescale_now() {
     let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = guard.as_mut() {
         let f = &mut f.0;
@@ -283,7 +290,7 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     wc.lpszClassName = cls.as_ptr();
     RegisterClassW(&wc);
 
-    let max_h = gdi::phys(ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 + SUMMARY_H + GAP) as i32;
+    let max_h = gdi::phys(MAX_H) as i32;
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE,
         cls.as_ptr(),
@@ -301,31 +308,13 @@ unsafe fn run_loop(rx: Receiver<ToastMsg>) {
     if hwnd.is_null() {
         return;
     }
+    TOAST_HWND.store(hwnd as usize, Ordering::Relaxed);
 
-    let hdc = GetDC(std::ptr::null_mut());
-    let mem_dc = CreateCompatibleDC(hdc) as usize;
-    let mut bmi: BITMAPINFO = std::mem::zeroed();
-    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    bmi.bmiHeader.biWidth = gdi::phys(TOAST_W) as i32;
-    bmi.bmiHeader.biHeight = -max_h;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    let mut bits: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-    let hbmp = CreateDIBSection(hdc, &bmi, 0, &mut bits, std::ptr::null_mut(), 0);
-    SelectObject(mem_dc as winapi::shared::windef::HDC, hbmp as winapi::shared::windef::HGDIOBJ);
-    ReleaseDC(std::ptr::null_mut(), hdc);
-    let mut bmp: gdi::Gp = std::ptr::null_mut();
-    GdipCreateBitmapFromScan0(gdi::phys(TOAST_W) as i32, max_h, gdi::phys(TOAST_W) as i32 * 4, gdi::PIXEL_FORMAT_32BPP_PARGB, bits as *mut u8, &mut bmp);
-    let mut g: gdi::Gp = std::ptr::null_mut();
-    GdipGetImageGraphicsContext(bmp, &mut g);
+    let surf = gdi::Dib::alloc(TOAST_W, MAX_H);
 
     *TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SendToast(Box::new(ToastUi {
         hwnd: hwnd as usize,
-        mem_dc,
-        scan0: bits as *mut u8,
-        bmp,
-        g,
+        surf,
         cache: Cache::new(),
         items: Vec::new(),
         dropped: 0,
@@ -459,45 +448,27 @@ unsafe fn position(f: &ToastUi) {
     SetWindowPos(f.hwnd as HWND, HWND_TOPMOST, x, y, gdi::phys(TOAST_W) as i32, h, SWP_NOACTIVATE);
 }
 
+/// 提交当前卡片列表到窗口（窗口高度随可见卡片数变化）
 fn repaint(f: &mut ToastUi) {
-    unsafe {
-        if f.g.is_null() {
-            GdipGetImageGraphicsContext(f.bmp, &mut f.g);
-        }
-        let cache_ptr: *const Cache = &f.cache;
-        GdipSetSmoothingMode(f.g, gdi::SMOOTH_ANTI_ALIAS);
-        GdipSetTextRenderingHint(f.g, gdi::text_hint());
-        let p = Painter { g: f.g, cache: cache_ptr, sf: gdi::scale(), w: TOAST_W, h: ITEM_H * MAX_ITEMS as f32 + GAP * (MAX_ITEMS - 1) as f32 + SUMMARY_H + GAP, dc: f.mem_dc, scan0: f.scan0 };
-        p.clear();
-        // 溢出折叠汇总条（点击清除）
-        if f.dropped > 0 {
-            let sh = SUMMARY_H;
-            p.fill_round(0.0, 0.0, TOAST_W, sh, 10.0, BG());
-            p.stroke_round(0.5, 0.5, TOAST_W - 1.0, sh - 1.0, 10.0, 1.0, BORDER());
-            p.text(&format!("还有 {} 条较早提醒（点击清除）", f.dropped), 14.0, 0.0, TOAST_W - 28.0, sh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB());
-        }
-        let off = summary_off(f);
-        for (i, it) in f.items.iter().enumerate() {
-            paint_item(&p, off + (ITEM_H + GAP) * i as f32, it, f.hover_btn.filter(|(hi, _)| *hi == i).map(|(_, b)| b));
-        }
-        let mut r: RECT = std::mem::zeroed();
-        GetWindowRect(f.hwnd as HWND, &mut r);
-        let h = gdi::phys(total_h(f)) as i32;
-        let mut ppt = POINT { x: r.left, y: r.top };
-        let mut size = SIZE { cx: gdi::phys(TOAST_W) as i32, cy: h };
-        let mut src = POINT { x: 0, y: 0 };
-        let mut blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
-        UpdateLayeredWindow(
-            f.hwnd as HWND,
-            std::ptr::null_mut(),
-            &mut ppt,
-            &mut size,
-            f.mem_dc as winapi::shared::windef::HDC,
-            &mut src,
-            0,
-            &mut blend,
-            2,
-        );
+    render(f);
+    f.surf.present(f.hwnd, gdi::scale(), TOAST_W, total_h(f));
+}
+
+/// 把当前卡片列表画进后台位图。只画不提交——界面自检据此在不显示窗口的情况下
+/// 渲染（见 selftest 模块）
+fn render(f: &mut ToastUi) {
+    let p = f.surf.painter(&f.cache, gdi::scale(), TOAST_W, MAX_H);
+    p.clear();
+    // 溢出折叠汇总条（点击清除）
+    if f.dropped > 0 {
+        let sh = SUMMARY_H;
+        p.fill_round(0.0, 0.0, TOAST_W, sh, 10.0, BG());
+        p.stroke_round(0.5, 0.5, TOAST_W - 1.0, sh - 1.0, 10.0, 1.0, BORDER());
+        p.text(&format!("还有 {} 条较早提醒（点击清除）", f.dropped), 14.0, 0.0, TOAST_W - 28.0, sh, gdi::HALIGN_NEAR, gdi::HALIGN_CENTER, 10.5, false, false, SUB());
+    }
+    let off = summary_off(f);
+    for (i, it) in f.items.iter().enumerate() {
+        paint_item(&p, off + (ITEM_H + GAP) * i as f32, it, f.hover_btn.filter(|(hi, _)| *hi == i).map(|(_, b)| b));
     }
 }
 
@@ -572,6 +543,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_APP_RESCALE => {
+            rescale_now();
+            0
+        }
         WM_MOUSEMOVE => {
             let s = gdi::scale();
             let (x, y) = (x_of(lp) as f32 / s, y_of(lp) as f32 / s);
@@ -763,10 +738,31 @@ fn y_of(lp: LPARAM) -> i32 {
     (((lp as usize) >> 16) as u16 as i16) as i32
 }
 
-#[link(name = "gdiplus")]
-extern "system" {
-    fn GdipCreateBitmapFromScan0(w: i32, h: i32, stride: i32, format: i32, scan0: *mut u8, bitmap: *mut gdi::Gp) -> i32;
-    fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
+/// 界面自检（见 selftest 模块）：画一组示例卡片并转储，窗口不显示。
+/// 全程持有 TOAST_UI 锁：提醒线程不会在这组样例卡片存在期间把窗口显示出来
+#[cfg(feature = "selftest")]
+pub fn debug_render(dir: &std::path::Path) {
+    use crate::debug::save_frame;
+    let mut guard = TOAST_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(f) = guard.as_mut() else { return };
+    let f = &mut f.0;
+    let item = |title: &str, body: &str, act: Act| Item { title: title.into(), body: body.into(), act, quiet: false, born: 0 };
+    f.items = vec![
+        item("待办提醒", "09:00 交周报", Act::TodoDone { id: "x".into(), date: "2026-11-4".into(), recur: false }),
+        item(
+            "日程提醒",
+            "14:30 项目评审会议（这是一个很长很长的标题，用来验证正文折行与第二行的省略号截断是否仍然正常工作）",
+            Act::None,
+        ),
+        item("已删除", "1 条待办", Act::Undo { data: UndoData::Todos { items: vec![] } }),
+    ];
+    f.hover_btn = Some((1, 1));
+    render(f);
+    save_frame(dir, "80-toast", &f.surf, TOAST_W, total_h(f), gdi::scale());
+    f.dropped = 2;
+    f.hover_btn = None;
+    render(f);
+    save_frame(dir, "81-toast-overflow", &f.surf, TOAST_W, total_h(f), gdi::scale());
+    f.items.clear();
+    f.dropped = 0;
 }

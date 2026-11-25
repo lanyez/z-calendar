@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "z-calendar"
-version = "1.0.5"
+version = "1.0.9"
 dependencies = [
  "chrono",
  "image",

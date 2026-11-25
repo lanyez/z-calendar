@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HWND, POINT, RECT, SIZE};
+use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::winuser::*;
 
 use crate::almanac;
+use crate::debug;
 use crate::events::AgendaMap;
 use crate::flyout::SharedState;
 use crate::gdi::{self, Cache, Painter};
@@ -57,19 +58,16 @@ struct SidebarUi {
     sf: f32,
     w: f32,
     h: f32,
-    mem_dc: usize,
-    hbmp: usize,
-    bmp: gdi::Gp,
-    scan0: *mut u8,
-    g: gdi::Gp,
+    /// 后台位图（隐藏时释放，显示前重建；见 gdi::Dib）
+    surf: gdi::Dib,
     cache: Cache,
     st: SharedState,
     agenda: Arc<Mutex<AgendaMap>>,
     date: Option<NaiveDate>,
     regions: Vec<(gdi::RectF, SbAction)>,
     hover: Option<SbAction>,
-    dumped: bool,
-    dump_path: String,
+    /// 调试：首帧转储（CAL_DUMP4，见 debug 模块）
+    dump: debug::FrameDump,
     // ---- 卡片滚动（滚轮作用于光标所在卡片） ----
     /// 日程卡片：滚动偏移 / 条目总数 / 列表区 y 范围
     agenda_scroll: usize,
@@ -142,6 +140,28 @@ pub struct Todo {
 
 static TODOS: Mutex<Option<Arc<Vec<Todo>>>> = Mutex::new(None);
 
+/// 测试用待办：带 id、未完成、归属日期 date、全天、不重复
+#[cfg(test)]
+pub(crate) fn test_todo(id: &str, text: &str, date: &str) -> Todo {
+    Todo {
+        id: id.into(),
+        text: text.into(),
+        done: false,
+        date: Some(date.into()),
+        priority: 0,
+        has_time: false,
+        start: None,
+        end: None,
+        remind: None,
+        repeat: None,
+        recur: None,
+        recur_until: None,
+        skip_dates: vec![],
+        done_dates: vec![],
+        note: None,
+        color: None,
+    }
+}
 /// 当前待办快照（Arc 克隆，读者零拷贝）：未加载时先读盘，避免写操作覆盖已有数据
 /// （损坏时自动从 .bak 恢复）。写路径用 Arc::make_mut 写时复制，旧快照不受影响。
 /// 提醒扫描线程每轮经此取内存态（todos_snapshot），不再磁盘重读。
@@ -167,22 +187,37 @@ pub fn todos_snapshot() -> Arc<Vec<Todo>> {
     todos_arc()
 }
 
-/// 落盘已序列化的待办快照（备份轮转 + 原子写）
+/// 落盘已序列化的待办快照（备份轮转 + 原子写，整段串行）
 fn commit_todos(text: &str) {
     let path = crate::config::data_dir().join("todo.json");
-    crate::config::backup_file(&path);
-    let _ = crate::config::write_file_atomic(&path, text);
+    let _ = crate::config::write_with_backup(&path, text);
 }
 
-/// 待办变更 + 序列化在 TODOS 锁内（纯 CPU），落盘在锁外（同
-/// events::edit_and_save 的理由：磁盘 IO 不握数据锁，避免阻塞并发读待办的
-/// 线程——提醒扫描线程 / 通知激活线程）。闭包返回 (结果, 是否变更)；
-/// 未变更不落盘（保持原有条件保存语义）。
+/// 提交串行锁（同 events::COMMIT_LOCK）：修改与落盘按同一顺序进行，先改完的线程
+/// 落盘较慢时不会被后改完的新快照抢先、再被旧快照覆盖
+static COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 待办变更 + 序列化在 TODOS 锁内（纯 CPU），数据锁外落盘（磁盘 IO 不握数据锁，
+/// 避免阻塞并发读待办的线程——提醒扫描线程 / 通知激活线程）。
+/// 闭包返回 (结果, 是否变更)；未变更不落盘（保持原有条件保存语义）。
 fn edit_todos<R>(edit: impl FnOnce(&mut Vec<Todo>) -> (R, bool)) -> R {
+    // 未加载时先读盘，避免写操作覆盖已有数据（损坏时自动从 .bak 恢复）
     let cached = todos_arc();
+    edit_serialized(&TODOS, cached, edit, commit_todos)
+}
+
+/// 同 edit_todos，落盘动作与数据由调用方给出（测试用内存替身验证提交顺序，
+/// 不触碰真实的 todo.json）
+fn edit_serialized<T: serde::Serialize + Clone, R>(
+    cell: &Mutex<Option<Arc<Vec<T>>>>,
+    initial: Arc<Vec<T>>,
+    edit: impl FnOnce(&mut Vec<T>) -> (R, bool),
+    commit: impl FnOnce(&str),
+) -> R {
+    let _c = COMMIT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ((r, changed), text) = {
-        let mut g = TODOS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let list = Arc::make_mut(g.get_or_insert_with(|| cached));
+        let mut g = cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let list = Arc::make_mut(g.get_or_insert_with(|| initial));
         let rc = edit(list);
         if rc.1 {
             TODO_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -191,7 +226,7 @@ fn edit_todos<R>(edit: impl FnOnce(&mut Vec<Todo>) -> (R, bool)) -> R {
     };
     if changed {
         if let Some(t) = text {
-            commit_todos(&t);
+            commit(&t);
         }
     }
     r
@@ -237,8 +272,12 @@ pub fn todo_at(gi: usize) -> Option<Todo> {
 /// 重复待办在命中日子展开一条（尊重截止日与“仅此次”例外），done 反映当天的完成记录；
 /// 列表按 时间→优先级 排序。取 Arc 快照筛选，只克隆命中条目（月历/日程页逐日调用）。
 pub fn todos_for(key: &str) -> Vec<(usize, Todo)> {
+    todos_for_in(&todos_arc(), key)
+}
+
+/// todos_for 的纯函数形式：对给定待办列表筛选某日条目（供测试）
+pub(crate) fn todos_for_in(list: &[Todo], key: &str) -> Vec<(usize, Todo)> {
     let date = chrono::NaiveDate::parse_from_str(key, "%Y-%m-%d").ok();
-    let list = todos_arc();
     let mut out: Vec<(usize, Todo)> = Vec::new();
     for (i, src) in list.iter().enumerate() {
         if src.date.as_deref() == Some(key) {
@@ -304,8 +343,17 @@ fn todo_sort_key(t: &Todo) -> (u8, u8, u32, u8) {
 /// 与 todos_for(key).filter(!done).count() 逐条等价，但整月一趟完成（42 格逐日
 /// 调 todos_for 会反复克隆整表）。
 pub fn todo_counts_between(a: NaiveDate, b: NaiveDate) -> std::collections::HashMap<String, usize> {
+    todo_counts_in(&todos_arc(), a, b)
+}
+
+/// todo_counts_between 的纯函数形式（对给定列表；供测试）
+pub(crate) fn todo_counts_in(
+    list: &[Todo],
+    a: NaiveDate,
+    b: NaiveDate,
+) -> std::collections::HashMap<String, usize> {
     let mut map = std::collections::HashMap::new();
-    for t in todos_arc().iter() {
+    for t in list.iter() {
         if t.done && t.recur.is_none() {
             continue;
         }
@@ -409,19 +457,39 @@ pub fn remove_todo_at_quiet(gi: usize) {
     });
 }
 
-/// 编辑替换待办（全局下标；done/id 沿用原条目）
-pub fn update_todo_at(gi: usize, mut td: Todo) {
-    edit_todos(|list| {
-        if let Some(old) = list.get(gi) {
-            td.done = old.done;
-            if td.id.is_empty() {
-                td.id = old.id.clone();
-            }
-            list[gi] = td;
-            ((), true)
-        } else {
-            ((), false)
+/// 按下标或 id 定位待办：id 非空时优先全表查找。gi 是打开编辑弹窗那一刻的全局
+/// 下标——弹窗开着时列表可能已被别处增删（下标整体位移），只认下标会改到另一条；
+/// 旧条目无 id 或已被删除时回退到原下标
+fn locate_todo(list: &[Todo], id: &str, gi: usize) -> Option<usize> {
+    if !id.is_empty() {
+        if let Some(i) = list.iter().position(|t| t.id == id) {
+            return Some(i);
         }
+    }
+    (gi < list.len()).then_some(gi)
+}
+
+/// 编辑替换待办（全局下标；done/id 沿用原条目）
+pub fn update_todo_at(gi: usize, td: Todo) {
+    let id = todos_arc().get(gi).map(|t| t.id.clone()).unwrap_or_default();
+    update_todo_by_id(&id, gi, td);
+}
+
+/// 编辑替换待办：按 id 定位（见 locate_todo），找不到再退回全局下标 gi
+pub fn update_todo_by_id(id: &str, gi: usize, mut td: Todo) {
+    edit_todos(|list| {
+        let Some(i) = locate_todo(list, id, gi) else {
+            return ((), false);
+        };
+        let Some(old) = list.get(i) else {
+            return ((), false);
+        };
+        td.done = old.done;
+        if td.id.is_empty() {
+            td.id = old.id.clone();
+        }
+        list[i] = td;
+        ((), true)
     });
     crate::flyout::flyout_repaint();
 }
@@ -511,7 +579,8 @@ pub fn has_done_todos() -> bool {
     todos().iter().any(|t| t.done && t.recur.is_none())
 }
 
-/// 提醒卡片「完成」按钮：按 id 定位待办标记完成（重复待办按日子记录完成）
+/// 提醒卡片「完成」按钮：按 id 定位待办标记完成（重复待办按日子记录完成）。
+/// 可能在提醒卡片线程 / 通知激活线程上执行：主面板与侧栏的重绘都投递到属主线程
 pub fn complete_todo_by_id(id: &str, date_key: &str) {
     if id.is_empty() {
         return;
@@ -536,6 +605,8 @@ pub fn complete_todo_by_id(id: &str, date_key: &str) {
     });
     if changed {
         crate::flyout::post_repaint();
+        // 侧栏待办清单同步刷新（此前只重绘主面板：内置提醒卡片点「完成」后侧栏不变）
+        post_repaint();
     }
 }
 
@@ -557,11 +628,12 @@ pub fn todo_skip_day(gi: usize, date: chrono::NaiveDate) -> bool {
     changed
 }
 
-/// 「仅修改这一天」（编辑保存）：给重复待办追加例外日期并可顺带更新截止日
-pub fn todo_patch_recur(gi: usize, until: Option<String>, skip: Option<chrono::NaiveDate>) {
+/// 「仅修改这一天」（编辑保存）：给重复待办追加例外日期并可顺带更新截止日。
+/// 按 id 定位（见 locate_todo），找不到再退回全局下标 gi
+pub fn todo_patch_recur_by_id(id: &str, gi: usize, until: Option<String>, skip: Option<chrono::NaiveDate>) {
     let changed = edit_todos(|list| {
         let mut changed = false;
-        if let Some(td) = list.get_mut(gi) {
+        if let Some(td) = locate_todo(list, id, gi).and_then(|i| list.get_mut(i)) {
             if td.recur.is_some() {
                 if td.recur_until != until {
                     td.recur_until = until;
@@ -737,10 +809,7 @@ pub fn sidebar_hide() {
         {
             let mut guard = SIDEBAR_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(f) = guard.as_mut() {
-                let ui = &mut f.0;
-                unsafe {
-                    gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-                }
+                f.0.surf.release();
             }
         }
         // 侧栏收起：天气面板（若可见）贴回主日历左缘
@@ -758,9 +827,7 @@ pub fn rescale(sf: f32) {
         let ui = &mut f.0;
         ui.sf = sf;
         date = ui.date;
-        unsafe {
-            gdi::free_dib(&mut ui.mem_dc, &mut ui.hbmp, &mut ui.bmp, &mut ui.g, &mut ui.scan0);
-        }
+        ui.surf.release();
     }
     if sidebar_visible() {
         sidebar_hide();
@@ -871,19 +938,14 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
             sf: gdi::scale(),
             w: SB_W,
             h: 716.0,
-            mem_dc: 0,
-            hbmp: 0,
-            bmp: std::ptr::null_mut(),
-            scan0: std::ptr::null_mut(),
-            g: std::ptr::null_mut(),
+            surf: gdi::Dib::empty(),
             cache: Cache::new(),
             st,
             agenda,
             date: None,
             regions: Vec::new(),
             hover: None,
-            dumped: false,
-            dump_path: std::env::var("CAL_DUMP4").unwrap_or_default(),
+            dump: debug::FrameDump::from_env(debug::DUMP_SIDEBAR),
             agenda_scroll: 0,
             agenda_count: 0,
             agenda_band: (0.0, 0.0),
@@ -905,63 +967,19 @@ pub fn create_window(st: SharedState, agenda: Arc<Mutex<AgendaMap>>) {
 
 impl SidebarUi {
     fn redraw(&mut self) {
-        if self.bmp.is_null() {
-            // 隐藏时位图已释放压缩内存：显示前重建
-            let (mem_dc, hbmp, bmp, scan0) = unsafe { gdi::alloc_dib(self.w, self.h) };
-            self.mem_dc = mem_dc;
-            self.hbmp = hbmp;
-            self.bmp = bmp;
-            self.scan0 = scan0;
+        // 隐藏时位图已释放压缩内存：显示前重建
+        if !self.surf.is_alloc() {
+            self.surf = gdi::Dib::alloc(self.w, self.h);
         }
-        if self.g.is_null() {
-            unsafe { GdipGetImageGraphicsContext(self.bmp, &mut self.g); }
-        }
-        let cache_ptr: *const Cache = &self.cache;
-        let g = self.g;
-        unsafe {
-            GdipSetSmoothingMode(g, gdi::SMOOTH_ANTI_ALIAS);
-            GdipSetTextRenderingHint(g, gdi::text_hint());
-        }
-        let p = Painter { g, cache: cache_ptr, sf: self.sf, w: self.w, h: self.h, dc: self.mem_dc, scan0: self.scan0 };
+        let p = self.surf.painter(&self.cache, self.sf, self.w, self.h);
         self.paint(&p);
         self.ulw();
 
-        if !self.dumped && !self.dump_path.is_empty() {
-            self.dumped = true;
-            save_bmp(self.scan0, (self.w * self.sf) as i32, (self.h * self.sf) as i32, &self.dump_path);
-            if std::env::var("CAL_DUMP_EXIT").map(|v| v == "1").unwrap_or(false) {
-                unsafe {
-                    PostMessageW(crate::flyout::hwnd() as HWND, WM_CLOSE, 0, 0);
-                }
-            }
-        }
+        self.dump.take(crate::flyout::hwnd(), self.surf.pixels(), (self.w * self.sf) as i32, (self.h * self.sf) as i32);
     }
 
     fn ulw(&self) {
-        unsafe {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(self.hwnd as HWND, &mut r);
-            let mut ppt = POINT { x: r.left, y: r.top };
-            let mut size = SIZE { cx: (self.w * self.sf) as i32, cy: (self.h * self.sf) as i32 };
-            let mut src = POINT { x: 0, y: 0 };
-            let mut blend = winapi::um::wingdi::BLENDFUNCTION {
-                BlendOp: 0,
-                BlendFlags: 0,
-                SourceConstantAlpha: 255,
-                AlphaFormat: 1,
-            };
-            UpdateLayeredWindow(
-                self.hwnd as HWND,
-                std::ptr::null_mut(),
-                &mut ppt,
-                &mut size,
-                self.mem_dc as winapi::shared::windef::HDC,
-                &mut src,
-                0,
-                &mut blend,
-                2,
-            );
-        }
+        self.surf.present(self.hwnd, self.sf, self.w, self.h);
     }
 
     fn enabled_cards(&self) -> Vec<&'static str> {
@@ -1727,6 +1745,9 @@ unsafe extern "system" fn sidebar_wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp:
                                 // 撤销卡片（快照携带被删条目）
                                 crate::toast::notify_undo(crate::toast::UndoData::Agenda { key, idx, entry }, &body);
                                 f.redraw();
+                                // 月历格的日程角标同步刷新（此前只重绘侧栏，角标要等鼠标
+                                // 划过日历才更新；flyout_repaint 取 UI 锁，侧栏锁 → UI 锁是既有顺序）
+                                crate::flyout::flyout_repaint();
                             }
                         }
                     }
@@ -1823,38 +1844,173 @@ fn priority_color(p: u8) -> Option<u32> {
     }
 }
 
-#[link(name = "gdiplus")]
-extern "system" {
-    fn GdipGetImageGraphicsContext(image: gdi::Gp, graphics: *mut gdi::Gp) -> i32;
-    fn GdipSetSmoothingMode(graphics: gdi::Gp, mode: i32) -> i32;
-    fn GdipSetTextRenderingHint(graphics: gdi::Gp, mode: i32) -> i32;
+
+/// 界面自检（见 selftest 模块）：今天的侧栏渲染一帧并转储，窗口不显示
+#[cfg(feature = "selftest")]
+pub fn debug_render(dir: &std::path::Path) {
+    let mut guard = SIDEBAR_UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(ui) = guard.as_mut() {
+        let ui = &mut ui.0;
+        ui.date = Some(Local::now().date_naive());
+        ui.redraw();
+        crate::debug::save_frame(dir, "40-sidebar", &ui.surf, ui.w, ui.h, ui.sf);
+        // 节前的日子（2026-11-05 在立冬 11-07 之前）：月干支 / 十二值日取"最近一个已到达
+        // 的节"所在月。回归黄历月柱：此类日子此前一律误落子月
+        ui.date = Some(NaiveDate::from_ymd_opt(2026, 11, 5).unwrap());
+        ui.redraw();
+        crate::debug::save_frame(dir, "41-sidebar-before-jie", &ui.surf, ui.w, ui.h, ui.sf);
+    }
 }
 
-fn save_bmp(scan0: *const u8, w: i32, h: i32, path: &str) {
-    let stride = (w as usize) * 4;
-    let data_size = stride * h as usize;
-    let file_size = 54 + data_size;
-    let mut buf = Vec::with_capacity(file_size);
-    buf.extend_from_slice(b"BM");
-    buf.extend_from_slice(&(file_size as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&54u32.to_le_bytes());
-    buf.extend_from_slice(&40u32.to_le_bytes());
-    buf.extend_from_slice(&w.to_le_bytes());
-    buf.extend_from_slice(&h.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&32u16.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&(data_size as u32).to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    unsafe {
-        for row in (0..h as usize).rev() {
-            let src = std::slice::from_raw_parts(scan0.add(row * stride), stride);
-            buf.extend_from_slice(src);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：并发保存时落盘按修改顺序进行（同 events 的同名测试）
+    #[test]
+    fn concurrent_edits_commit_in_order() {
+        let cell = Mutex::new(None);
+        let disk = Mutex::new(String::new());
+        std::thread::scope(|s| {
+            // 线程 1：先改，但落盘慢（60ms）
+            s.spawn(|| {
+                edit_serialized(
+                    &cell,
+                    Arc::new(Vec::new()),
+                    |list| {
+                        list.push(test_todo("t-slow", "慢", "2026-11-4"));
+                        ((), true)
+                    },
+                    |t| {
+                        std::thread::sleep(std::time::Duration::from_millis(60));
+                        *disk.lock().unwrap() = t.to_string();
+                    },
+                )
+            });
+            // 线程 2：等线程 1 已进入落盘阶段再启动，落盘快
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.spawn(|| {
+                edit_serialized(
+                    &cell,
+                    Arc::new(Vec::new()),
+                    |list| {
+                        list.push(test_todo("t-fast", "快", "2026-11-4"));
+                        ((), true)
+                    },
+                    |t| {
+                        *disk.lock().unwrap() = t.to_string();
+                    },
+                )
+            });
+        });
+        let d = disk.lock().unwrap();
+        assert!(d.contains("t-slow") && d.contains("t-fast"), "最后落盘的快照应包含两次修改：{d}");
+        assert_eq!(cell.lock().unwrap().as_ref().unwrap().len(), 2);
     }
-    let _ = std::fs::write(path, buf);
+
+    /// 编辑定位：id 非空时按 id 找（下标漂移也能找对），否则退回原下标
+    #[test]
+    fn locate_todo_prefers_id() {
+        let mut list = vec![test_todo("a", "甲", "2026-11-4"), test_todo("b", "乙", "2026-11-5")];
+        assert_eq!(locate_todo(&list, "b", 1), Some(1));
+        // 弹窗打开期间前面插了一条：b 的下标变成 2
+        list.insert(0, test_todo("x", "新", "2026-11-4"));
+        assert_eq!(locate_todo(&list, "b", 1), Some(2));
+        // 旧条目无 id：原下标
+        assert_eq!(locate_todo(&list, "", 1), Some(1));
+        // id 已不存在：原下标；下标越界：None
+        assert_eq!(locate_todo(&list, "gone", 1), Some(1));
+        assert_eq!(locate_todo(&list, "gone", 9), None);
+    }
+
+    fn d(y: i32, m: u32, dd: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, dd).unwrap()
+    }
+
+    fn timed(id: &str, date: &str, hm: &str, prio: u8) -> Todo {
+        let mut t = test_todo(id, id, date);
+        t.has_time = true;
+        t.start = Some(format!("{date} {hm}"));
+        t.priority = prio;
+        t
+    }
+
+    /// 按天重复的待办在命中日子展开（下标仍指向主条目）；尊重截止日、"仅此次"
+    /// 与当天的完成记录
+    #[test]
+    fn todos_for_expands_recurring_todos() {
+        let mut td = test_todo("r1", "周报", "2026-11-1"); // 周日
+        td.recur = Some("w".into());
+        let mut list = vec![test_todo("a", "普通", "2026-11-4"), td];
+        let ids = |list: &[Todo], key: &str| todos_for_in(list, key).into_iter().map(|(_, t)| t.id.clone()).collect::<Vec<_>>();
+
+        assert_eq!(ids(&list, "2026-11-1"), vec!["r1"], "锚点日");
+        assert_eq!(ids(&list, "2026-11-8"), vec!["r1"], "下一个周日");
+        assert!(ids(&list, "2026-11-5").is_empty(), "非命中日");
+        assert_eq!(ids(&list, "2026-11-4"), vec!["a"]);
+
+        list[1].recur_until = Some("2026-11-8".into());
+        assert_eq!(ids(&list, "2026-11-8").len(), 1, "截止日含当天");
+        assert!(ids(&list, "2026-11-15").is_empty(), "过了截止日");
+
+        list[1].skip_dates.push("2026-11-8".into());
+        assert!(ids(&list, "2026-11-8").is_empty(), "仅此次排除");
+        list[1].skip_dates.push("2026-11-1".into());
+        assert!(ids(&list, "2026-11-1").is_empty(), "锚点日同样受仅此次约束");
+        list[1].skip_dates.pop();
+
+        list[1].done_dates.push("2026-11-1".into());
+        assert!(todos_for_in(&list, "2026-11-1")[0].1.done, "展开条目的 done 取当天完成记录");
+        assert!(!list[1].done, "主条目 done 恒为 false");
+    }
+
+    /// 排序：未完成在前 → 带时间的按时间升序 → 无时间的在后 → 优先级（收集箱垫底）
+    #[test]
+    fn todos_for_sorts_undone_timed_first() {
+        let day = "2026-11-4";
+        let mut done = test_todo("done", "完成", day);
+        done.done = true;
+        let list = vec![
+            test_todo("inbox", "收集箱", day),
+            done,
+            timed("late", day, "14:00", 3),
+            timed("early", day, "09:00", 2),
+        ];
+        let order: Vec<String> = todos_for_in(&list, day).into_iter().map(|(_, t)| t.id.clone()).collect();
+        assert_eq!(order, ["early", "late", "inbox", "done"]);
+        // 没有归属日期的待办不属于任何一天
+        let mut no_date = test_todo("nd", "无日期", "2026-11-4");
+        no_date.date = None;
+        assert!(todos_for_in(&[no_date], day).is_empty());
+    }
+
+    /// 月历角标用的整月计数与"逐日筛选后滤掉已完成"逐日等价
+    #[test]
+    fn todo_counts_match_filtered_todos_for_each_day() {
+        let mut daily = test_todo("daily", "每日", "2026-11-1");
+        daily.recur = Some("d".into());
+        daily.done_dates.push("2026-11-3".into());
+        let mut wk = test_todo("wk", "每周", "2026-11-2"); // 周一
+        wk.recur = Some("w".into());
+        wk.recur_until = Some("2026-11-20".into());
+        let mut done = test_todo("done", "完成", "2026-11-5");
+        done.done = true;
+        let list = vec![test_todo("p", "普通", "2026-11-5"), daily, wk, done];
+
+        let (a, b) = (d(2026, 10, 28), d(2026, 11, 25));
+        let counts = todo_counts_in(&list, a, b);
+        let mut cur = a;
+        while cur <= b {
+            let key = crate::ics::key_of_date(cur);
+            let want = todos_for_in(&list, &key).into_iter().filter(|(_, t)| !t.done).count();
+            assert_eq!(counts.get(&key).copied().unwrap_or(0), want, "{key}");
+            cur += Duration::days(1);
+        }
+        let at = |key: &str| counts.get(key).copied().unwrap_or(0);
+        assert_eq!(at("2026-11-3"), 0, "每日待办当天已完成，不计");
+        assert_eq!(at("2026-11-5"), 2, "普通 + 每日（已完成的不计，周一的本周四不命中）");
+        assert_eq!(at("2026-11-9"), 2, "周一：每日 + 每周");
+        assert_eq!(at("2026-11-23"), 1, "过了截止日的周待办不再出现");
+        assert_eq!(at("2026-10-30"), 0, "锚点日之前不展开");
+    }
 }

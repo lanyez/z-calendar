@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 数据集镜像（CDN 优先，GitHub 原始地址兜底）
 const SOURCES: &[&str] = &[
@@ -88,9 +87,7 @@ fn month_path(m: u32) -> std::path::PathBuf {
     cache_dir().join(format!("{}.json", m))
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+use crate::clock::now_ms_u64 as now_ms;
 
 /// 启动清理：删除旧版 asilu 单日缓存格式（history.json）
 pub fn purge_stale() {
@@ -192,7 +189,8 @@ fn fetch_and_split() -> Option<()> {
         }
         let mf = MonthFile { entries: std::mem::take(v) };
         if let Ok(json) = serde_json::to_string(&mf) {
-            if std::fs::write(month_path(i as u32 + 1), json).is_ok() {
+            // 缓存文件：原子写（不保留备份；损坏则解析失败，10 分钟后自动重拉）
+            if crate::config::write_file_atomic(&month_path(i as u32 + 1), &json).is_ok() {
                 wrote_any = true;
             }
         }
